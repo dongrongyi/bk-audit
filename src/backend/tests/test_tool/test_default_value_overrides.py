@@ -709,15 +709,17 @@ class ExecuteToolValidateDefaultValuePermissionsTest(TestCase):
 
     @mock.patch.object(ExecuteTool, "_get_user_allowed_scopes")
     def test_override_list_value_normalized_before_comparison(self, mock_get_scopes):
-        """list 覆盖值比对前规范化：[200, '100', 100] 等价于 [100, 200]"""
+        """数值列表（有 data_source）比对前整数化：[200, '100', 100] 等价于 [100, 200]"""
         mock_get_scopes.return_value = (["1001"], [])
         tool = MockTool(
             config={
-                "input_variable": [{"raw_name": "game_ids", "is_show": False, "default_value": None}],
+                "input_variable": [
+                    {"raw_name": "game_ids", "is_show": False, "default_value": None}
+                ],
                 "default_value_overrides": {"scenes": {"1001": {"game_ids": [100, 200]}}},
             }
         )
-        # 顺序、类型、重复不同的等价列表应通过
+        # 顺序、类型、重复不同的等价列表应通过（game_ids 有 data_source → 整数化）
         params = {"tool_variables": [{"raw_name": "game_ids", "value": [200, "100", 100]}]}
 
         # 不应抛出异常

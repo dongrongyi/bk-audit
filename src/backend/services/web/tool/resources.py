@@ -878,6 +878,12 @@ class UpdateTool(ToolBase):
         config = tool.config if tool.config else {}
         config['default_value_overrides'] = new_overrides
         validated_request_data["config"] = config
+        # smart_page 不允许修改标签：用旧工具标签覆盖客户端传入值
+        # （tags 是 uid 级别，sync_resource_tags 先删后建，必须传回旧标签名避免清空）
+        tag_ids = ToolTag.objects.filter(tool_uid=tool.uid).values_list("tag_id", flat=True)
+        validated_request_data["tags"] = list(
+            Tag.objects.filter(tag_id__in=tag_ids).values_list("tag_name", flat=True)
+        )
         return self.create_tool_new_version(
             old_tool=tool,
             validated_request_data=validated_request_data,
@@ -886,26 +892,19 @@ class UpdateTool(ToolBase):
 
 
 def _normalize_override_value(value):
-    """规范化覆盖值（整数化、去重、升序）。
+    """规范化 game_ids 覆盖值（整数化、去重、升序）。
 
-    list 类型按"整数化、去重、升序"规范化，避免 [100, 200] 与 ["200", 100, 100]
-    因顺序、类型、重复而产生比对误判。其他类型原样返回。
-
-    用于 default_value_overrides 的覆盖值与用户提交值在比对前统一规范化。
+    仅用于 game_ids 等数值列表，使 [100, 200] 与 ["200", 100, 100] 等价。
+    其他列表变量不调用此函数，保持精确匹配。
     """
     if not isinstance(value, list):
-        # 非列表类型（str/int/float/bool/None）原样返回，无需规范化
         return value
-    # 优先尝试整数化: ["100", 200, 100] → {100, 200} → sorted → [100, 200]
-    # 覆盖 game_ids 等 ID 类场景中字符串/重复/无序的问题
     try:
         return sorted({int(item) for item in value})
     except (TypeError, ValueError):
-        # 元素不可整数化（如字符串列表 ["a", "b"]），仅做去重排序
         try:
             return sorted(set(value))
         except TypeError:
-            # 元素不可哈希或不可排序（如含 dict/list），原样返回
             return value
 
 
@@ -1239,14 +1238,18 @@ class ExecuteTool(ToolBase):
             if input_var_config.get("field_category") in ["time_range_select", "time-ranger"]:
                 continue
 
+            # game_ids 做去重+排序+整数化（使 [100,200] 与 ["200",100] 等价）；
+            # 其他变量直接用原始值比较，避免 ["001"] 与 ["1"] 被误判相等
+            normalize = _normalize_override_value if raw_name == "game_ids" else (lambda v: v)
+
             # 获取工具的原始默认值
-            original_default = _normalize_override_value(input_var_config.get("default_value"))
+            original_default = normalize(input_var_config.get("default_value"))
 
             # effective_value（实际参与校验的值）:
             #   - 用户提交了该变量 → 用用户提交值（规范化后），如 [100, 200]
             #   - 用户未提交该变量 → 回退到 original_default，如 [100, 200, 300]
             if raw_name in input_variable_map:
-                effective_value = _normalize_override_value(input_variable_map[raw_name])
+                effective_value = normalize(input_variable_map[raw_name])
             else:
                 effective_value = original_default
 
@@ -1263,7 +1266,7 @@ class ExecuteTool(ToolBase):
                 if isinstance(scope_overrides, dict) and raw_name in scope_overrides:
                     override_value = scope_overrides[raw_name]
                     if override_value is not None:
-                        allowed_values.append(_normalize_override_value(override_value))
+                        allowed_values.append(normalize(override_value))
                     else:
                         has_unrestricted_scope = True
                 else:
@@ -1275,7 +1278,7 @@ class ExecuteTool(ToolBase):
                 if isinstance(scope_overrides, dict) and raw_name in scope_overrides:
                     override_value = scope_overrides[raw_name]
                     if override_value is not None:
-                        allowed_values.append(_normalize_override_value(override_value))
+                        allowed_values.append(normalize(override_value))
                     else:
                         has_unrestricted_scope = True
                 else:
