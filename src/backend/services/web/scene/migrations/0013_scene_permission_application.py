@@ -1,0 +1,95 @@
+# Generated for scene permission application
+
+import django.utils.timezone
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ("scene", "0012_scene_managers_scene_users"),
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name="ScenePermissionApplication",
+            fields=[
+                ("id", models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name="ID")),
+                (
+                    "created_at",
+                    models.DateTimeField(db_index=True, default=django.utils.timezone.now, verbose_name="创建时间"),
+                ),
+                (
+                    "created_by",
+                    models.CharField(
+                        blank=True, db_index=True, default="", max_length=32, null=True, verbose_name="创建者"
+                    ),
+                ),
+                ("updated_at", models.DateTimeField(blank=True, db_index=True, null=True, verbose_name="更新时间")),
+                (
+                    "updated_by",
+                    models.CharField(
+                        blank=True, db_index=True, default="", max_length=32, null=True, verbose_name="修改者"
+                    ),
+                ),
+                ("applicant", models.CharField(db_index=True, max_length=64, verbose_name="申请人")),
+                (
+                    "role",
+                    models.CharField(
+                        choices=[("manager", "场景管理员"), ("user", "场景使用者")],
+                        db_index=True,
+                        max_length=16,
+                        verbose_name="申请角色",
+                    ),
+                ),
+                ("reason", models.TextField(blank=True, default="", verbose_name="申请理由")),
+                ("workflow_key", models.CharField(max_length=64, verbose_name="流程编码")),
+                ("itsm_sn", models.CharField(db_index=True, max_length=64, verbose_name="ITSM单号")),
+                (
+                    "itsm_ticket_id",
+                    models.CharField(blank=True, default="", max_length=128, verbose_name="ITSM工单ID"),
+                ),
+                ("itsm_status", models.CharField(blank=True, default="", max_length=32, verbose_name="ITSM原始状态")),
+                (
+                    "status",
+                    models.CharField(
+                        choices=[
+                            ("pending", "待审批"),
+                            ("approved", "已通过"),
+                            ("rejected", "已驳回"),
+                            ("revoked", "已撤回"),
+                            ("grant_failed", "授权失败"),
+                        ],
+                        db_index=True,
+                        default="pending",
+                        max_length=16,
+                        verbose_name="申请状态",
+                    ),
+                ),
+                ("approvers", models.JSONField(default=list, verbose_name="审批人")),
+                ("reject_reason", models.TextField(blank=True, default="", verbose_name="拒绝理由")),
+                ("grant_method", models.CharField(blank=True, default="", max_length=32, verbose_name="授权方式")),
+                ("grant_error", models.TextField(blank=True, default="", verbose_name="授权错误")),
+                ("retry_count", models.IntegerField(default=0, verbose_name="授权重试次数")),
+                ("finished_at", models.DateTimeField(blank=True, null=True, verbose_name="完结时间")),
+                (
+                    "scene",
+                    models.ForeignKey(
+                        on_delete=models.deletion.CASCADE,
+                        related_name="permission_applications",
+                        to="scene.scene",
+                    ),
+                ),
+            ],
+            options={
+                "verbose_name": "场景权限申请",
+                "verbose_name_plural": "场景权限申请",
+                "ordering": ["-id"],
+                "indexes": [
+                    models.Index(fields=["applicant", "status"], name="spa_app_status_idx"),
+                    models.Index(fields=["scene", "status"], name="spa_scene_status_idx"),
+                    models.Index(fields=["status", "retry_count"], name="spa_status_retry_idx"),
+                ],
+            },
+        ),
+    ]

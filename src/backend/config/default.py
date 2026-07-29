@@ -198,6 +198,7 @@ BK_CMSI_API_URL = os.getenv("BKAPP_CMSI_URL")
 BK_SOPS_API_URL = os.getenv("BKAPP_BK_SOPS_API_URL")
 BK_SOPS_APIGW_NAME = os.getenv("BKAPP_BK_SOPS_APIGW_NAME", "bk-sops")
 BK_ITSM_APIGW_NAME = os.getenv("BKAPP_BK_ITSM_APIGW_NAME", "bk-itsm")
+BK_ITSM_V4_APIGW_NAME = os.getenv("BKAPP_BK_ITSM_V4_APIGW_NAME", "bk-itsm")
 BKIAM_APIGW_NAME = os.getenv("BKAPP_BKIAM_APIGW_NAME", "bkiam")
 # IAM V4 API 地址覆盖；默认由 api.domains 解析到预发布网关，本地 dev e2e 可临时指定 dev 地址。
 BK_IAM_V4_API_URL = os.getenv("BKAPP_BK_IAM_V4_API_URL", "")
@@ -226,6 +227,7 @@ BK_LOG_ESB_NAME = os.getenv("BKAPP_BK_LOG_ESB_NAME", "bk_log")
 USERMANAGE_ESB_NAME = os.getenv("BKAPP_USERMANAGE_ESB_NAME", "usermanage")
 MONITOR_V3_ESB_NAME = os.getenv("BKAPP_MONITOR_V3_ESB_NAME", "monitor_v3")
 ITSM_ESB_NAME = os.getenv("BKAPP_ITSM_ESB_NAME", "itsm")
+ITSM_V4_ESB_NAME = os.getenv("BKAPP_ITSM_V4_ESB_NAME", "itsm")
 CMSI_ESB_NAME = os.getenv("BKAPP_CMSI_ESB_NAME", "cmsi")
 
 SWAGGER_SETTINGS = {

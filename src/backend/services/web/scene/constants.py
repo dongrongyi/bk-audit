@@ -1,6 +1,10 @@
 # -*- coding: utf-8 -*-
+import os
+
 from django.db.models import TextChoices
 from django.utils.translation import gettext_lazy
+
+from apps.permission.constants import IAMV4Role
 
 
 class SceneStatus(TextChoices):
@@ -109,3 +113,50 @@ SCENE_RISK_COUNT_ACTIVE_DISPLAY_STATUSES = (
     "for_approve",
     "auto_process",
 )
+
+
+# ==================== 场景权限自助审批 ====================
+
+# 全局配置 key（存 GlobalMetaConfig）：ITSM V4 流程编码
+SCENE_PERMISSION_WORKFLOW_KEY = "SCENE_PERMISSION_WORKFLOW_KEY"
+
+# 周期任务 cron 分钟
+SYNC_SCENE_PERMISSION_PERIODIC_TASK_MINUTE = os.getenv("BKAPP_SYNC_SCENE_PERMISSION_MINUTE", "*/10")
+
+# 授权失败最大重试次数
+SCENE_PERMISSION_GRANT_MAX_RETRY = int(os.getenv("BKAPP_SCENE_PERMISSION_GRANT_MAX_RETRY", "5"))
+
+# workflow 字段模板缓存秒数
+SCENE_PERMISSION_WORKFLOW_CACHE_TIMEOUT = 10 * 60
+
+# 业务角色 → V4 role_id
+SCENE_ROLE_TO_IAM_V4_ROLE = {
+    SceneRole.MANAGER: IAMV4Role.SCENE_ADMIN,
+    SceneRole.USER: IAMV4Role.SCENE_USER,
+}
+
+
+class ScenePermissionFormFieldTitles:
+    """ITSM V4 流程表单字段标题约定。
+
+    运维在 ITSM 建流程时，字段「标题」必须与此处一致。
+    代码运行时从 user_workflow_detail 的 jsonschema 按 title 动态匹配字段 key
+    （ITSM V4 的字段 key 是自动生成的随机串，不能硬编码）。
+    """
+
+    TITLE = "标题"
+    APPLICANT = "申请人"
+    SCENE_NAME = "场景名称"
+    ROLE = "申请角色"
+    REASON = "申请理由"
+    APPROVER = "审批人"
+
+
+class ITSMV4TicketStatus(TextChoices):
+    """ITSM V4 工单状态"""
+
+    RUNNING = "running", gettext_lazy("处理中")
+    FINISHED = "finished", gettext_lazy("已结束")
+    TERMINATED = "terminated", gettext_lazy("被终止")
+    REVOKED = "revoked", gettext_lazy("被撤销")
+    DRAFT = "draft", gettext_lazy("草稿")
