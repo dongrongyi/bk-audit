@@ -843,7 +843,9 @@ class ListMyScenePermissionApplications(SceneResource):
         )
 
     def perform_request(self, validated_request_data):
-        qs = ScenePermissionApplication.objects.filter(applicant=get_request_username())
+        qs = ScenePermissionApplication.objects.select_related("scene").filter(
+            applicant=get_request_username()
+        )
         if validated_request_data.get("status"):
             qs = qs.filter(status__in=validated_request_data["status"])
         return qs.order_by("-id")
