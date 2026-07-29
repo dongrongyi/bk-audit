@@ -25,6 +25,7 @@ __all__ = [
     "RiskExportFailedEvent",
     "NL2RiskFilterFailedEvent",
     "AnalyseReportGenerateFailedEvent",
+    "ScenePermissionGrantFailedEvent",
 ]
 
 
@@ -82,3 +83,19 @@ class AnalyseReportGenerateFailedEvent(Event):
     name = "analyse_report_generate_failed"
     documentation = "AI 分析报告最终生成失败"
     labelnames = ["report_type", "has_scenario", "error_type"]
+
+
+class ScenePermissionGrantFailedEvent(Event):
+    """场景权限申请审批通过但授权失败事件
+
+    维度字段:
+    - application_id: 申请单ID
+    - applicant: 申请人
+    - scene_id: 场景ID
+    - role: 申请角色
+    - grant_error: 授权失败原因
+    """
+
+    name = "scene_permission_grant_failed"
+    documentation = "场景权限申请审批通过但授权失败（重试已达上限）"
+    labelnames = ["application_id", "applicant", "scene_id", "role", "grant_error"]

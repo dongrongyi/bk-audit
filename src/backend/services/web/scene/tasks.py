@@ -115,11 +115,12 @@ def sync_scene_permission_status():
                 "[sync_scene_permission_status] PENDING 单 %s 失败: %s", application.id, err
             )
 
-    # 阶段二：重试 GRANT_FAILED（审批已通过、仅授权失败）
+    # 阶段二：重试授权失败（审批已通过、仅授权失败），retry_count < MAX 才重试
     failed_qs = (
         ScenePermissionApplication.objects.select_related("scene")
         .filter(
-            status=ScenePermissionApplication.Status.GRANT_FAILED,
+            status=ScenePermissionApplication.Status.APPROVED,
+            grant_status=ScenePermissionApplication.GrantStatus.FAILED,
             retry_count__lt=SCENE_PERMISSION_GRANT_MAX_RETRY,
         )
         .exclude(itsm_sn="")
@@ -132,7 +133,7 @@ def sync_scene_permission_status():
                     .select_related("scene")
                     .get(id=application.id)
                 )
-                if application.status != ScenePermissionApplication.Status.GRANT_FAILED:
+                if application.grant_status != ScenePermissionApplication.GrantStatus.FAILED:
                     continue
                 _do_grant(application, operator=operator)
                 application.save()
@@ -140,5 +141,5 @@ def sync_scene_permission_status():
             # _do_grant 内部已 catch 异常并自增 retry_count；
             # 此处仅兜底 get/save 等基础设施异常，不重复计数（下个周期自然重试）
             logger_celery.exception(
-                "[sync_scene_permission_status] GRANT_FAILED 重试 %s 失败: %s", application.id, err
+                "[sync_scene_permission_status] 授权失败重试 %s 失败: %s", application.id, err
             )

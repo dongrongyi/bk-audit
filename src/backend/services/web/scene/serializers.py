@@ -451,6 +451,7 @@ class ScenePermissionApplicationSerializer(serializers.ModelSerializer):
     scene_name = serializers.CharField(source="scene.name", read_only=True)
     role_display = serializers.CharField(source="get_role_display", read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
+    grant_status_display = serializers.CharField(source="get_grant_status_display", read_only=True)
 
     class Meta:
         model = ScenePermissionApplication
@@ -465,6 +466,8 @@ class ScenePermissionApplicationSerializer(serializers.ModelSerializer):
             "itsm_sn",
             "status",
             "status_display",
+            "grant_status",
+            "grant_status_display",
             "approvers",
             "reject_reason",
             "created_at",

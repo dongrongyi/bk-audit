@@ -191,10 +191,13 @@ class ScenePermissionApplication(OperateRecordModel):
 
     class Status(models.TextChoices):
         PENDING = "pending", gettext_lazy("待审批")
-        APPROVED = "approved", gettext_lazy("已通过")
+        APPROVED = "approved", gettext_lazy("审批通过")
         REJECTED = "rejected", gettext_lazy("已驳回")
         REVOKED = "revoked", gettext_lazy("已撤回")
-        GRANT_FAILED = "grant_failed", gettext_lazy("授权失败")
+
+    class GrantStatus(models.TextChoices):
+        SUCCESS = "success", gettext_lazy("授权成功")
+        FAILED = "failed", gettext_lazy("授权失败")
 
     scene = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name="permission_applications")
     applicant = models.CharField(gettext_lazy("申请人"), max_length=64, db_index=True)
@@ -211,10 +214,18 @@ class ScenePermissionApplication(OperateRecordModel):
 
     # 状态
     status = models.CharField(
-        gettext_lazy("申请状态"),
+        gettext_lazy("审批状态"),
         max_length=16,
         choices=Status.choices,
         default=Status.PENDING,
+        db_index=True,
+    )
+    grant_status = models.CharField(
+        gettext_lazy("授权状态"),
+        max_length=16,
+        choices=GrantStatus.choices,
+        blank=True,
+        default="",
         db_index=True,
     )
     approvers = models.JSONField(gettext_lazy("审批人"), default=list)
@@ -241,5 +252,5 @@ class ScenePermissionApplication(OperateRecordModel):
 
     @property
     def is_terminal(self) -> bool:
-        """终态（不再被 task 处理，GRANT_FAILED 除外——可重试）"""
-        return self.status in [self.Status.APPROVED, self.Status.REJECTED, self.Status.REVOKED]
+        """审批终态（审批结果已确定，不再被阶段一轮询）"""
+        return self.status != self.Status.PENDING

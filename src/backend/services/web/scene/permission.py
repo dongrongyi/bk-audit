@@ -27,7 +27,13 @@ from apps.meta.handlers.iam_group import IAMGroupManager
 from apps.permission.constants import IAMV4Role
 from apps.permission.handlers.resource_types import ResourceEnum
 from apps.permission.handlers.service import PermissionService
-from services.web.scene.constants import ITSMV4TicketStatus, SCENE_ROLE_TO_IAM_V4_ROLE, SceneRole
+from services.web.common.monitor import ScenePermissionGrantFailedEvent
+from services.web.scene.constants import (
+    ITSMV4TicketStatus,
+    SCENE_PERMISSION_GRANT_MAX_RETRY,
+    SCENE_ROLE_TO_IAM_V4_ROLE,
+    SceneRole,
+)
 from services.web.scene.models import Scene, ScenePermissionApplication
 
 
@@ -81,14 +87,15 @@ def apply_ticket_result(
     itsm_status = ticket_data.get("status", "")
     application.itsm_status = itsm_status
 
-    # ① 审批通过 → 授权
+    # ① 审批通过 → 先设审批状态，再授权
     if itsm_status == ITSMV4TicketStatus.FINISHED and ticket_data.get("approve_result"):
+        application.status = ScenePermissionApplication.Status.APPROVED
         _do_grant(application, operator=operator)
-    # ② 审批驳回（finished 但未通过）
+    # ② 审批驳回（finished 但未通过）→ 记录拒绝理由
     elif itsm_status == ITSMV4TicketStatus.FINISHED:
         application.reject_reason = _extract_reject_reason(ticket_data)
         _set_terminal(application, ScenePermissionApplication.Status.REJECTED)
-    # ③ 被终止
+    # ③ 被终止 → 记录拒绝理由
     elif itsm_status == ITSMV4TicketStatus.TERMINATED:
         application.reject_reason = _extract_reject_reason(ticket_data)
         _set_terminal(application, ScenePermissionApplication.Status.REJECTED)
@@ -108,7 +115,10 @@ def _extract_reject_reason(ticket_data: dict) -> str:
 
 
 def _do_grant(application: ScenePermissionApplication, operator: Optional[str] = None) -> None:
-    """执行授权。成功→APPROVED；失败→GRANT_FAILED(retry_count++)。"""
+    """执行授权。成功→grant_status=SUCCESS；失败→grant_status=FAILED(retry_count++)。
+
+    注意：status（审批状态）由调用方 apply_ticket_result 设为 APPROVED，此函数只管 grant_status。
+    """
     try:
         result = grant_scene_role(
             scene=application.scene,
@@ -117,22 +127,56 @@ def _do_grant(application: ScenePermissionApplication, operator: Optional[str] =
             operator=operator,
         )
         if result.get("success"):
-            application.status = ScenePermissionApplication.Status.APPROVED
+            application.grant_status = ScenePermissionApplication.GrantStatus.SUCCESS
             application.grant_method = result.get("method", "")
             application.grant_error = ""
             application.retry_count = 0
             application.finished_at = timezone.now()
         else:
-            application.status = ScenePermissionApplication.Status.GRANT_FAILED
+            application.grant_status = ScenePermissionApplication.GrantStatus.FAILED
             application.grant_error = result.get("error", "unknown")
             application.retry_count += 1
-            # 不设 finished_at：仍在重试中，非终态
+            _check_grant_retry_exhausted(application)
     except Exception as err:  # pylint: disable=broad-except
         logger.exception("[_do_grant] 申请单 %s 授权失败: %s", application.id, err)
-        application.status = ScenePermissionApplication.Status.GRANT_FAILED
+        application.grant_status = ScenePermissionApplication.GrantStatus.FAILED
         application.grant_error = str(err)
         application.retry_count += 1
-        # 不设 finished_at：仍在重试中，非终态
+        _check_grant_retry_exhausted(application)
+
+
+def _check_grant_retry_exhausted(application: ScenePermissionApplication) -> None:
+    """授权重试到上限时上报告警事件。"""
+    if application.retry_count < SCENE_PERMISSION_GRANT_MAX_RETRY:
+        return
+    logger.error(
+        "[scene_permission] 申请单 %s 授权重试已达上限(%s)，applicant=%s, scene=%s, role=%s, error=%s",
+        application.id,
+        application.retry_count,
+        application.applicant,
+        application.scene_id,
+        application.role,
+        application.grant_error,
+    )
+    try:
+        event = ScenePermissionGrantFailedEvent(
+            target=f"application_{application.id}",
+            context={
+                "application_id": str(application.id),
+                "applicant": application.applicant,
+                "scene_id": str(application.scene_id),
+                "role": application.role,
+                "grant_error": (application.grant_error or "")[:500],
+            },
+            extra={
+                "retry_count": application.retry_count,
+                "workflow_key": application.workflow_key,
+                "itsm_sn": application.itsm_sn,
+            },
+        )
+        event.async_report()
+    except Exception:  # pylint: disable=broad-except
+        logger.exception("[scene_permission] 告警事件上报失败，申请单 %s", application.id)
 
 
 def _set_terminal(

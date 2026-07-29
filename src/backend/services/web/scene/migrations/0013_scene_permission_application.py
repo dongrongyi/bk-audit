@@ -55,15 +55,25 @@ class Migration(migrations.Migration):
                     models.CharField(
                         choices=[
                             ("pending", "待审批"),
-                            ("approved", "已通过"),
+                            ("approved", "审批通过"),
                             ("rejected", "已驳回"),
                             ("revoked", "已撤回"),
-                            ("grant_failed", "授权失败"),
                         ],
                         db_index=True,
                         default="pending",
                         max_length=16,
-                        verbose_name="申请状态",
+                        verbose_name="审批状态",
+                    ),
+                ),
+                (
+                    "grant_status",
+                    models.CharField(
+                        blank=True,
+                        choices=[("success", "授权成功"), ("failed", "授权失败")],
+                        db_index=True,
+                        default="",
+                        max_length=16,
+                        verbose_name="授权状态",
                     ),
                 ),
                 ("approvers", models.JSONField(default=list, verbose_name="审批人")),

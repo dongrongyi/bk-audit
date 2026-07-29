@@ -90,13 +90,14 @@ class ScenePermissionApplicationAdmin(admin.ModelAdmin):
         "applicant",
         "role",
         "status",
+        "grant_status",
         "itsm_sn",
         "grant_method",
         "retry_count",
         "reject_reason",
         "created_at",
     ]
-    list_filter = ["status", "role"]
+    list_filter = ["status", "grant_status", "role"]
     search_fields = ["applicant", "itsm_sn", "scene__name"]
     readonly_fields = [
         "created_at",
