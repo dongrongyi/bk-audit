@@ -43,13 +43,11 @@ class Migration(migrations.Migration):
                     ),
                 ),
                 ("reason", models.TextField(blank=True, default="", verbose_name="申请理由")),
-                ("workflow_key", models.CharField(max_length=64, verbose_name="流程编码")),
                 ("itsm_sn", models.CharField(db_index=True, max_length=64, verbose_name="ITSM单号")),
                 (
                     "itsm_ticket_id",
                     models.CharField(blank=True, default="", max_length=128, verbose_name="ITSM工单ID"),
                 ),
-                ("itsm_status", models.CharField(blank=True, default="", max_length=32, verbose_name="ITSM原始状态")),
                 (
                     "status",
                     models.CharField(

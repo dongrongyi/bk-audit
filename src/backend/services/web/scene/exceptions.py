@@ -129,7 +129,3 @@ class ApproveServiceNotConfigured(ScenePermissionApplicationException):
     MESSAGE = gettext_lazy("场景权限审批流程未配置，请联系管理员")
     ERROR_CODE = "013"
 
-
-class SceneNoManager(ScenePermissionApplicationException):
-    MESSAGE = gettext_lazy("该场景暂无管理员，无法指定审批人，请联系平台管理员")
-    ERROR_CODE = "014"

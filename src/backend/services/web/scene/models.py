@@ -9,7 +9,9 @@ from core.models import (
     SoftDeleteQuerySet,
 )
 from services.web.scene.constants import (
+    ApplicationStatus,
     BindingType,
+    GrantStatus,
     ResourceVisibilityType,
     SceneRole,
     SceneStatus,
@@ -189,16 +191,6 @@ class ResourceBindingSystem(OperateRecordModel):
 class ScenePermissionApplication(OperateRecordModel):
     """场景权限申请单"""
 
-    class Status(models.TextChoices):
-        PENDING = "pending", gettext_lazy("待审批")
-        APPROVED = "approved", gettext_lazy("审批通过")
-        REJECTED = "rejected", gettext_lazy("已驳回")
-        REVOKED = "revoked", gettext_lazy("已撤回")
-
-    class GrantStatus(models.TextChoices):
-        SUCCESS = "success", gettext_lazy("授权成功")
-        FAILED = "failed", gettext_lazy("授权失败")
-
     scene = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name="permission_applications")
     applicant = models.CharField(gettext_lazy("申请人"), max_length=64, db_index=True)
     role = models.CharField(
@@ -206,18 +198,16 @@ class ScenePermissionApplication(OperateRecordModel):
     )
     reason = models.TextField(gettext_lazy("申请理由"), blank=True, default="")
 
-    # ITSM V4 单据
-    workflow_key = models.CharField(gettext_lazy("流程编码"), max_length=64)
+    # ITSM 单据
     itsm_sn = models.CharField(gettext_lazy("ITSM单号"), max_length=64, db_index=True)
     itsm_ticket_id = models.CharField(gettext_lazy("ITSM工单ID"), max_length=128, blank=True, default="")
-    itsm_status = models.CharField(gettext_lazy("ITSM原始状态"), max_length=32, blank=True, default="")
 
     # 状态
     status = models.CharField(
         gettext_lazy("审批状态"),
         max_length=16,
-        choices=Status.choices,
-        default=Status.PENDING,
+        choices=ApplicationStatus.choices,
+        default=ApplicationStatus.PENDING,
         db_index=True,
     )
     grant_status = models.CharField(
@@ -253,4 +243,4 @@ class ScenePermissionApplication(OperateRecordModel):
     @property
     def is_terminal(self) -> bool:
         """审批终态（审批结果已确定，不再被阶段一轮询）"""
-        return self.status != self.Status.PENDING
+        return self.status != ApplicationStatus.PENDING

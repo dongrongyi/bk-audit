@@ -2,9 +2,8 @@
 import abc
 from collections.abc import Collection
 
-from bk_resource import resource
+from bk_resource import api, resource
 from django.conf import settings
-from django.core.cache import cache
 from django.db import transaction
 from django.db.models import (
     Case,
@@ -26,7 +25,7 @@ from rest_framework import serializers
 from apps.audit.resources import AuditMixinResource
 from apps.meta.constants import SystemAuditStatusEnum
 from apps.meta.handlers.iam_group import IAMGroupManager
-from apps.meta.models import GlobalMetaConfig, System
+from apps.meta.models import System
 from blueapps.utils.logger import logger
 from apps.permission.handlers.actions import ActionEnum
 from apps.permission.handlers.service import PermissionService
@@ -37,10 +36,10 @@ from services.web.common.scope_permission import ScopeContext, ScopePermission
 from services.web.risk.models import Risk
 from services.web.scene.binding_validation import assert_binding_relation_integrity
 from services.web.scene.constants import (
-    SCENE_PERMISSION_WORKFLOW_CACHE_TIMEOUT,
+    ApplicationStatus,
     SCENE_PERMISSION_WORKFLOW_KEY,
     ResourceVisibilityType,
-    ScenePermissionFormFieldTitles,
+    ScenePermissionFormFields,
     SceneRole,
     SceneStatus,
 )
@@ -50,8 +49,6 @@ from services.web.scene.exceptions import (
     ApproveServiceNotConfigured,
     SceneNotExist,
     SceneNotEnabled,
-    SceneNoManager,
-    ScenePermissionApplicationException,
     SceneStrategyNotDisabled,
 )
 from services.web.scene.models import (
@@ -61,7 +58,7 @@ from services.web.scene.models import (
     ScenePermissionApplication,
     SceneSystem,
 )
-from services.web.scene.permission import already_has_role, get_scene_managers
+from services.web.scene.permission import already_has_role
 from services.web.scene.serializers import (
     ApplyScenePermissionRequestSerializer,
     CreateSceneSerializer,
@@ -681,7 +678,7 @@ class GetSceneMembers(SceneResource):
         return get_scene_members_data(scene_id)
 
 
-# ==================== 场景权限自助审批 ====================
+# ==================== 场景权限自动化审批授权 ====================
 
 
 class ApplyScenePermission(SceneResource):
@@ -697,7 +694,7 @@ class ApplyScenePermission(SceneResource):
         role = validated_request_data["role"]
         reason = validated_request_data.get("reason", "")
 
-        # 1. 校验场景
+        # 1. 校验场景(是否存在、是否已启用)
         try:
             scene = Scene.objects.get(scene_id=scene_id)
         except Scene.DoesNotExist:
@@ -705,35 +702,31 @@ class ApplyScenePermission(SceneResource):
         if scene.status != SceneStatus.ENABLED:
             raise SceneNotEnabled()
 
-        # 2. 幂等校验一：已有该 role
+        # 2. 幂等校验一：是否已有该场景的使用/管理权限
         if already_has_role(scene, role, applicant):
             raise AlreadyHasPermission()
 
-        # 3. 幂等校验二：无在途 PENDING 单
+        # 3. 幂等校验二：是否有在途 PENDING 单
         if ScenePermissionApplication.objects.filter(
             scene_id=scene_id,
             applicant=applicant,
             role=role,
-            status=ScenePermissionApplication.Status.PENDING,
+            status=ApplicationStatus.PENDING,
         ).exists():
             raise ApplicationPending()
 
-        # 4. 取流程编码 + 解析字段 key 映射（带缓存）
-        workflow_key = GlobalMetaConfig.get(SCENE_PERMISSION_WORKFLOW_KEY)
-        if not workflow_key:
+        # 4. 校验流程编码已配置
+        if not SCENE_PERMISSION_WORKFLOW_KEY:
             raise ApproveServiceNotConfigured()
-        field_keys = self._get_form_field_keys(workflow_key)
 
-        # 5. 取审批人（场景管理员）
-        approvers = get_scene_managers(scene)
+        # 5. 取审批人（场景管理员优先，为空时回退到admin）
+        approvers = list(scene.managers or [])
         if not approvers:
-            raise SceneNoManager()
+            approvers = list(settings.SYSTEM_ADMIN)
 
         # 6. 建 ITSM V4 单（operator=申请人 → 单据归属申请人，可在 ITSM 查看/撤单）
         ticket = self._create_itsm_ticket(
             applicant=applicant,
-            workflow_key=workflow_key,
-            field_keys=field_keys,
             scene=scene,
             role=role,
             reason=reason,
@@ -747,10 +740,9 @@ class ApplyScenePermission(SceneResource):
                 applicant=applicant,
                 role=role,
                 reason=reason,
-                workflow_key=workflow_key,
                 itsm_sn=ticket.get("sn", ""),
                 itsm_ticket_id=ticket.get("id", ""),
-                status=ScenePermissionApplication.Status.PENDING,
+                status=ApplicationStatus.PENDING,
                 approvers=approvers,
                 created_by=applicant,
                 updated_by=applicant,
@@ -765,65 +757,21 @@ class ApplyScenePermission(SceneResource):
             raise
 
     @staticmethod
-    def _get_form_field_keys(workflow_key: str) -> dict:
-        """从 user_workflow_detail 的 jsonschema 解析 标题→字段key 映射（带缓存）。
-
-        ITSM V4 字段 key 是自动生成的随机串（如 text_HB5MRZyY），
-        不能硬编码；按字段标题动态匹配。
-        """
-        cache_key = f"scene_permission:form_keys:{workflow_key}"
-        field_keys = cache.get(cache_key)
-        if field_keys is not None:
-            return field_keys
-
-        workflow_detail = resource.itsm.get_user_workflow_detail(workflow_key=workflow_key)
-        if not workflow_detail:
-            raise ApproveServiceNotConfigured()
-
-        # 解析 jsonschema.properties：{ field_key: { "title": "标题", "translations": {...} } }
-        properties = workflow_detail.get("jsonschema", {}).get("properties", {})
-        field_keys = {}
-        for key, field_def in properties.items():
-            translations = field_def.get("translations", {})
-            title = translations.get("title_zh_hans") or field_def.get("title", "")
-            if title:
-                field_keys[title] = key
-
-        # 校验必要字段都存在
-        required_titles = [
-            ScenePermissionFormFieldTitles.TITLE,
-            ScenePermissionFormFieldTitles.APPLICANT,
-            ScenePermissionFormFieldTitles.SCENE_NAME,
-            ScenePermissionFormFieldTitles.ROLE,
-            ScenePermissionFormFieldTitles.APPROVER,
-        ]
-        missing = [t for t in required_titles if t not in field_keys]
-        if missing:
-            raise ScenePermissionApplicationException(
-                message=gettext("ITSM 审批流程缺少必要字段：%s，请联系管理员检查流程表单配置") % "、".join(missing)
-            )
-
-        cache.set(cache_key, field_keys, SCENE_PERMISSION_WORKFLOW_CACHE_TIMEOUT)
-        return field_keys
-
-    @staticmethod
-    def _create_itsm_ticket(applicant, workflow_key, field_keys, scene, role, reason, approvers) -> dict:
+    def _create_itsm_ticket(applicant, scene, role, reason, approvers) -> dict:
+        """建 ITSM V4 审批单。字段标识见 ScenePermissionFormFields。"""
         role_label = dict(SceneRole.choices).get(role, role)
         form_data = {
-            field_keys[ScenePermissionFormFieldTitles.TITLE]: gettext("【审计中心】%s 申请 %s %s权限")
+            ScenePermissionFormFields.TITLE: gettext("【审计中心】%s 申请 %s %s权限")
             % (applicant, scene.name, role_label),
-            field_keys[ScenePermissionFormFieldTitles.APPLICANT]: applicant,
-            field_keys[ScenePermissionFormFieldTitles.SCENE_NAME]: scene.name,
-            field_keys[ScenePermissionFormFieldTitles.ROLE]: role_label,
-            field_keys[ScenePermissionFormFieldTitles.APPROVER]: approvers,
+            ScenePermissionFormFields.APPLICANT: applicant,
+            ScenePermissionFormFields.SCENE_NAME: scene.name,
+            ScenePermissionFormFields.ROLE: role_label,
+            ScenePermissionFormFields.APPROVER: approvers,
+            ScenePermissionFormFields.REASON: reason,
         }
-        # 申请理由字段可选（可能未在流程中配置）
-        reason_key = field_keys.get(ScenePermissionFormFieldTitles.REASON)
-        if reason_key:
-            form_data[reason_key] = reason
-        return resource.itsm.create_ticket_v4(
+        return api.bk_itsm_v4.ticket_create(
             operator=applicant,
-            workflow_key=workflow_key,
+            workflow_key=SCENE_PERMISSION_WORKFLOW_KEY,
             form_data=form_data,
             is_submit=True,
         )
@@ -838,7 +786,7 @@ class ListMyScenePermissionApplications(SceneResource):
 
     class RequestSerializer(serializers.Serializer):
         status = FlexibleListField(
-            child=serializers.ChoiceField(choices=ScenePermissionApplication.Status.choices),
+            child=serializers.ChoiceField(choices=ApplicationStatus.choices),
             required=False,
         )
 

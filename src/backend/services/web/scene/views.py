@@ -105,7 +105,12 @@ class SceneViewSet(ResourceViewSet):
 
 
 class ScenePermissionApplicationViewSet(ResourceViewSet):
-    """场景权限自助申请"""
+    """
+    场景权限自助申请
+
+        POST /api/v1/scene_permission_applications/apply/   场景管理/使用权限申请
+        GET  /api/v1/scene_permission_applications/mine/    我的申请列表
+    """
 
     resource_routes = [
         ResourceRoute("POST", resource.scene.apply_scene_permission, endpoint="apply"),
@@ -116,7 +121,3 @@ class ScenePermissionApplicationViewSet(ResourceViewSet):
             enable_paginate=True,
         ),
     ]
-
-    def get_permissions(self):
-        # 登录即可（用户正因为没有权限才来申请，不能要求已有 IAM 权限）
-        return []

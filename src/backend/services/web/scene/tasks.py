@@ -16,7 +16,7 @@ We undertake not to change the open source license (MIT license) applicable
 to the current version of the project delivered to anyone in the future.
 """
 
-from bk_resource import resource
+from bk_resource import api
 from bk_resource.settings import bk_resource_settings
 from blueapps.contrib.celery_tools.periodic import periodic_task
 from blueapps.utils.logger import logger_celery
@@ -26,6 +26,8 @@ from django.db import transaction
 
 from core.lock import lock
 from services.web.scene.constants import (
+    ApplicationStatus,
+    GrantStatus,
     SCENE_PERMISSION_GRANT_MAX_RETRY,
     SYNC_SCENE_PERMISSION_PERIODIC_TASK_MINUTE,
 )
@@ -92,7 +94,7 @@ def sync_scene_permission_status():
     # select_related("scene") 避免 _do_grant 访问 application.scene 时 N+1 查询
     pending_qs = (
         ScenePermissionApplication.objects.select_related("scene")
-        .filter(status=ScenePermissionApplication.Status.PENDING)
+        .filter(status=ApplicationStatus.PENDING)
         .exclude(itsm_sn="")
     )
     for application in pending_qs:
@@ -103,9 +105,13 @@ def sync_scene_permission_status():
                     .select_related("scene")
                     .get(id=application.id)
                 )
-                if application.status != ScenePermissionApplication.Status.PENDING:
+                if application.status != ApplicationStatus.PENDING:
                     continue  # 并发已被处理
-                ticket = resource.itsm.get_system_ticket_list(sn=application.itsm_sn)
+                ticket_result = api.bk_itsm_v4.system_ticket_list(
+                    sn__contains=application.itsm_sn, page=1, page_size=1
+                )
+                results = ticket_result.get("results", [])
+                ticket = results[0] if results else {}
                 if not ticket:
                     continue  # 查不到，跳过等下次
                 apply_ticket_result(application, ticket, operator=operator)
@@ -119,8 +125,8 @@ def sync_scene_permission_status():
     failed_qs = (
         ScenePermissionApplication.objects.select_related("scene")
         .filter(
-            status=ScenePermissionApplication.Status.APPROVED,
-            grant_status=ScenePermissionApplication.GrantStatus.FAILED,
+            status=ApplicationStatus.APPROVED,
+            grant_status=GrantStatus.FAILED,
             retry_count__lt=SCENE_PERMISSION_GRANT_MAX_RETRY,
         )
         .exclude(itsm_sn="")
@@ -133,7 +139,7 @@ def sync_scene_permission_status():
                     .select_related("scene")
                     .get(id=application.id)
                 )
-                if application.grant_status != ScenePermissionApplication.GrantStatus.FAILED:
+                if application.grant_status != GrantStatus.FAILED:
                     continue
                 _do_grant(application, operator=operator)
                 application.save()

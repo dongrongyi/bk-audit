@@ -24,16 +24,18 @@ from django.utils.translation import gettext
 from django.utils import timezone
 
 from apps.meta.handlers.iam_group import IAMGroupManager
-from apps.permission.constants import IAMV4Role
 from apps.permission.handlers.resource_types import ResourceEnum
 from apps.permission.handlers.service import PermissionService
 from services.web.common.monitor import ScenePermissionGrantFailedEvent
 from services.web.scene.constants import (
+    ApplicationStatus,
+    GrantStatus,
     ITSMV4TicketStatus,
     SCENE_PERMISSION_GRANT_MAX_RETRY,
     SCENE_ROLE_TO_IAM_V4_ROLE,
     SceneRole,
 )
+from services.web.scene.exceptions import ScenePermissionApplicationException
 from services.web.scene.models import Scene, ScenePermissionApplication
 
 
@@ -85,23 +87,22 @@ def apply_ticket_result(
     :param operator: 授权操作人
     """
     itsm_status = ticket_data.get("status", "")
-    application.itsm_status = itsm_status
 
     # ① 审批通过 → 先设审批状态，再授权
     if itsm_status == ITSMV4TicketStatus.FINISHED and ticket_data.get("approve_result"):
-        application.status = ScenePermissionApplication.Status.APPROVED
+        application.status = ApplicationStatus.APPROVED
         _do_grant(application, operator=operator)
     # ② 审批驳回（finished 但未通过）→ 记录拒绝理由
     elif itsm_status == ITSMV4TicketStatus.FINISHED:
         application.reject_reason = _extract_reject_reason(ticket_data)
-        _set_terminal(application, ScenePermissionApplication.Status.REJECTED)
+        _set_terminal(application, ApplicationStatus.REJECTED)
     # ③ 被终止 → 记录拒绝理由
     elif itsm_status == ITSMV4TicketStatus.TERMINATED:
         application.reject_reason = _extract_reject_reason(ticket_data)
-        _set_terminal(application, ScenePermissionApplication.Status.REJECTED)
+        _set_terminal(application, ApplicationStatus.REJECTED)
     # ④ 申请人撤单
     elif itsm_status == ITSMV4TicketStatus.REVOKED:
-        _set_terminal(application, ScenePermissionApplication.Status.REVOKED)
+        _set_terminal(application, ApplicationStatus.REVOKED)
     # running / draft → 保持 PENDING，不动
 
 
@@ -127,19 +128,19 @@ def _do_grant(application: ScenePermissionApplication, operator: Optional[str] =
             operator=operator,
         )
         if result.get("success"):
-            application.grant_status = ScenePermissionApplication.GrantStatus.SUCCESS
+            application.grant_status = GrantStatus.SUCCESS
             application.grant_method = result.get("method", "")
             application.grant_error = ""
             application.retry_count = 0
             application.finished_at = timezone.now()
         else:
-            application.grant_status = ScenePermissionApplication.GrantStatus.FAILED
+            application.grant_status = GrantStatus.FAILED
             application.grant_error = result.get("error", "unknown")
             application.retry_count += 1
             _check_grant_retry_exhausted(application)
     except Exception as err:  # pylint: disable=broad-except
         logger.exception("[_do_grant] 申请单 %s 授权失败: %s", application.id, err)
-        application.grant_status = ScenePermissionApplication.GrantStatus.FAILED
+        application.grant_status = GrantStatus.FAILED
         application.grant_error = str(err)
         application.retry_count += 1
         _check_grant_retry_exhausted(application)
@@ -170,7 +171,6 @@ def _check_grant_retry_exhausted(application: ScenePermissionApplication) -> Non
             },
             extra={
                 "retry_count": application.retry_count,
-                "workflow_key": application.workflow_key,
                 "itsm_sn": application.itsm_sn,
             },
         )
@@ -180,19 +180,10 @@ def _check_grant_retry_exhausted(application: ScenePermissionApplication) -> Non
 
 
 def _set_terminal(
-    application: ScenePermissionApplication, status: Union[str, ScenePermissionApplication.Status]
+    application: ScenePermissionApplication, status: Union[str, ApplicationStatus]
 ) -> None:
     application.status = status
     application.finished_at = timezone.now()
-
-
-def get_scene_managers(scene: Scene) -> list:
-    """获取场景管理员（V4 真相源优先，本地缓存兜底）。"""
-    if IAMGroupManager.is_v4_backend():
-        managers = IAMGroupManager.get_scene_role_members(IAMV4Role.SCENE_ADMIN, str(scene.scene_id))
-        if managers:
-            return managers
-    return list(scene.managers or [])
 
 
 def already_has_role(scene: Scene, role: str, username: str) -> bool:
@@ -202,6 +193,8 @@ def already_has_role(scene: Scene, role: str, username: str) -> bool:
         return username in IAMGroupManager.get_scene_role_members(role_id, str(scene.scene_id))
     group_id = scene.iam_manager_group_id if role == SceneRole.MANAGER else scene.iam_viewer_group_id
     if not group_id:
-        return False
+        raise ScenePermissionApplicationException(
+            message=gettext("场景用户组未创建，无法校验权限，请联系管理员")
+        )
     members = IAMGroupManager.get_all_group_members(group_id=group_id)
     return username in [m["id"] for m in members if m.get("type") == "user"]

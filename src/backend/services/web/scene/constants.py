@@ -117,8 +117,8 @@ SCENE_RISK_COUNT_ACTIVE_DISPLAY_STATUSES = (
 
 # ==================== 场景权限自助审批 ====================
 
-# 全局配置 key（存 GlobalMetaConfig）：ITSM V4 流程编码
-SCENE_PERMISSION_WORKFLOW_KEY = "SCENE_PERMISSION_WORKFLOW_KEY"
+# 全局配置：ITSM V4 审批流程编码
+SCENE_PERMISSION_WORKFLOW_KEY = os.getenv("BKAPP_SCENE_PERMISSION_WORKFLOW_KEY", "")
 
 # 周期任务 cron 分钟
 SYNC_SCENE_PERMISSION_PERIODIC_TASK_MINUTE = os.getenv("BKAPP_SYNC_SCENE_PERMISSION_MINUTE", "*/10")
@@ -136,20 +136,27 @@ SCENE_ROLE_TO_IAM_V4_ROLE = {
 }
 
 
-class ScenePermissionFormFieldTitles:
-    """ITSM V4 流程表单字段标题约定。
+class ScenePermissionFormFields:
+    """ITSM V4 流程表单字段标识。
 
-    运维在 ITSM 建流程时，字段「标题」必须与此处一致。
-    代码运行时从 user_workflow_detail 的 jsonschema 按 title 动态匹配字段 key
-    （ITSM V4 的字段 key 是自动生成的随机串，不能硬编码）。
+    在 ITSM 创建审批流程时的表单模型：
+
+    | 字段标识        | 字段类型       | 说明                         |
+    |---------------|--------------|------------------------------|
+    | ticket__title | 单行文本        | 标题（ITSM 内置，固定不可改）        |
+    | applicant     | 单行文本        | 申请人                          |
+    | scene_name    | 单行文本        | 场景名称                         |
+    | role          | 单行文本        | 申请角色                         |
+    | reason        | 多行文本        | 申请理由（可选）                     |
+    | approver      | 人员选择器(多选)    | 审批人（审批节点处理人取自此字段）      |
     """
 
-    TITLE = "标题"
-    APPLICANT = "申请人"
-    SCENE_NAME = "场景名称"
-    ROLE = "申请角色"
-    REASON = "申请理由"
-    APPROVER = "审批人"
+    TITLE = "ticket__title"
+    APPLICANT = "applicant"
+    SCENE_NAME = "scene_name"
+    ROLE = "role"
+    REASON = "reason"
+    APPROVER = "approver"
 
 
 class ITSMV4TicketStatus(TextChoices):
@@ -160,3 +167,19 @@ class ITSMV4TicketStatus(TextChoices):
     TERMINATED = "terminated", gettext_lazy("被终止")
     REVOKED = "revoked", gettext_lazy("被撤销")
     DRAFT = "draft", gettext_lazy("草稿")
+
+
+class ApplicationStatus(TextChoices):
+    """场景权限申请审批状态"""
+
+    PENDING = "pending", gettext_lazy("待审批")
+    APPROVED = "approved", gettext_lazy("审批通过")
+    REJECTED = "rejected", gettext_lazy("已驳回")
+    REVOKED = "revoked", gettext_lazy("已撤回")
+
+
+class GrantStatus(TextChoices):
+    """场景权限授权状态"""
+
+    SUCCESS = "success", gettext_lazy("授权成功")
+    FAILED = "failed", gettext_lazy("授权失败")
