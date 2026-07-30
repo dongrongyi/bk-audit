@@ -733,7 +733,7 @@ class ApplyScenePermission(SceneResource):
             approvers=approvers,
         )
 
-        # 7. 落库（失败则记录孤儿单号，便于人工补偿）
+        # 7. 落库
         try:
             return ScenePermissionApplication.objects.create(
                 scene=scene,
@@ -749,7 +749,7 @@ class ApplyScenePermission(SceneResource):
             )
         except Exception:
             logger.exception(
-                "[ApplyScenePermission] DB 写入失败，孤儿 ITSM 单 sn=%s, applicant=%s, scene=%s",
+                "[ApplyScenePermission] DB 写入失败， ITSM 单 sn=%s, applicant=%s, scene=%s",
                 ticket.get("sn", ""),
                 applicant,
                 scene.scene_id,
@@ -796,4 +796,4 @@ class ListMyScenePermissionApplications(SceneResource):
         )
         if validated_request_data.get("status"):
             qs = qs.filter(status__in=validated_request_data["status"])
-        return qs.order_by("-id")
+        return qs.order_by("-updated_at")

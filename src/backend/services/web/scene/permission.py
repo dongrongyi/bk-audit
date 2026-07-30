@@ -116,10 +116,7 @@ def _extract_reject_reason(ticket_data: dict) -> str:
 
 
 def _do_grant(application: ScenePermissionApplication, operator: Optional[str] = None) -> None:
-    """执行授权。成功→grant_status=SUCCESS；失败→grant_status=FAILED(retry_count++)。
-
-    注意：status（审批状态）由调用方 apply_ticket_result 设为 APPROVED，此函数只管 grant_status。
-    """
+    """执行授权。成功→grant_status=SUCCESS；失败→grant_status=FAILED(retry_count++)"""
     try:
         result = grant_scene_role(
             scene=application.scene,

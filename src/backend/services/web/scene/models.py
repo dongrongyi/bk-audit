@@ -230,7 +230,7 @@ class ScenePermissionApplication(OperateRecordModel):
     class Meta:
         verbose_name = gettext_lazy("场景权限申请")
         verbose_name_plural = verbose_name
-        ordering = ["-id"]
+        ordering = ["-updated_at"]
         indexes = [
             models.Index(fields=["applicant", "status"], name="spa_app_status_idx"),
             models.Index(fields=["scene", "status"], name="spa_scene_status_idx"),

@@ -91,11 +91,9 @@ def sync_scene_permission_status():
     operator = bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME
 
     # 阶段一：同步 PENDING
-    # select_related("scene") 避免 _do_grant 访问 application.scene 时 N+1 查询
     pending_qs = (
         ScenePermissionApplication.objects.select_related("scene")
         .filter(status=ApplicationStatus.PENDING)
-        .exclude(itsm_sn="")
     )
     for application in pending_qs:
         try:
@@ -129,7 +127,6 @@ def sync_scene_permission_status():
             grant_status=GrantStatus.FAILED,
             retry_count__lt=SCENE_PERMISSION_GRANT_MAX_RETRY,
         )
-        .exclude(itsm_sn="")
     )
     for application in failed_qs:
         try:
@@ -144,8 +141,6 @@ def sync_scene_permission_status():
                 _do_grant(application, operator=operator)
                 application.save()
         except Exception as err:  # pylint: disable=broad-except
-            # _do_grant 内部已 catch 异常并自增 retry_count；
-            # 此处仅兜底 get/save 等基础设施异常，不重复计数（下个周期自然重试）
             logger_celery.exception(
                 "[sync_scene_permission_status] 授权失败重试 %s 失败: %s", application.id, err
             )

@@ -109,5 +109,4 @@ class ScenePermissionApplicationAdmin(admin.ModelAdmin):
         "grant_method",
         "retry_count",
         "itsm_ticket_id",
-        "itsm_status",
     ]
