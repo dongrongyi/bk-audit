@@ -201,6 +201,7 @@ class ScenePermissionApplication(OperateRecordModel):
     # ITSM 单据
     itsm_sn = models.CharField(gettext_lazy("ITSM单号"), max_length=64, db_index=True)
     itsm_ticket_id = models.CharField(gettext_lazy("ITSM工单ID"), max_length=128, blank=True, default="")
+    callback_token = models.CharField(gettext_lazy("回调鉴权Token"), max_length=128, blank=True, default="")
 
     # 状态
     status = models.CharField(

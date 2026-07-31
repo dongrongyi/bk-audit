@@ -80,7 +80,7 @@ def grant_scene_role(scene: Scene, role: str, username: str, operator: Optional[
 def apply_ticket_result(
     application: ScenePermissionApplication, ticket_data: dict, operator: Optional[str] = None
 ) -> None:
-    """根据 ITSM 工单结果推进申请状态。【轮询 / 未来 callback 共用入口】
+    """根据 ITSM 工单结果推进申请状态。【轮询 / callback 共用入口】
 
     :param application: 申请单（调用方负责加锁/事务）
     :param ticket_data: ITSM 工单数据 {"status": "finished", "approve_result": True, ...}

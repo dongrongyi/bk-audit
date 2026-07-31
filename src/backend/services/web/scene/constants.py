@@ -141,18 +141,22 @@ class ScenePermissionFormFields:
 
     在 ITSM 创建审批流程时的表单模型：
 
-    | 字段标识        | 字段类型       | 说明                         |
-    |---------------|--------------|------------------------------|
-    | ticket__title | 单行文本        | 标题（ITSM 内置，固定不可改）        |
-    | applicant     | 单行文本        | 申请人                          |
-    | scene_name    | 单行文本        | 场景名称                         |
-    | role          | 单行文本        | 申请角色                         |
-    | reason        | 多行文本        | 申请理由（可选）                     |
-    | approver      | 人员选择器(多选)    | 审批人（审批节点处理人取自此字段）      |
+    | 字段标识             | 字段类型       | 说明                         |
+    |--------------------|--------------|------------------------------|
+    | ticket__title      | 单行文本        | 标题（ITSM 内置，固定不可改）        |
+    | applicant          | 单行文本        | 申请人                          |
+    | applicant_department | 单行文本      | 申请人部门                        |
+    | apply_time         | 单行文本        | 申请时间                          |
+    | scene_name         | 单行文本        | 场景名称(场景ID)                    |
+    | role               | 单行文本        | 申请角色                         |
+    | reason             | 多行文本        | 申请理由（可选）                     |
+    | approver           | 人员选择器(多选)    | 审批人（审批节点处理人取自此字段）      |
     """
 
     TITLE = "ticket__title"
     APPLICANT = "applicant"
+    APPLICANT_DEPARTMENT = "applicant_department"
+    APPLY_TIME = "apply_time"
     SCENE_NAME = "scene_name"
     ROLE = "role"
     REASON = "reason"

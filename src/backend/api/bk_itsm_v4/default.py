@@ -65,3 +65,11 @@ class SystemTicketList(BKITSMV4):
     name = gettext_lazy("V4-查询工单列表")
     method = "GET"
     action = "/api/v1/system_ticket/list/"
+
+
+class TicketDetail(BKITSMV4):
+    """查询单个工单详情"""
+
+    name = gettext_lazy("V4-查询工单详情")
+    method = "GET"
+    action = "/api/v1/ticket/detail/"

@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import abc
+import uuid
 from collections.abc import Collection
 
 from bk_resource import api, resource
+from bk_resource.settings import bk_resource_settings
 from django.conf import settings
 from django.db import transaction
 from django.db.models import (
@@ -19,6 +21,7 @@ from django.db.models import (
     When,
 )
 from django.db.models.functions import Cast, Coalesce
+from django.utils import timezone
 from django.utils.translation import gettext, gettext_lazy
 from rest_framework import serializers
 
@@ -58,7 +61,7 @@ from services.web.scene.models import (
     ScenePermissionApplication,
     SceneSystem,
 )
-from services.web.scene.permission import already_has_role
+from services.web.scene.permission import already_has_role, apply_ticket_result
 from services.web.scene.serializers import (
     ApplyScenePermissionRequestSerializer,
     CreateSceneSerializer,
@@ -724,16 +727,33 @@ class ApplyScenePermission(SceneResource):
         if not approvers:
             approvers = list(settings.SYSTEM_ADMIN)
 
-        # 6. 建 ITSM V4 单（operator=申请人 → 单据归属申请人，可在 ITSM 查看/撤单）
+        # 6. 生成回调 Token
+        callback_token = str(uuid.uuid4())
+
+        # 7. 校验回调地址已配置
+        if not getattr(settings, "BKAUDIT_CALLBACK_URL_PREFIX", ""):
+            logger.error("[ApplyScenePermission] BKAUDIT_CALLBACK_URL_PREFIX 未配置，无法创建 ITSM 工单")
+            raise ApproveServiceNotConfigured()
+
+        # 8. 建 ITSM V4 单（operator=申请人 → 单据归属申请人，可在 ITSM 查看/撤单）
         ticket = self._create_itsm_ticket(
             applicant=applicant,
             scene=scene,
             role=role,
             reason=reason,
             approvers=approvers,
+            callback_token=callback_token,
         )
 
-        # 7. 落库
+        # 9. 落库
+        itsm_ticket_id = ticket.get("id", "")
+        if not itsm_ticket_id:
+            logger.error(
+                "[ApplyScenePermission] ITSM 未返回 ticket id， sn=%s, applicant=%s, scene=%s",
+                ticket.get("sn", ""),
+                applicant,
+                scene.scene_id,
+            )
         try:
             return ScenePermissionApplication.objects.create(
                 scene=scene,
@@ -741,7 +761,8 @@ class ApplyScenePermission(SceneResource):
                 role=role,
                 reason=reason,
                 itsm_sn=ticket.get("sn", ""),
-                itsm_ticket_id=ticket.get("id", ""),
+                itsm_ticket_id=itsm_ticket_id,
+                callback_token=callback_token,
                 status=ApplicationStatus.PENDING,
                 approvers=approvers,
                 created_by=applicant,
@@ -757,23 +778,39 @@ class ApplyScenePermission(SceneResource):
             raise
 
     @staticmethod
-    def _create_itsm_ticket(applicant, scene, role, reason, approvers) -> dict:
+    def _create_itsm_ticket(applicant, scene, role, reason, approvers, callback_token) -> dict:
         """建 ITSM V4 审批单。字段标识见 ScenePermissionFormFields。"""
         role_label = dict(SceneRole.choices).get(role, role)
+
+        # 获取申请人部门（主岗全称）
+        applicant_department = ""
+        try:
+            departments = api.user_manage.list_user_departments(id=applicant)
+            if departments:
+                applicant_department = departments[0].get("full_name", "")
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("[_create_itsm_ticket] 获取用户部门失败, applicant=%s", applicant)
+
         form_data = {
             ScenePermissionFormFields.TITLE: gettext("【审计中心】%s 申请 %s %s权限")
             % (applicant, scene.name, role_label),
             ScenePermissionFormFields.APPLICANT: applicant,
-            ScenePermissionFormFields.SCENE_NAME: scene.name,
+            ScenePermissionFormFields.APPLICANT_DEPARTMENT: applicant_department,
+            ScenePermissionFormFields.APPLY_TIME: timezone.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ScenePermissionFormFields.SCENE_NAME: f"{scene.name}({scene.scene_id})",
             ScenePermissionFormFields.ROLE: role_label,
             ScenePermissionFormFields.APPROVER: approvers,
             ScenePermissionFormFields.REASON: reason,
         }
+        # 构造回调 URL（需要配置 BKAPP_BKAUDIT_CALLBACK_URL_PREFIX 环境变量）
+        callback_url = f"{settings.BKAUDIT_CALLBACK_URL_PREFIX}/api/v1/scene_permission_applications/callback/"
         return api.bk_itsm_v4.ticket_create(
             operator=applicant,
             workflow_key=SCENE_PERMISSION_WORKFLOW_KEY,
             form_data=form_data,
             is_submit=True,
+            callback_url=callback_url,
+            callback_token=callback_token,
         )
 
 
@@ -797,3 +834,67 @@ class ListMyScenePermissionApplications(SceneResource):
         if validated_request_data.get("status"):
             qs = qs.filter(status__in=validated_request_data["status"])
         return qs.order_by("-updated_at")
+
+
+class ScenePermissionApplicationCallback(SceneResource):
+    """ITSM 工单回调接口
+
+    ITSM 审批完成后主动回调此接口，更新申请单状态并触发授权。
+    """
+
+    name = gettext_lazy("ITSM工单回调")
+
+    class RequestSerializer(serializers.Serializer):
+        callback_token = serializers.CharField(label=gettext_lazy("回调鉴权Token"))
+        ticket = serializers.DictField(label=gettext_lazy("工单详情"))
+
+    def perform_request(self, validated_request_data):
+        callback_token = validated_request_data.get("callback_token", "")
+        ticket_data = validated_request_data.get("ticket", {})
+
+        # 1. 提取工单信息
+        ticket_id = ticket_data.get("id", "")
+
+        if not ticket_id:
+            logger.warning("[ScenePermissionApplicationCallback] 回调缺少工单ID")
+            return {"result": False, "message": "missing ticket id"}
+
+        # 2. 查找申请单
+        try:
+            application = ScenePermissionApplication.objects.select_related("scene").get(
+                itsm_ticket_id=ticket_id
+            )
+        except ScenePermissionApplication.DoesNotExist:
+            logger.warning("[ScenePermissionApplicationCallback] 未找到申请单, ticket_id=%s", ticket_id)
+            return {"result": False, "message": "application not found"}
+
+        # 3. 验证 callback_token
+        if not callback_token or application.callback_token != callback_token:
+            logger.warning(
+                "[ScenePermissionApplicationCallback] Token验证失败, ticket_id=%s", ticket_id
+            )
+            return {"result": False, "message": "invalid token"}
+
+        # 4. 幂等校验：已终态则跳过
+        if application.is_terminal:
+            return {"result": True, "message": "already processed"}
+
+        # 5. 处理回调
+        try:
+            with transaction.atomic():
+                application = ScenePermissionApplication.objects.select_for_update().get(id=application.id)
+                if application.is_terminal:
+                    return {"result": True, "message": "already processed"}
+
+                operator = bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME
+                apply_ticket_result(application, ticket_data, operator=operator)
+                application.save()
+        except Exception as err:
+            logger.exception(
+                "[ScenePermissionApplicationCallback] 处理回调失败, ticket_id=%s, error=%s",
+                ticket_id,
+                err,
+            )
+            return {"result": False, "message": str(err)}
+
+        return {"result": True, "message": "success"}

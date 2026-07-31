@@ -108,8 +108,9 @@ class ScenePermissionApplicationViewSet(ResourceViewSet):
     """
     场景权限自助申请
 
-        POST /api/v1/scene_permission_applications/apply/   场景管理/使用权限申请
-        GET  /api/v1/scene_permission_applications/mine/    我的申请列表
+        POST /api/v1/scene_permission_applications/apply/      场景管理/使用权限申请
+        GET  /api/v1/scene_permission_applications/mine/       我的申请列表
+        POST /api/v1/scene_permission_applications/callback/   ITSM工单回调
     """
 
     resource_routes = [
@@ -119,5 +120,10 @@ class ScenePermissionApplicationViewSet(ResourceViewSet):
             resource.scene.list_my_scene_permission_applications,
             endpoint="mine",
             enable_paginate=True,
+        ),
+        ResourceRoute(
+            "POST",
+            resource.scene.scene_permission_application_callback,
+            endpoint="callback",
         ),
     ]

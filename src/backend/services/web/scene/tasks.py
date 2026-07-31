@@ -105,11 +105,12 @@ def sync_scene_permission_status():
                 )
                 if application.status != ApplicationStatus.PENDING:
                     continue  # 并发已被处理
-                ticket_result = api.bk_itsm_v4.system_ticket_list(
-                    sn__contains=application.itsm_sn, page=1, page_size=1
-                )
-                results = ticket_result.get("results", [])
-                ticket = results[0] if results else {}
+                if not application.itsm_ticket_id:
+                    logger_celery.warning(
+                        "[sync_scene_permission_status] PENDING 单 %s 无 itsm_ticket_id，跳过", application.id
+                    )
+                    continue
+                ticket = api.bk_itsm_v4.ticket_detail(id=application.itsm_ticket_id)
                 if not ticket:
                     continue  # 查不到，跳过等下次
                 apply_ticket_result(application, ticket, operator=operator)

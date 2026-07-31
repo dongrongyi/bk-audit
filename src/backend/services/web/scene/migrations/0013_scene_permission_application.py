@@ -49,6 +49,10 @@ class Migration(migrations.Migration):
                     models.CharField(blank=True, default="", max_length=128, verbose_name="ITSM工单ID"),
                 ),
                 (
+                    "callback_token",
+                    models.CharField(blank=True, default="", max_length=128, verbose_name="回调验证Token"),
+                ),
+                (
                     "status",
                     models.CharField(
                         choices=[
@@ -92,7 +96,7 @@ class Migration(migrations.Migration):
             options={
                 "verbose_name": "场景权限申请",
                 "verbose_name_plural": "场景权限申请",
-                "ordering": ["-id"],
+                "ordering": ["-updated_at"],
                 "indexes": [
                     models.Index(fields=["applicant", "status"], name="spa_app_status_idx"),
                     models.Index(fields=["scene", "status"], name="spa_scene_status_idx"),
