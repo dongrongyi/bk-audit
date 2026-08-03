@@ -193,14 +193,13 @@ class ScenePermissionApplication(OperateRecordModel):
 
     scene = models.ForeignKey(Scene, on_delete=models.CASCADE, related_name="permission_applications")
     applicant = models.CharField(gettext_lazy("申请人"), max_length=64, db_index=True)
-    role = models.CharField(
-        gettext_lazy("申请角色"), max_length=16, choices=SceneRole.choices, db_index=True
-    )
+    role = models.CharField(gettext_lazy("申请角色"), max_length=16, choices=SceneRole.choices, db_index=True)
     reason = models.TextField(gettext_lazy("申请理由"), blank=True, default="")
 
     # ITSM 单据
     itsm_sn = models.CharField(gettext_lazy("ITSM单号"), max_length=64, db_index=True)
     itsm_ticket_id = models.CharField(gettext_lazy("ITSM工单ID"), max_length=128, blank=True, default="")
+    itsm_ticket_url = models.CharField(gettext_lazy("ITSM工单链接"), max_length=512, blank=True, default="")
     callback_token = models.CharField(gettext_lazy("回调鉴权Token"), max_length=128, blank=True, default="")
 
     # 状态

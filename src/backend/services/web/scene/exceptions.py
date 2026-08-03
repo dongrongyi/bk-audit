@@ -128,4 +128,3 @@ class ApplicationPending(ScenePermissionApplicationException):
 class ApproveServiceNotConfigured(ScenePermissionApplicationException):
     MESSAGE = gettext_lazy("场景权限审批流程未配置，请联系管理员")
     ERROR_CODE = "013"
-

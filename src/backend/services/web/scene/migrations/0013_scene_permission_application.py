@@ -49,6 +49,10 @@ class Migration(migrations.Migration):
                     models.CharField(blank=True, default="", max_length=128, verbose_name="ITSM工单ID"),
                 ),
                 (
+                    "itsm_ticket_url",
+                    models.CharField(blank=True, default="", max_length=512, verbose_name="ITSM工单链接"),
+                ),
+                (
                     "callback_token",
                     models.CharField(blank=True, default="", max_length=128, verbose_name="回调验证Token"),
                 ),

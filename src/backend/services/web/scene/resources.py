@@ -5,6 +5,7 @@ from collections.abc import Collection
 
 from bk_resource import api, resource
 from bk_resource.settings import bk_resource_settings
+from blueapps.utils.logger import logger
 from django.conf import settings
 from django.db import transaction
 from django.db.models import (
@@ -29,7 +30,6 @@ from apps.audit.resources import AuditMixinResource
 from apps.meta.constants import SystemAuditStatusEnum
 from apps.meta.handlers.iam_group import IAMGroupManager
 from apps.meta.models import System
-from blueapps.utils.logger import logger
 from apps.permission.handlers.actions import ActionEnum
 from apps.permission.handlers.service import PermissionService
 from core.models import get_request_username
@@ -39,8 +39,8 @@ from services.web.common.scope_permission import ScopeContext, ScopePermission
 from services.web.risk.models import Risk
 from services.web.scene.binding_validation import assert_binding_relation_integrity
 from services.web.scene.constants import (
-    ApplicationStatus,
     SCENE_PERMISSION_WORKFLOW_KEY,
+    ApplicationStatus,
     ResourceVisibilityType,
     ScenePermissionFormFields,
     SceneRole,
@@ -50,8 +50,8 @@ from services.web.scene.exceptions import (
     AlreadyHasPermission,
     ApplicationPending,
     ApproveServiceNotConfigured,
-    SceneNotExist,
     SceneNotEnabled,
+    SceneNotExist,
     SceneStrategyNotDisabled,
 )
 from services.web.scene.models import (
@@ -762,6 +762,7 @@ class ApplyScenePermission(SceneResource):
                 reason=reason,
                 itsm_sn=ticket.get("sn", ""),
                 itsm_ticket_id=itsm_ticket_id,
+                itsm_ticket_url=ticket.get("frontend_url", ""),
                 callback_token=callback_token,
                 status=ApplicationStatus.PENDING,
                 approvers=approvers,
@@ -792,8 +793,7 @@ class ApplyScenePermission(SceneResource):
             logger.warning("[_create_itsm_ticket] 获取用户部门失败, applicant=%s", applicant)
 
         form_data = {
-            ScenePermissionFormFields.TITLE: gettext("【审计中心】%s 申请 %s %s权限")
-            % (applicant, scene.name, role_label),
+            ScenePermissionFormFields.TITLE: gettext("【审计中心】%s 申请 %s %s权限") % (applicant, scene.name, role_label),
             ScenePermissionFormFields.APPLICANT: applicant,
             ScenePermissionFormFields.APPLICANT_DEPARTMENT: applicant_department,
             ScenePermissionFormFields.APPLY_TIME: timezone.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -828,9 +828,7 @@ class ListMyScenePermissionApplications(SceneResource):
         )
 
     def perform_request(self, validated_request_data):
-        qs = ScenePermissionApplication.objects.select_related("scene").filter(
-            applicant=get_request_username()
-        )
+        qs = ScenePermissionApplication.objects.select_related("scene").filter(applicant=get_request_username())
         if validated_request_data.get("status"):
             qs = qs.filter(status__in=validated_request_data["status"])
         return qs.order_by("-updated_at")
@@ -861,18 +859,14 @@ class ScenePermissionApplicationCallback(SceneResource):
 
         # 2. 查找申请单
         try:
-            application = ScenePermissionApplication.objects.select_related("scene").get(
-                itsm_ticket_id=ticket_id
-            )
+            application = ScenePermissionApplication.objects.select_related("scene").get(itsm_ticket_id=ticket_id)
         except ScenePermissionApplication.DoesNotExist:
             logger.warning("[ScenePermissionApplicationCallback] 未找到申请单, ticket_id=%s", ticket_id)
             return {"result": False, "message": "application not found"}
 
         # 3. 验证 callback_token
         if not callback_token or application.callback_token != callback_token:
-            logger.warning(
-                "[ScenePermissionApplicationCallback] Token验证失败, ticket_id=%s", ticket_id
-            )
+            logger.warning("[ScenePermissionApplicationCallback] Token验证失败, ticket_id=%s", ticket_id)
             return {"result": False, "message": "invalid token"}
 
         # 4. 幂等校验：已终态则跳过

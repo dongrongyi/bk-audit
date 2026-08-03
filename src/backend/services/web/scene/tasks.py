@@ -26,15 +26,14 @@ from django.db import transaction
 
 from core.lock import lock
 from services.web.scene.constants import (
-    ApplicationStatus,
-    GrantStatus,
     SCENE_PERMISSION_GRANT_MAX_RETRY,
     SYNC_SCENE_PERMISSION_PERIODIC_TASK_MINUTE,
+    ApplicationStatus,
+    GrantStatus,
 )
 from services.web.scene.models import Scene, ScenePermissionApplication
 from services.web.scene.permission import _do_grant, apply_ticket_result
 from services.web.scene.resources import SceneResource
-
 
 # ==================== 场景成员同步（原有任务，每 10 分钟）====================
 
@@ -91,10 +90,7 @@ def sync_scene_permission_status():
     operator = bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME
 
     # 阶段一：同步 PENDING
-    pending_qs = (
-        ScenePermissionApplication.objects.select_related("scene")
-        .filter(status=ApplicationStatus.PENDING)
-    )
+    pending_qs = ScenePermissionApplication.objects.select_related("scene").filter(status=ApplicationStatus.PENDING)
     for application in pending_qs:
         try:
             with transaction.atomic():
@@ -116,18 +112,13 @@ def sync_scene_permission_status():
                 apply_ticket_result(application, ticket, operator=operator)
                 application.save()
         except Exception as err:  # pylint: disable=broad-except
-            logger_celery.exception(
-                "[sync_scene_permission_status] PENDING 单 %s 失败: %s", application.id, err
-            )
+            logger_celery.exception("[sync_scene_permission_status] PENDING 单 %s 失败: %s", application.id, err)
 
     # 阶段二：重试授权失败（审批已通过、仅授权失败），retry_count < MAX 才重试
-    failed_qs = (
-        ScenePermissionApplication.objects.select_related("scene")
-        .filter(
-            status=ApplicationStatus.APPROVED,
-            grant_status=GrantStatus.FAILED,
-            retry_count__lt=SCENE_PERMISSION_GRANT_MAX_RETRY,
-        )
+    failed_qs = ScenePermissionApplication.objects.select_related("scene").filter(
+        status=ApplicationStatus.APPROVED,
+        grant_status=GrantStatus.FAILED,
+        retry_count__lt=SCENE_PERMISSION_GRANT_MAX_RETRY,
     )
     for application in failed_qs:
         try:
@@ -142,6 +133,4 @@ def sync_scene_permission_status():
                 _do_grant(application, operator=operator)
                 application.save()
         except Exception as err:  # pylint: disable=broad-except
-            logger_celery.exception(
-                "[sync_scene_permission_status] 授权失败重试 %s 失败: %s", application.id, err
-            )
+            logger_celery.exception("[sync_scene_permission_status] 授权失败重试 %s 失败: %s", application.id, err)

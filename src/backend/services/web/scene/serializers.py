@@ -464,6 +464,7 @@ class ScenePermissionApplicationSerializer(serializers.ModelSerializer):
             "role_display",
             "reason",
             "itsm_sn",
+            "itsm_ticket_url",
             "status",
             "status_display",
             "grant_status",

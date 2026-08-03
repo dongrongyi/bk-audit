@@ -18,21 +18,22 @@ to the current version of the project delivered to anyone in the future.
 
 from typing import Optional, Union
 
-from blueapps.utils.logger import logger
+from bk_resource import api
 from bk_resource.settings import bk_resource_settings
-from django.utils.translation import gettext
+from blueapps.utils.logger import logger
 from django.utils import timezone
+from django.utils.translation import gettext
 
 from apps.meta.handlers.iam_group import IAMGroupManager
 from apps.permission.handlers.resource_types import ResourceEnum
 from apps.permission.handlers.service import PermissionService
 from services.web.common.monitor import ScenePermissionGrantFailedEvent
 from services.web.scene.constants import (
+    SCENE_PERMISSION_GRANT_MAX_RETRY,
+    SCENE_ROLE_TO_IAM_V4_ROLE,
     ApplicationStatus,
     GrantStatus,
     ITSMV4TicketStatus,
-    SCENE_PERMISSION_GRANT_MAX_RETRY,
-    SCENE_ROLE_TO_IAM_V4_ROLE,
     SceneRole,
 )
 from services.web.scene.exceptions import ScenePermissionApplicationException
@@ -94,11 +95,11 @@ def apply_ticket_result(
         _do_grant(application, operator=operator)
     # ② 审批驳回（finished 但未通过）→ 记录拒绝理由
     elif itsm_status == ITSMV4TicketStatus.FINISHED:
-        application.reject_reason = _extract_reject_reason(ticket_data)
+        application.reject_reason = _extract_reject_reason(application.itsm_ticket_id)
         _set_terminal(application, ApplicationStatus.REJECTED)
     # ③ 被终止 → 记录拒绝理由
     elif itsm_status == ITSMV4TicketStatus.TERMINATED:
-        application.reject_reason = _extract_reject_reason(ticket_data)
+        application.reject_reason = _extract_reject_reason(application.itsm_ticket_id)
         _set_terminal(application, ApplicationStatus.REJECTED)
     # ④ 申请人撤单
     elif itsm_status == ITSMV4TicketStatus.REVOKED:
@@ -106,12 +107,27 @@ def apply_ticket_result(
     # running / draft → 保持 PENDING，不动
 
 
-def _extract_reject_reason(ticket_data: dict) -> str:
-    """从 ITSM 工单数据中提取拒绝/驳回理由（字段名按 ITSM V4 实际返回适配）。"""
-    for key in ("opinion", "comment", "reject_reason", "remarks", "approve_result_remark"):
-        value = ticket_data.get(key)
-        if value:
-            return str(value)
+def _extract_reject_reason(ticket_id: str) -> str:
+    """从 ITSM V4 工单日志中提取拒绝/驳回理由。
+
+    :param ticket_id: ITSM 工单 ID
+    :return: 拒绝理由，获取失败返回空字符串
+    """
+    try:
+        logs_data = api.bk_itsm_v4.ticket_logs(ticket_id=ticket_id)
+        items = logs_data.get("items", [])
+
+        # 从后往前找最近的拒绝操作
+        for log_item in reversed(items):
+            if log_item.get("action") == "refuse":
+                # 从 extra 中提取审批意见
+                for extra_item in log_item.get("extra", []):
+                    if extra_item.get("type") == "name_value" and extra_item.get("name") == "审批意见":
+                        return str(extra_item.get("value", "")).strip()
+                break
+    except Exception as err:  # pylint: disable=broad-except
+        logger.warning("[_extract_reject_reason] 获取工单日志失败, ticket_id=%s, error=%s", ticket_id, err)
+
     return ""
 
 
@@ -176,9 +192,7 @@ def _check_grant_retry_exhausted(application: ScenePermissionApplication) -> Non
         logger.exception("[scene_permission] 告警事件上报失败，申请单 %s", application.id)
 
 
-def _set_terminal(
-    application: ScenePermissionApplication, status: Union[str, ApplicationStatus]
-) -> None:
+def _set_terminal(application: ScenePermissionApplication, status: Union[str, ApplicationStatus]) -> None:
     application.status = status
     application.finished_at = timezone.now()
 
@@ -190,8 +204,6 @@ def already_has_role(scene: Scene, role: str, username: str) -> bool:
         return username in IAMGroupManager.get_scene_role_members(role_id, str(scene.scene_id))
     group_id = scene.iam_manager_group_id if role == SceneRole.MANAGER else scene.iam_viewer_group_id
     if not group_id:
-        raise ScenePermissionApplicationException(
-            message=gettext("场景用户组未创建，无法校验权限，请联系管理员")
-        )
+        raise ScenePermissionApplicationException(message=gettext("场景用户组未创建，无法校验权限，请联系管理员"))
     members = IAMGroupManager.get_all_group_members(group_id=group_id)
     return username in [m["id"] for m in members if m.get("type") == "user"]
