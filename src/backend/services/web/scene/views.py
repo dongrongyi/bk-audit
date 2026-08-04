@@ -113,6 +113,11 @@ class ScenePermissionApplicationViewSet(ResourceViewSet):
         POST /api/v1/scene_permission_applications/callback/   ITSM工单回调
     """
 
+    def get_permissions(self):
+        if self.action == "callback":
+            return []
+        return super().get_permissions()
+
     resource_routes = [
         ResourceRoute("POST", resource.scene.apply_scene_permission, endpoint="apply"),
         ResourceRoute(

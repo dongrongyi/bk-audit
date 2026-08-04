@@ -29,10 +29,10 @@ from services.web.scene.constants import (
     SCENE_PERMISSION_GRANT_MAX_RETRY,
     SYNC_SCENE_PERMISSION_PERIODIC_TASK_MINUTE,
     ApplicationStatus,
-    GrantStatus,
+    GrantStatus, ITSMV4TicketStatus,
 )
 from services.web.scene.models import Scene, ScenePermissionApplication
-from services.web.scene.permission import _do_grant, apply_ticket_result
+from services.web.scene.permission import _do_grant, apply_ticket_result, parse_itsm_ticket, _extract_reject_reason
 from services.web.scene.resources import SceneResource
 
 # ==================== 场景成员同步（原有任务，每 10 分钟）====================
@@ -93,6 +93,23 @@ def sync_scene_permission_status():
     pending_qs = ScenePermissionApplication.objects.select_related("scene").filter(status=ApplicationStatus.PENDING)
     for application in pending_qs:
         try:
+            # 1. 先在锁外调用 ITSM API（避免长锁）
+            if not application.itsm_ticket_id:
+                logger_celery.warning(
+                    "[sync_scene_permission_status] PENDING 单 %s 无 itsm_ticket_id，跳过", application.id
+                )
+                continue
+            ticket = api.bk_itsm_v4.ticket_detail(id=application.itsm_ticket_id)
+            if not ticket:
+                continue  # 查不到，跳过等下次
+
+            # 2. 判断是否需要获取拒绝理由（仅驳回/终止时调用）
+            reject_reason = ""
+            parsed = parse_itsm_ticket(ticket)
+            if parsed["need_reject_reason"]:
+                reject_reason = _extract_reject_reason(application.itsm_ticket_id)
+
+            # 3. 加锁 + 更新状态（仅数据库操作）
             with transaction.atomic():
                 application = (
                     ScenePermissionApplication.objects.select_for_update()
@@ -101,15 +118,7 @@ def sync_scene_permission_status():
                 )
                 if application.status != ApplicationStatus.PENDING:
                     continue  # 并发已被处理
-                if not application.itsm_ticket_id:
-                    logger_celery.warning(
-                        "[sync_scene_permission_status] PENDING 单 %s 无 itsm_ticket_id，跳过", application.id
-                    )
-                    continue
-                ticket = api.bk_itsm_v4.ticket_detail(id=application.itsm_ticket_id)
-                if not ticket:
-                    continue  # 查不到，跳过等下次
-                apply_ticket_result(application, ticket, operator=operator)
+                apply_ticket_result(application, ticket, operator=operator, reject_reason=reject_reason)
                 application.save()
         except Exception as err:  # pylint: disable=broad-except
             logger_celery.exception("[sync_scene_permission_status] PENDING 单 %s 失败: %s", application.id, err)

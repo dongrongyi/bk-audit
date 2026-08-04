@@ -78,31 +78,56 @@ def grant_scene_role(scene: Scene, role: str, username: str, operator: Optional[
     return {"success": True, "method": "v3_group_add", "group_id": group_id}
 
 
+def parse_itsm_ticket(ticket_data: dict) -> dict:
+    """解析 ITSM 工单响应，返回结构化结果。
+
+    :param ticket_data: ITSM API 返回的工单数据
+    :return: {"status": str, "approve_result": bool, "is_terminal": bool, "need_reject_reason": bool}
+    """
+    status = ticket_data.get("status", "")
+    approve_result = ticket_data.get("approve_result", False)
+    is_terminal = status in [ITSMV4TicketStatus.FINISHED, ITSMV4TicketStatus.TERMINATED, ITSMV4TicketStatus.REVOKED]
+    need_reject_reason = (
+        (status == ITSMV4TicketStatus.FINISHED and not approve_result)
+        or status == ITSMV4TicketStatus.TERMINATED
+    )
+    return {
+        "status": status,
+        "approve_result": approve_result,
+        "is_terminal": is_terminal,
+        "need_reject_reason": need_reject_reason,
+    }
+
+
 def apply_ticket_result(
-    application: ScenePermissionApplication, ticket_data: dict, operator: Optional[str] = None
+    application: ScenePermissionApplication,
+    ticket_data: dict,
+    operator: Optional[str] = None,
+    reject_reason: str = "",
 ) -> None:
     """根据 ITSM 工单结果推进申请状态。【轮询 / callback 共用入口】
 
     :param application: 申请单（调用方负责加锁/事务）
     :param ticket_data: ITSM 工单数据 {"status": "finished", "approve_result": True, ...}
     :param operator: 授权操作人
+    :param reject_reason: 预获取的拒绝理由（轮询场景由调用方提前获取，callback 场景传空）
     """
-    itsm_status = ticket_data.get("status", "")
+    parsed = parse_itsm_ticket(ticket_data)
 
     # ① 审批通过 → 先设审批状态，再授权
-    if itsm_status == ITSMV4TicketStatus.FINISHED and ticket_data.get("approve_result"):
+    if parsed["status"] == ITSMV4TicketStatus.FINISHED and parsed["approve_result"]:
         application.status = ApplicationStatus.APPROVED
         _do_grant(application, operator=operator)
     # ② 审批驳回（finished 但未通过）→ 记录拒绝理由
-    elif itsm_status == ITSMV4TicketStatus.FINISHED:
-        application.reject_reason = _extract_reject_reason(application.itsm_ticket_id)
+    elif parsed["status"] == ITSMV4TicketStatus.FINISHED:
+        application.reject_reason = reject_reason or _extract_reject_reason(application.itsm_ticket_id)
         _set_terminal(application, ApplicationStatus.REJECTED)
     # ③ 被终止 → 记录拒绝理由
-    elif itsm_status == ITSMV4TicketStatus.TERMINATED:
-        application.reject_reason = _extract_reject_reason(application.itsm_ticket_id)
+    elif parsed["status"] == ITSMV4TicketStatus.TERMINATED:
+        application.reject_reason = reject_reason or _extract_reject_reason(application.itsm_ticket_id)
         _set_terminal(application, ApplicationStatus.REJECTED)
     # ④ 申请人撤单
-    elif itsm_status == ITSMV4TicketStatus.REVOKED:
+    elif parsed["status"] == ITSMV4TicketStatus.REVOKED:
         _set_terminal(application, ApplicationStatus.REVOKED)
     # running / draft → 保持 PENDING，不动
 

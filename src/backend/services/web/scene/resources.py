@@ -24,7 +24,8 @@ from django.db.models import (
 from django.db.models.functions import Cast, Coalesce
 from django.utils import timezone
 from django.utils.translation import gettext, gettext_lazy
-from rest_framework import serializers
+from rest_framework import serializers, status
+from rest_framework.response import Response
 
 from apps.audit.resources import AuditMixinResource
 from apps.meta.constants import SystemAuditStatusEnum
@@ -61,7 +62,7 @@ from services.web.scene.models import (
     ScenePermissionApplication,
     SceneSystem,
 )
-from services.web.scene.permission import already_has_role, apply_ticket_result
+from services.web.scene.permission import already_has_role, apply_ticket_result, parse_itsm_ticket, _extract_reject_reason
 from services.web.scene.serializers import (
     ApplyScenePermissionRequestSerializer,
     CreateSceneSerializer,
@@ -875,13 +876,19 @@ class ScenePermissionApplicationCallback(SceneResource):
 
         # 5. 处理回调
         try:
+            # 如果审批被拒绝，需要查日志获取拒绝理由
+            reject_reason = ""
+            parsed = parse_itsm_ticket(ticket_data)
+            if parsed["need_reject_reason"]:
+                reject_reason = _extract_reject_reason(ticket_id)
+
             with transaction.atomic():
                 application = ScenePermissionApplication.objects.select_for_update().get(id=application.id)
                 if application.is_terminal:
                     return {"result": True, "message": "already processed"}
 
                 operator = bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME
-                apply_ticket_result(application, ticket_data, operator=operator)
+                apply_ticket_result(application, ticket_data, operator=operator, reject_reason=reject_reason)
                 application.save()
         except Exception as err:
             logger.exception(
@@ -889,6 +896,7 @@ class ScenePermissionApplicationCallback(SceneResource):
                 ticket_id,
                 err,
             )
-            return {"result": False, "message": str(err)}
+            # 系统异常返回 500，让 ITSM 重试；业务错误返回 200 避免重试
+            return Response({"result": False, "message": str(err)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
         return {"result": True, "message": "success"}
