@@ -29,10 +29,15 @@ from services.web.scene.constants import (
     SCENE_PERMISSION_GRANT_MAX_RETRY,
     SYNC_SCENE_PERMISSION_PERIODIC_TASK_MINUTE,
     ApplicationStatus,
-    GrantStatus, ITSMV4TicketStatus,
+    GrantStatus,
 )
 from services.web.scene.models import Scene, ScenePermissionApplication
-from services.web.scene.permission import _do_grant, apply_ticket_result, parse_itsm_ticket, _extract_reject_reason
+from services.web.scene.permission import (
+    _extract_reject_reason,
+    apply_ticket_result,
+    do_grant,
+    parse_itsm_ticket,
+)
 from services.web.scene.resources import SceneResource
 
 # ==================== 场景成员同步（原有任务，每 10 分钟）====================
@@ -72,7 +77,7 @@ def sync_scene_members_from_iam():
     )
 
 
-# ==================== 场景权限申请审批状态同步（新增任务，每 10 分钟）====================
+# ==================== 场景权限申请审批状态同步（每 10 分钟）====================
 
 
 @periodic_task(
@@ -95,9 +100,7 @@ def sync_scene_permission_status():
         try:
             # 1. 先在锁外调用 ITSM API（避免长锁）
             if not application.itsm_ticket_id:
-                logger_celery.warning(
-                    "[sync_scene_permission_status] PENDING 单 %s 无 itsm_ticket_id，跳过", application.id
-                )
+                logger_celery.warning("[sync_scene_permission_status] PENDING 单 %s 无 itsm_ticket_id，跳过", application.id)
                 continue
             ticket = api.bk_itsm_v4.ticket_detail(id=application.itsm_ticket_id)
             if not ticket:
@@ -139,7 +142,7 @@ def sync_scene_permission_status():
                 )
                 if application.grant_status != GrantStatus.FAILED:
                     continue
-                _do_grant(application, operator=operator)
+                do_grant(application, operator=operator)
                 application.save()
         except Exception as err:  # pylint: disable=broad-except
             logger_celery.exception("[sync_scene_permission_status] 授权失败重试 %s 失败: %s", application.id, err)

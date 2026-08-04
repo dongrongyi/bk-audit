@@ -62,7 +62,12 @@ from services.web.scene.models import (
     ScenePermissionApplication,
     SceneSystem,
 )
-from services.web.scene.permission import already_has_role, apply_ticket_result, parse_itsm_ticket, _extract_reject_reason
+from services.web.scene.permission import (
+    _extract_reject_reason,
+    already_has_role,
+    apply_ticket_result,
+    parse_itsm_ticket,
+)
 from services.web.scene.serializers import (
     ApplyScenePermissionRequestSerializer,
     CreateSceneSerializer,
@@ -706,11 +711,11 @@ class ApplyScenePermission(SceneResource):
         if scene.status != SceneStatus.ENABLED:
             raise SceneNotEnabled()
 
-        # 2. 幂等校验一：是否已有该场景的使用/管理权限
+        # 2. 校验是否已有该场景的使用/管理权限
         if already_has_role(scene, role, applicant):
             raise AlreadyHasPermission()
 
-        # 3. 幂等校验二：是否有在途 PENDING 单
+        # 3. 校验是否有在途 PENDING 单
         if ScenePermissionApplication.objects.filter(
             scene_id=scene_id,
             applicant=applicant,
@@ -719,7 +724,7 @@ class ApplyScenePermission(SceneResource):
         ).exists():
             raise ApplicationPending()
 
-        # 4. 校验流程编码已配置
+        # 4. 校验审批流程已配置
         if not SCENE_PERMISSION_WORKFLOW_KEY:
             raise ApproveServiceNotConfigured()
 

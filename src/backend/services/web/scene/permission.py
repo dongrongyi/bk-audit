@@ -88,9 +88,8 @@ def parse_itsm_ticket(ticket_data: dict) -> dict:
     approve_result = ticket_data.get("approve_result", False)
     is_terminal = status in [ITSMV4TicketStatus.FINISHED, ITSMV4TicketStatus.TERMINATED, ITSMV4TicketStatus.REVOKED]
     need_reject_reason = (
-        (status == ITSMV4TicketStatus.FINISHED and not approve_result)
-        or status == ITSMV4TicketStatus.TERMINATED
-    )
+        status == ITSMV4TicketStatus.FINISHED and not approve_result
+    ) or status == ITSMV4TicketStatus.TERMINATED
     return {
         "status": status,
         "approve_result": approve_result,
@@ -105,26 +104,26 @@ def apply_ticket_result(
     operator: Optional[str] = None,
     reject_reason: str = "",
 ) -> None:
-    """根据 ITSM 工单结果推进申请状态。【轮询 / callback 共用入口】
+    """根据 ITSM 工单结果更新申请状态。【轮询 / callback 共用入口】
 
     :param application: 申请单（调用方负责加锁/事务）
     :param ticket_data: ITSM 工单数据 {"status": "finished", "approve_result": True, ...}
     :param operator: 授权操作人
-    :param reject_reason: 预获取的拒绝理由（轮询场景由调用方提前获取，callback 场景传空）
+    :param reject_reason: 拒绝理由
     """
     parsed = parse_itsm_ticket(ticket_data)
 
     # ① 审批通过 → 先设审批状态，再授权
     if parsed["status"] == ITSMV4TicketStatus.FINISHED and parsed["approve_result"]:
         application.status = ApplicationStatus.APPROVED
-        _do_grant(application, operator=operator)
+        do_grant(application, operator=operator)
     # ② 审批驳回（finished 但未通过）→ 记录拒绝理由
     elif parsed["status"] == ITSMV4TicketStatus.FINISHED:
-        application.reject_reason = reject_reason or _extract_reject_reason(application.itsm_ticket_id)
+        application.reject_reason = reject_reason
         _set_terminal(application, ApplicationStatus.REJECTED)
     # ③ 被终止 → 记录拒绝理由
     elif parsed["status"] == ITSMV4TicketStatus.TERMINATED:
-        application.reject_reason = reject_reason or _extract_reject_reason(application.itsm_ticket_id)
+        application.reject_reason = reject_reason
         _set_terminal(application, ApplicationStatus.REJECTED)
     # ④ 申请人撤单
     elif parsed["status"] == ITSMV4TicketStatus.REVOKED:
@@ -156,7 +155,7 @@ def _extract_reject_reason(ticket_id: str) -> str:
     return ""
 
 
-def _do_grant(application: ScenePermissionApplication, operator: Optional[str] = None) -> None:
+def do_grant(application: ScenePermissionApplication, operator: Optional[str] = None) -> None:
     """执行授权。成功→grant_status=SUCCESS；失败→grant_status=FAILED(retry_count++)"""
     try:
         result = grant_scene_role(
@@ -177,7 +176,7 @@ def _do_grant(application: ScenePermissionApplication, operator: Optional[str] =
             application.retry_count += 1
             _check_grant_retry_exhausted(application)
     except Exception as err:  # pylint: disable=broad-except
-        logger.exception("[_do_grant] 申请单 %s 授权失败: %s", application.id, err)
+        logger.exception("[do_grant] 申请单 %s 授权失败: %s", application.id, err)
         application.grant_status = GrantStatus.FAILED
         application.grant_error = str(err)
         application.retry_count += 1

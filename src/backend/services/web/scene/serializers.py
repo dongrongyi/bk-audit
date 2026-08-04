@@ -448,29 +448,15 @@ class ApplyScenePermissionRequestSerializer(serializers.Serializer):
 class ScenePermissionApplicationSerializer(serializers.ModelSerializer):
     """场景权限申请单"""
 
-    scene_name = serializers.CharField(source="scene.name", read_only=True)
-    role_display = serializers.CharField(source="get_role_display", read_only=True)
     status_display = serializers.CharField(source="get_status_display", read_only=True)
-    grant_status_display = serializers.CharField(source="get_grant_status_display", read_only=True)
 
     class Meta:
         model = ScenePermissionApplication
         fields = [
             "id",
-            "scene_id",
-            "scene_name",
-            "applicant",
-            "role",
-            "role_display",
-            "reason",
             "itsm_sn",
-            "itsm_ticket_url",
             "status",
             "status_display",
-            "grant_status",
-            "grant_status_display",
-            "approvers",
-            "reject_reason",
             "created_at",
         ]
         read_only_fields = fields
