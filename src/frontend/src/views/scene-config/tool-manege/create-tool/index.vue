@@ -104,7 +104,7 @@
   import _ from 'lodash';
   import { nextTick, onMounted, provide, ref, toRef, watch } from 'vue';
   import { useI18n } from 'vue-i18n';
-  import { useRoute, useRouter } from 'vue-router';
+  import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router';
 
   import MetaManageService from '@service/meta-manage';
   import RootManageService from '@service/root-manage';
@@ -113,20 +113,27 @@
   import ConfigModel from '@model/root/config';
   import ToolDetailModel from '@model/tool/tool-detail';
 
+  import useRecordPage from '@hooks/use-record-page';
   import useRouterBack from '@hooks/use-router-back';
 
-  import Api from './components/api/index.vue';
-  import BaseInfo from './components/base-info.vue';
-  import BkVision from './components/bkvision/index.vue';
-  import DataSearch from './components/data-search/index.vue';
-  import Creating from './components/tool-status/creating.vue';
-  import Failed from './components/tool-status/failed.vue';
-  import Successful from './components/tool-status/Successful.vue';
-  import ToolTypeSection from './components/tool-type-section.vue';
-  import type { FormData } from './types';
+  import {
+    createSceneToolManageContext,
+    provideToolManageContext,
+  } from '@views/tool-manage-shared/context';
+  import Api from '@views/tool-manage-shared/create-tool/components/api/index.vue';
+  import BaseInfo from '@views/tool-manage-shared/create-tool/components/base-info.vue';
+  import BkVision from '@views/tool-manage-shared/create-tool/components/bkvision/index.vue';
+  import DataSearch from '@views/tool-manage-shared/create-tool/components/data-search/index.vue';
+  import Creating from '@views/tool-manage-shared/create-tool/components/tool-status/creating.vue';
+  import Failed from '@views/tool-manage-shared/create-tool/components/tool-status/failed.vue';
+  import Successful from '@views/tool-manage-shared/create-tool/components/tool-status/Successful.vue';
+  import ToolTypeSection from '@views/tool-manage-shared/create-tool/components/tool-type-section.vue';
+  import type { FormData } from '@views/tool-manage-shared/create-tool/types';
 
   import useMessage from '@/hooks/use-message';
   import useRequest from '@/hooks/use-request';
+
+  provideToolManageContext(createSceneToolManageContext());
 
   const ToolTypeComMap: Record<string, any> = {
     data_search: DataSearch,
@@ -137,6 +144,7 @@
   const route = useRoute();
   const router = useRouter();
   const { t } = useI18n();
+  const { removePageParams } = useRecordPage;
 
   const isEditMode = route.name === 'sceneToolEdit';
   const backRouteName = 'sceneToolManege';
@@ -168,6 +176,8 @@
     updated_at: '',
     updated_by: '',
     updated_time: null,
+    scene_ids: [],
+    system_ids: [],
     config: {
       referenced_tables: [],
       input_variable: [{
@@ -175,6 +185,7 @@
         display_name: '',
         description: '',
         required: false,
+        is_show: true,
         field_category: '',
         default_value: '',
         raw_default_value: '',
@@ -470,6 +481,12 @@
     router.push({
       name: backRouteName,
     });
+  });
+
+  onBeforeRouteLeave((to) => {
+    if (to.name !== backRouteName) {
+      removePageParams(backRouteName);
+    }
   });
 </script>
 

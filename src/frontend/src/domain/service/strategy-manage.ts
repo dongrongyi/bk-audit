@@ -28,6 +28,7 @@ export default {
   fetchStrategyList(params: {
     label?: string
     name?: string,
+    order_field?: string
     order_type?: string
     page?: number,
     page_size?: number
@@ -163,6 +164,7 @@ export default {
   fetchTable(params: {
     table_type: string;
     scene_id?: string;
+    bk_biz_id?: string | number;
   }) {
     return StrategySource.getTable(params)
       .then(({ data }) => data);
@@ -173,6 +175,7 @@ export default {
   fetchScenePermissionTable(params: {
     table_type: string;
     scene_id?: string;
+    bk_biz_id?: string | number;
   }) {
     if (params.table_type === 'BuildIn' || params.table_type === 'BizRt') {
       return StrategySource.getScenePermissionTable(params)
@@ -186,8 +189,8 @@ export default {
    */
   fetchTableRtMeta(params: {
     table_id: string
-  }) {
-    return StrategySource.getTableRtMeta(params)
+  }, payload: Record<string, any> = {}) {
+    return StrategySource.getTableRtMeta(params, payload)
       .then(({ data }) => data);
   },
   /**

@@ -19,56 +19,58 @@
     fullscreen
     :loading="isSkeletonLoading"
     name="storageList">
-    <bk-loading
-      :loading="pageLoading">
-      <div class="scene-info-page">
-        <!-- 顶部统计卡片 -->
-        <stat-cards
-          :scene-data="statCardsData"
-          @go-risk="handleGoRisk"
-          @go-strategy="handleGoStrategy" />
+    <div class="scene-info-page">
+      <!-- 顶部统计卡片 -->
+      <stat-cards
+        :scene-data="statCardsData"
+        @go-risk="handleGoRisk"
+        @go-strategy="handleGoStrategy" />
 
-        <!-- 基础信息 -->
-        <base-info
-          :can-edit="canEdit"
-          :saving-field="savingField"
-          :scene-data="sceneData"
-          @update:scene-data="handleUpdateSceneData" />
+      <!-- 基础信息 -->
+      <base-info
+        :can-edit="canEdit"
+        :saving-field="savingField"
+        :scene-data="sceneData"
+        @update:scene-data="handleUpdateSceneData" />
 
-        <!-- 关联系统 -->
-        <scene-table
-          :columns="systemColumns"
-          :data="systemTableData"
-          enable-search
-          resizable
-          :search-data="systemSearchData"
-          :search-placeholder="t('搜索 系统名称、系统管理员、系统域名')"
-          show-pagination
-          stripe
-          :title="t('关联系统')"
-          :tooltip="t('由蓝鲸审计中心管理员配置，场景管理员仅可查看，如需调整请联系 审计中心平台管理员: ') + configData.platform_admin_users.join(',')" />
+      <!-- 关联系统 -->
+      <scene-table
+        :columns="systemColumns"
+        :data="systemTableData"
+        enable-search
+        :loading="systemDetailLoading"
+        resizable
+        :search-data="systemSearchData"
+        :search-loading="!systemAllLoaded"
+        :search-placeholder="t('搜索 系统名称、系统管理员、系统域名')"
+        show-pagination
+        stripe
+        :title="t('关联系统')"
+        :tooltip="t('由蓝鲸审计中心管理员配置，场景管理员仅可查看，如需调整请联系 审计中心平台管理员: ') + configData.platform_admin_users.join(',')"
+        :total="systemTotal" />
 
-        <!-- 关联数据报表 -->
-        <scene-table
-          :columns="dataTableColumns"
-          :data="dataTableData"
-          enable-search
-          resizable
-          :search-data="dataTableSearchData"
-          :search-loading="!dataTableAllLoaded"
-          :search-placeholder="t('搜索 数据表名称、数据表ID、管理员')"
-          show-pagination
-          stripe
-          :title="t('关联数据表')"
-          :tooltip="t('由蓝鲸审计中心管理员配置，场景管理员仅可查看，可基于数据表配置审计策略，在工具广场创建 SQL 工具，如需调整请联系 审计中心平台管理员: ')
-            + configData.platform_admin_users.join(',')"
-          :total="dataTableTotal" />
-      </div>
-    </bk-loading>
+      <!-- 关联数据报表 -->
+      <scene-table
+        :columns="dataTableColumns"
+        :data="dataTableData"
+        enable-search
+        :loading="dataTableDetailLoading"
+        resizable
+        :search-data="dataTableSearchData"
+        :search-loading="!dataTableAllLoaded"
+        :search-placeholder="t('搜索 数据表名称、数据表ID、管理员')"
+        show-pagination
+        stripe
+        :title="t('关联数据表')"
+        :tooltip="t('由蓝鲸审计中心管理员配置，场景管理员仅可查看，可基于数据表配置审计策略，在工具广场创建 SQL 工具，如需调整请联系 审计中心平台管理员: ')
+          + configData.platform_admin_users.join(',')"
+        :total="dataTableTotal" />
+    </div>
   </skeleton-loading>
 </template>
 
 <script setup lang="tsx">
+  import axios, { type CancelTokenSource } from 'axios';
   import { computed, onMounted, onUnmounted, ref } from 'vue';
   import { useI18n } from 'vue-i18n';
   import { useRouter } from 'vue-router';
@@ -94,16 +96,15 @@
 
   import { getSceneSystemParams } from '@/utils/assist/scene-system-params';
 
+  const { CancelToken } = axios;
   const router = useRouter();
   const { t } = useI18n();
   const { messageSuccess } = useMessage();
   const { on: onEvent, off } = useEventBus();
 
   const sceneId = ref(getSceneSystemParams().scope_id);
-  // 骨架屏 loading 状态（首次进入页面时展示）
+  // 骨架屏 loading 状态（仅等待场景基础信息）
   const isSkeletonLoading = ref(true);
-  // 页面整体 loading 状态（切换场景时）
-  const pageLoading = ref(false);
   // 基础信息字段保存 loading 状态
   const savingField = ref('');
 
@@ -279,7 +280,7 @@
     onSuccess: () => {
       messageSuccess(t('保存成功'));
       // 刷新场景信息
-      fetchSceneInfo(sceneId.value);
+      fetchSceneInfo(sceneId.value as any);
     },
   });
 
@@ -296,47 +297,94 @@
 
   // 统计卡片数据（从接口返回数据中提取）
   const statCardsData = computed(() => ({
-    systemCount: systemDetailList.value.length || 0,
+    systemCount: systemTotal.value || systemDetailList.value.length || 0,
     dataTableCount: sceneInfoData.value.tables?.length || 0,
     strategyCount: sceneInfoData.value.strategy_ids?.length || 0,
     activeRiskCount: sceneInfoData.value.risk_count || 0,
   }));
 
-  // 关联系统表格数据（通过新接口获取有权限的系统列表，再获取详情）
+  const DETAIL_BATCH_SIZE = 10;
+  // 详情批量拉取的世代号：离开页面 / 切换场景时递增，用于中止未完成的遍历请求
+  let detailFetchToken = 0;
+  // 同一轮批量详情共享 CancelToken，离开页时一并取消进行中的 HTTP
+  let detailCancelSource: CancelTokenSource | null = null;
+
+  const getDetailRequestPayload = () => ({
+    silent: true,
+    ...(detailCancelSource ? { cancelTokenSource: detailCancelSource } : {}),
+  });
+
+  const abortDetailFetches = () => {
+    detailFetchToken += 1;
+    detailCancelSource?.cancel('scene-info detail aborted');
+    detailCancelSource = null;
+  };
+
+  const beginDetailFetches = () => {
+    abortDetailFetches();
+    detailCancelSource = CancelToken.source();
+    detailFetchToken += 1;
+    return detailFetchToken;
+  };
+
+  // 关联系统表格数据（通过新接口获取有权限的系统列表，再分批获取详情）
   const systemDetailList = ref<Array<Record<string, any>>>([]);
   const systemDetailLoading = ref(false);
+  const systemTotal = ref(0);
+  const systemAllLoaded = ref(false);
 
-  // 获取场景下有权限的系统列表，再逐个获取系统详情
-  const fetchPermissionSystems = async () => {
+  const mapSystemDetail = (detail: any) => ({
+    system_id: detail.system_id,
+    name: detail.name || '--',
+    managers: detail.managers || [],
+    system_url: detail.system_url || '',
+    description: detail.description || '',
+    source_type: detail.source_type || '',
+    status: detail.status || '',
+    status_msg: detail.status_msg || '',
+    last_time: detail.last_time || '',
+  });
+
+  type SystemItem = { system_id: string };
+
+  const fetchSystemDetailsBatch = (systems: SystemItem[]) => Promise.all(systems.map(sys => MetaManageService
+    .fetchSystemInfo({ id: sys.system_id }, getDetailRequestPayload())
+    .catch(() => null))).then(details => details.filter(Boolean).map(mapSystemDetail));
+
+  const fetchPermissionSystems = async (token: number) => {
     if (!sceneId.value) return;
     systemDetailLoading.value = true;
+    systemAllLoaded.value = false;
+    systemDetailList.value = [];
+    systemTotal.value = 0;
     try {
       const systems = await SceneManageService.fetchScenePermissionSystems(sceneId.value);
-      if (!systems || systems.length === 0) {
-        systemDetailList.value = [];
+      if (token !== detailFetchToken) return;
+      if (!systems?.length) {
         return;
       }
-      const detailPromises = systems.map((sys: { system_id: string; system_name: string }) => MetaManageService
-        .fetchSystemInfo({ id: sys.system_id })
-        .catch(() => null));
-      const details = await Promise.all(detailPromises);
-      systemDetailList.value = details
-        .filter(Boolean)
-        .map((detail: any) => ({
-          system_id: detail.system_id,
-          name: detail.name || '--',
-          managers: detail.managers || [],
-          system_url: detail.system_url || '',
-          description: detail.description || '',
-          source_type: detail.source_type || '',
-          status: detail.status || '',
-          status_msg: detail.status_msg || '',
-          last_time: detail.last_time || '',
-        }));
-    } catch (e) {
+      systemTotal.value = systems.length;
+      for (let i = 0; i < systems.length; i += DETAIL_BATCH_SIZE) {
+        if (token !== detailFetchToken) return;
+        const batch = systems.slice(i, i + DETAIL_BATCH_SIZE);
+        const batchData = await fetchSystemDetailsBatch(batch);
+        if (token !== detailFetchToken) return;
+        if (i === 0) {
+          systemDetailList.value = batchData;
+          systemDetailLoading.value = false;
+        } else {
+          systemDetailList.value = [...systemDetailList.value, ...batchData];
+        }
+      }
+    } catch {
+      if (token !== detailFetchToken) return;
       systemDetailList.value = [];
+      systemTotal.value = 0;
     } finally {
-      systemDetailLoading.value = false;
+      if (token === detailFetchToken) {
+        systemDetailLoading.value = false;
+        systemAllLoaded.value = true;
+      }
     }
   };
 
@@ -362,61 +410,45 @@
   });
 
   // 根据场景详情中的 tables 列表，分批获取数据表详情
-  const fetchPermissionTables = () => {
-    if (!sceneId.value) return Promise.resolve();
+  type TableItem = Record<string, any>;
+
+  const fetchTableDetailsBatch = (tables: TableItem[]) => Promise.all(tables.map(table => StrategyManageService
+    .fetchTableRtMeta({ table_id: table.table_id }, getDetailRequestPayload())
+    .catch(() => null))).then(details => details.filter(Boolean).map(mapTableDetail));
+
+  const fetchPermissionTables = async (token: number) => {
+    if (!sceneId.value) return;
     dataTableDetailLoading.value = true;
     dataTableAllLoaded.value = false;
+    dataTableDetailList.value = [];
     const tables = sceneInfoData.value.tables || [];
-    if (!tables || tables.length === 0) {
-      dataTableDetailList.value = [];
+    if (!tables.length) {
       dataTableAllLoaded.value = true;
-      isSkeletonLoading.value = false;
       dataTableDetailLoading.value = false;
-      return Promise.resolve();
+      return;
     }
-    const BATCH_SIZE = 20;
-    // 第一批：立即加载并展示，加载完后关闭骨架屏并 resolve
-    const firstBatch = tables.slice(0, BATCH_SIZE);
-    const firstPromises = firstBatch.map((table: Record<string, any>) => StrategyManageService
-      .fetchTableRtMeta({ table_id: table.table_id })
-      .catch(() => null));
-    const firstLoadPromise = Promise.all(firstPromises)
-      .then((firstDetails) => {
-        dataTableDetailList.value = firstDetails
-          .filter(Boolean)
-          .map(mapTableDetail);
-        // 第一批数据加载完成，关闭骨架屏
-        isSkeletonLoading.value = false;
-      })
-      .catch(() => {
-        dataTableDetailList.value = [];
-        isSkeletonLoading.value = false;
-      });
-
-    // 如果还有更多，后台继续加载剩余数据（不阻塞第一批的 resolve）
-    if (tables.length > BATCH_SIZE) {
-      firstLoadPromise.then(() => {
-        const remainingTables = tables.slice(BATCH_SIZE);
-        Promise.all(remainingTables.map((table: Record<string, any>) => StrategyManageService
-          .fetchTableRtMeta({ table_id: table.table_id })
-          .catch(() => null))).then((details) => {
-          const remainingData = details.filter(Boolean).map(mapTableDetail);
-          dataTableDetailList.value = [...dataTableDetailList.value, ...remainingData];
-        })
-          .finally(() => {
-            dataTableAllLoaded.value = true;
-            dataTableDetailLoading.value = false;
-          });
-      });
-    } else {
-      // 没有更多数据，直接标记为全部加载完成
-      firstLoadPromise.then(() => {
+    try {
+      for (let i = 0; i < tables.length; i += DETAIL_BATCH_SIZE) {
+        if (token !== detailFetchToken) return;
+        const batch = tables.slice(i, i + DETAIL_BATCH_SIZE);
+        const batchData = await fetchTableDetailsBatch(batch);
+        if (token !== detailFetchToken) return;
+        if (i === 0) {
+          dataTableDetailList.value = batchData;
+          dataTableDetailLoading.value = false;
+        } else {
+          dataTableDetailList.value = [...dataTableDetailList.value, ...batchData];
+        }
+      }
+    } catch {
+      if (token !== detailFetchToken) return;
+      dataTableDetailList.value = [];
+    } finally {
+      if (token === detailFetchToken) {
         dataTableAllLoaded.value = true;
         dataTableDetailLoading.value = false;
-      });
+      }
     }
-
-    return firstLoadPromise;
   };
 
   const dataTableData = computed(() => dataTableDetailList.value);
@@ -530,33 +562,39 @@
       isSkeletonLoading.value = false;
       return;
     }
+    // 切换场景前先中止上一轮未完成的详情遍历与进行中的 HTTP
+    abortDetailFetches();
     sceneId.value = newSceneId;
     systemDetailList.value = [];
+    systemTotal.value = 0;
+    systemAllLoaded.value = false;
     dataTableDetailList.value = [];
+    dataTableAllLoaded.value = false;
     // 不是有效的场景（如选择了聚合项 / sessionStorage 是 system 类型旧值），不发起请求
     // 此时等待场景选择器初始化后 emit scene:change 事件来触发真正的加载
     if (!sceneId.value) {
       lastLoadedSceneId = undefined;
       return;
     }
-    lastLoadedSceneId = sceneId.value;
-    // 非首次加载（场景切换）展示页面 loading
-    if (!isSkeletonLoading.value) {
-      pageLoading.value = true;
-    }
+    const loadingSceneId = sceneId.value;
+    lastLoadedSceneId = loadingSceneId;
     try {
-      // 先获取场景信息（fetchPermissionTables 依赖 sceneInfoData 中的 tables 数据）
-      await Promise.all([
-        fetchSceneInfo(sceneId.value).catch(() => null),
-        fetchPermissionSystems(),
-      ]);
-      // 场景信息和系统列表已加载完，关闭页面 loading
-      pageLoading.value = false;
-      // 获取数据表详情（首批加载完后关骨架屏，剩余后台加载）
-      await fetchPermissionTables();
-    } catch {
+      // 先加载场景基础信息，完成后立即展示统计卡片与基础信息
+      await fetchSceneInfo(loadingSceneId as any).catch(() => null);
+      // 等待期间已离开页面 / 再次切换场景，不再启动详情遍历
+      if (sceneId.value !== loadingSceneId || lastLoadedSceneId !== loadingSceneId) {
+        return;
+      }
       isSkeletonLoading.value = false;
-      pageLoading.value = false;
+
+      // 关联系统、关联数据表异步加载，表格区域各自展示 loading
+      const fetchToken = beginDetailFetches();
+      void fetchPermissionSystems(fetchToken);
+      void fetchPermissionTables(fetchToken);
+    } catch {
+      if (sceneId.value === loadingSceneId) {
+        isSkeletonLoading.value = false;
+      }
     }
   };
 
@@ -573,6 +611,10 @@
   });
 
   onUnmounted(() => {
+    // 离开页面时中止未完成的关联系统 / 关联数据表详情遍历，并取消进行中的 HTTP
+    lastLoadedSceneId = undefined;
+    sceneId.value = '';
+    abortDetailFetches();
     off('scene:change', handleSceneChange);
   });
 

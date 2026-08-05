@@ -20,6 +20,7 @@
     class="audit-render-list">
     <bk-loading :loading="isLoading">
       <bk-table
+        :key="tableRenderKey"
         ref="tableRef"
         :border="border"
         class="render-list"
@@ -146,6 +147,8 @@
   }
   interface Exposes {
     fetchData: (params: Record<string, any>) => void,
+    /** 清空筛选/排序等记忆参数后重新拉取（切换场景时使用） */
+    resetFetchData: (params?: Record<string, any>) => void,
     loading: Ref<boolean>,
     refreshList: () => void,
     getListData:()=> Array<Record<string, any>>,
@@ -174,6 +177,8 @@
   const slot = useSlots();
   const tableRef = ref();
   const rootRef = ref();
+  // 切换场景重置排序时递增，强制表头按未排序态重新初始化
+  const tableRenderKey = ref(0);
   const { t } = useI18n();
   const route = useRoute();
   const pagination = reactive<IPagination>({
@@ -193,10 +198,56 @@
   const isLoading = ref(false);
   // 新增：用户是否手动选择了分页大小的标志
   const isUserSelectedPageSize = ref(false);
+  /** page 非法（NaN/≤0）时回退为 1，避免添加/编辑返回后出现 page=NaN */
+  const normalizePage = (page: unknown, fallback = 1) => {
+    const num = Number(page);
+    if (!Number.isFinite(num) || num < 1) {
+      return fallback;
+    }
+    return Math.floor(num);
+  };
+  const parseSortParam = (sort?: string | string[]) => {
+    if (!sort) return undefined;
+    if (Array.isArray(sort)) return sort;
+    try {
+      const parsedSort = JSON.parse(sort);
+      return Array.isArray(parsedSort) ? parsedSort : undefined;
+    } catch {
+      // 兼容旧 URL：sort=-field 或 sort=field1,-field2
+      return sort.split(',').filter(Boolean);
+    }
+  };
   const {
     getSearchParams,
     replaceSearchParams,
   } = useUrlSearch();
+
+  // 刷新后根据 URL 恢复表头排序高亮：
+  // bk-table 列的初始高亮由 column.sort.value 决定，页面里通常传 'custom'（无方向），
+  // 这里把 URL 中的排序方向写回对应列，首屏渲染即可显示箭头高亮
+  const restoreColumnSortActive = () => {
+    const { sort } = getSearchParams();
+    const sortArray = parseSortParam(sort);
+    const primarySort = sortArray?.[0];
+    if (!primarySort || typeof primarySort !== 'string') return;
+    const isDesc = primarySort.startsWith('-');
+    const field = isDesc ? primarySort.slice(1) : primarySort;
+    // 与 handleColumnSortChange 的 reverse 逻辑对应：请求方向与图标方向互为反转
+    let uiType: 'asc' | 'desc' = isDesc ? 'desc' : 'asc';
+    if (props.reverseSortFields.includes(field)) {
+      uiType = uiType === 'desc' ? 'asc' : 'desc';
+    }
+    const column = (props.columns || []).find((col: any) => {
+      if (!col?.sort) return false;
+      const colField = typeof col.field === 'function' ? col.field() : col.field;
+      return colField === field;
+    }) as Record<string, any> | undefined;
+    if (column) {
+      // sortFn 恒等：数据顺序以服务端返回为准，value 仅用于初始高亮
+      column.sort = { value: uiType, sortFn: () => 0 };
+    }
+  };
+  restoreColumnSortActive();
 
   const {
     run,
@@ -246,9 +297,25 @@
               || (route.query.scope_id as string)
               || getSceneSystemParams().scope_id,
           } : {};
+          // 无论是否透传场景参数给接口，写回 URL 时都保留场景上下文，避免切换场景重置筛选后丢失 scene_id
+          const sceneContextFromUrl = {
+            ...(route.query.scene_id ? { scene_id: String(route.query.scene_id) } : {}),
+            ...(route.query.scope_id ? { scope_id: String(route.query.scope_id) } : {}),
+            ...(route.query.scope_type ? { scope_type: String(route.query.scope_type) } : {}),
+          };
+          if (!sceneContextFromUrl.scene_id && !sceneContextFromUrl.scope_id) {
+            const sceneInfo = getSceneSystemParams();
+            if (sceneInfo.scope_id) {
+              sceneContextFromUrl.scene_id = sceneInfo.scope_id;
+              sceneContextFromUrl.scope_id = sceneInfo.scope_id;
+            }
+            if (sceneInfo.scope_type) {
+              sceneContextFromUrl.scope_type = sceneInfo.scope_type;
+            }
+          }
           const params = {
             ...cleanedParams,
-            page: isUnload.value ? 1 : pagination.current,
+            page: isUnload.value ? 1 : normalizePage(pagination.current),
             page_size: pageSize,
             ...sceneParams,
             ...sceneIdParam,
@@ -258,12 +325,16 @@
           run(params).finally(() => {
             isLoading.value = false;
           });
-          replaceSearchParams(params);
+          replaceSearchParams({
+            ...params,
+            ...sceneContextFromUrl,
+          });
         }
       });
   };
   // 解析 URL 上面的分页信息
   const parseURL = () => {
+    const recordParams = getRecordPageParams();
     const {
       page,
       page_size: pageSize,
@@ -272,24 +343,30 @@
       sort,
     } = getSearchParams();
 
-    const pageValue = isUnload.value ? 1 : page;
-    if (pageValue && pageSize) {
-      pagination.current = ~~pageValue;
-      pagination.limit = (~~pageSize) < 10 ? 10 :  (~~pageSize);
+    // 从详情/编辑返回：优先恢复 sessionStorage 中记录的分页
+    if (recordParams?.page_size) {
+      pagination.current = normalizePage(recordParams.page);
+      pagination.limit = Number(recordParams.page_size) < 10 ? 10 : Number(recordParams.page_size);
       pagination.limitList = [...new Set([...pagination.limitList, pagination.limit])].sort((a, b) => a - b);
+      isUserSelectedPageSize.value = true;
+    } else {
+      const pageValue = isUnload.value ? 1 : page;
+      if (pageValue && pageSize) {
+        pagination.current = normalizePage(pageValue);
+        pagination.limit = (~~pageSize) < 10 ? 10 : (~~pageSize);
+        pagination.limitList = [...new Set([...pagination.limitList, pagination.limit])].sort((a, b) => a - b);
+      } else {
+        isUserSelectedPageSize.value = false;
+      }
     }
     // 优先使用新的 sort 数组格式，向后兼容旧的 order_field + order_type
     if (sort) {
-      try {
-        const sortArray = Array.isArray(sort) ? sort : JSON.parse(sort);
-        if (Array.isArray(sortArray) && sortArray.length > 0) {
-          paramsMemo = {
-            ...paramsMemo,
-            sort: sortArray,
-          };
-        }
-      } catch {
-        // 如果解析失败，忽略
+      const sortArray = parseSortParam(sort);
+      if (sortArray?.length) {
+        paramsMemo = {
+          ...paramsMemo,
+          sort: sortArray,
+        };
       }
     } else if (orderField && orderType) {
       // 向后兼容：将旧的 order_field + order_type 转换为 sort 数组
@@ -300,23 +377,28 @@
       };
     }
     // 注意：默认排序应该在具体页面组件中设置，而不是在通用组件中
-    // 从URL参数初始化时重置用户选择标志
-    isUserSelectedPageSize.value = false;
+    // 从URL参数初始化时：有 page_size 则已在上方标记为用户分页状态
     isReady = false;
   };
   const handleSettingChange = (setting: ISettings) => {
     emits('onSettingChange', setting);
   };
+  // 清除表头排序箭头高亮（bk-table 内部 sortType 不会随 column.sort 变更自动重置）
+  const clearSortActiveUI = () => {
+    if (!rootRef.value) return;
+    const sortAr: Array<Element> = rootRef.value.getElementsByClassName('bk-head-cell-sort');
+    Array.from(sortAr).forEach((item: Element) => {
+      const sortIconAr = item.getElementsByClassName('sort-action');
+      for (let i = 0; i < sortIconAr.length; i++) {
+        sortIconAr[i].className = sortIconAr[i].className.replace(/\bactive\b/g, '').replace(/\s+/g, ' ')
+          .trim();
+      }
+    });
+  };
   const handleColumnSortChange = (sortPayload: any) => {
     let { type } = sortPayload;
     // 移除之前选中的排序样式
-    const sortAr:Array<Element> = rootRef.value.getElementsByClassName('bk-head-cell-sort');
-    Array.from(sortAr).forEach((item:Element) => {
-      const sortIconAr =  item.getElementsByClassName('sort-action');
-      for (let i = 0; i < sortIconAr.length; i++) {
-        sortIconAr[i].className =  sortIconAr[i].className.replace('active', '');
-      }
-    });
+    clearSortActiveUI();
     // 颠倒排序
     if (props.reverseSortFields && sortPayload.type !== 'null'
       &&  props.reverseSortFields.includes(sortPayload.column.field)) {
@@ -371,7 +453,7 @@
   };
   // 切换页码
   const handlePageValueChange = (pageValue:number) => {
-    pagination.current = pageValue;
+    pagination.current = normalizePage(pageValue);
     isUnload.value = false;
     isLoading.value = true;
     fetchListData();
@@ -382,8 +464,25 @@
     isUserSelectedPageSize.value = false;
     emits('clearSearch');
   };
+  const applyHeightBasedPageSize = () => {
+    if (isUserSelectedPageSize.value) {
+      return;
+    }
+    const { page_size: urlPageSize } = getSearchParams();
+    if (urlPageSize || getRecordPageParams()?.page_size) {
+      return;
+    }
+    const dimensions = calculateTableDimensions();
+    const nextLimit = dimensions.rowNum < 10 ? 10 : dimensions.rowNum;
+    pagination.limit = nextLimit;
+    if (nextLimit > 10) {
+      pagination.limitList = [...new Set([...pagination.limitList, nextLimit])].sort((a, b) => a - b);
+    }
+  };
+
   onMounted(() => {
     parseURL();
+    applyHeightBasedPageSize();
     calcTableHeight();
   });
 
@@ -511,9 +610,8 @@
           sort: normalizedParams.sort,
         };
       } else if (sort) {
-        sortParam = {
-          sort: Array.isArray(sort) ? sort : JSON.parse(sort),
-        };
+        const sortArray = parseSortParam(sort);
+        sortParam = sortArray?.length ? { sort: sortArray } : {};
       } else if (orderField && orderType) {
         sortParam = {
           sort: [orderType === 'desc' ? `-${orderField}` : orderField],
@@ -534,14 +632,59 @@
       const recordParams = getRecordPageParams();
       removePageParams();
       if (params.page) {
-        pagination.current = params.page;
+        pagination.current = normalizePage(params.page);
       }
       if (recordParams) {
-        pagination.current = Number(recordParams.page);
+        pagination.current = normalizePage(recordParams.page);
         pagination.limit = Number(recordParams.page_size) < 10 ? 10 : Number(recordParams.page_size);
+        // 从详情/编辑返回时恢复离开前的分页大小，避免被 calcTableHeight 重置为 10
+        isUserSelectedPageSize.value = true;
+      } else {
+        // 重置用户选择标志，允许重新计算分页大小
+        isUserSelectedPageSize.value = false;
       }
-      // 重置用户选择标志，允许重新计算分页大小
+      isLoading.value = true;
+      fetchListData();
+    },
+    // 切换场景等场景：不继承 URL 上的 sort/筛选，只保留场景上下文后重新拉取
+    resetFetchData(params = {} as Record<string, any>) {
+      const normalizedParams = Object.keys(params).reduce((result, key) => {
+        const value = params[key];
+        if (value === undefined || value === null || value === '') {
+          return result;
+        }
+        if (Array.isArray(value) && value.length === 0) {
+          return result;
+        }
+        return {
+          ...result,
+          [key]: value,
+        };
+      }, {} as Record<string, any>);
+      // 清空历史筛选/排序记忆，避免旧场景条件污染新场景
+      paramsMemo = { ...normalizedParams };
+      delete paramsMemo.sort;
+      delete paramsMemo.order_field;
+      delete paramsMemo.order_type;
+      pagination.current = 1;
       isUserSelectedPageSize.value = false;
+      removePageParams();
+      // 恢复列配置，并强制表格重挂载以清除表头排序/筛选高亮
+      (props.columns || []).forEach((col: any) => {
+        if (col?.sort) {
+          // eslint-disable-next-line no-param-reassign
+          col.sort = 'custom';
+        }
+        if (col?.filter && Array.isArray(col.filter.checked)) {
+          // eslint-disable-next-line no-param-reassign
+          col.filter.checked.length = 0;
+        }
+      });
+      tableRenderKey.value += 1;
+      clearSortActiveUI();
+      nextTick(() => {
+        clearSortActiveUI();
+      });
       isLoading.value = true;
       fetchListData();
     },

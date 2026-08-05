@@ -574,6 +574,10 @@ LOG_EXPORT_STATUS_DATA_ID = int(os.getenv("BKAPP_LOG_EXPORT_STATUS_DATA_ID", 0))
 # 日志导出状态上报的数据token
 LOG_EXPORT_STATUS_ACCESS_TOKEN = os.getenv("BKAPP_LOG_EXPORT_STATUS_ACCESS_TOKEN", "")
 
+# Asset Observability（资产可观测性）
+# 卡在启动中超过该时长（秒）视为异常，默认 6 小时
+ASSET_SYNC_PREPARING_TIMEOUT = int(os.getenv("BKAPP_ASSET_SYNC_PREPARING_TIMEOUT", 6 * 3600))
+
 # metric report
 METRIC_REPORT_TRACE_URL = os.getenv("BKAPP_METRIC_REPORT_TRACE_URL", "")
 # bkvision是否更新
@@ -620,6 +624,9 @@ BKAPP_PYTHON_SDK_CONFIG = os.getenv("BKAPP_PYTHON_SDK_CONFIG", "")
 # 审计文档配置
 BKAPP_AUDIT_ACCESS_GUIDE = os.getenv("BKAPP_AUDIT_ACCESS_GUIDE", "")
 BKAPP_AUDIT_OPERATION_LOG_RECORD_STANDARDS = os.getenv("BKAPP_AUDIT_OPERATION_LOG_RECORD_STANDARDS", "")
+
+# Agent 用户态授权 ping 配置，完整 JSON 在系统初始化时写入 GlobalMetaConfig。
+BKAPP_AGENT_AUTH_CONFIG = os.getenv("BKAPP_AGENT_AUTH_CONFIG", "{}")
 
 # 申请场景权限企业微信UIN
 BKAPP_IEGSEC_HELPER = os.getenv("BKAPP_IEGSEC_HELPER", "")

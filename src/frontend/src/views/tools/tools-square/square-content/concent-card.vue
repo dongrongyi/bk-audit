@@ -17,7 +17,7 @@
 <template>
   <div class="card">
     <div
-      v-if="dataList.length > 0 || searchValue.length > 0 || (isCrossScene && groupedByScene.length > 0)"
+      v-if="dataList.length > 0 || searchValue.length > 0 || (isGroupedMode && groupedTools.length > 0)"
       class="card-search">
       <bk-search-select
         v-model="searchValue"
@@ -31,35 +31,36 @@
         @update:model-value="handleSearch" />
     </div>
     <scroll-faker
+      ref="scrollFakerRef"
       :style="scrollStyle">
       <bk-loading
         :loading="loading"
         :z-index="10000">
-        <!-- 跨场景分组展示模式 -->
-        <template v-if="isCrossScene && groupedByScene.length > 0">
+        <!-- 跨场景/跨系统分组展示模式 -->
+        <template v-if="isGroupedMode && groupedTools.length > 0">
           <div
             ref="cardListRef"
             class="card-list">
             <div
-              v-for="group in groupedByScene"
-              :key="group.sceneId"
+              v-for="group in groupedTools"
+              :key="group.groupKey"
               class="scene-group">
               <div
                 class="scene-group-header"
-                @click="toggleSceneCollapse(group.sceneId)">
+                @click="toggleGroupCollapse(group.groupKey)">
                 <span
                   class="scene-group-arrow"
-                  :class="{ 'is-collapsed': collapsedScenes.has(group.sceneId) }" />
-                <span class="scene-group-title">{{ group.sceneName }}({{ group.sceneId }})</span>
+                  :class="{ 'is-collapsed': collapsedGroups.has(group.groupKey) }" />
+                <span class="scene-group-title">{{ group.groupName }}({{ group.groupId }})</span>
               </div>
               <div
-                v-show="!collapsedScenes.has(group.sceneId)"
+                v-show="!collapsedGroups.has(group.groupKey)"
                 class="card-list-box">
                 <div
                   v-for="(item, index) in group.tools"
                   :key="index"
                   class="card-list-item"
-                  @click="handleClickTool(item)"
+                  @click="handleClickTool(item, group.groupKey)"
                   @mouseenter="handleMouseenter(item)"
                   @mouseleave="handleMouseleave()">
                   <!-- 右上角收藏icon -->
@@ -312,7 +313,7 @@
         </template>
 
         <div
-          v-if="dataList.length === 0 && groupedByScene.length === 0"
+          v-if="dataList.length === 0 && groupedTools.length === 0"
           class="card-empty">
           <bk-exception
             class="empty-exception"
@@ -336,6 +337,10 @@
   </div>
 </template>
 
+<script lang="tsx">
+  // 广场/详情路由切换会重建页面实例，滚动位置需提到模块级保存
+  let cachedToolsSquareScrollTop = 0;
+</script>
 <script setup lang='tsx'>
   import { computed, nextTick, ref, watch } from 'vue';
   import { useI18n } from 'vue-i18n';
@@ -363,11 +368,14 @@
 
 
   interface Exposes {
-    getToolsList: (id: string) => void;
+    getToolsList: (id: string, restoreScroll?: boolean) => void;
+    clearSearch: () => void;
+    saveScrollPosition: () => void;
+    restoreScrollPosition: () => Promise<void>;
   }
   interface Emits {
     (e: 'change'): void;
-    (e: 'openTool', toolInfo: ToolInfo): void;
+    (e: 'openTool', toolInfo: ToolInfo, overrideContext?: { scene_id?: number; system_id?: string }): void;
   }
 
   const props = defineProps<Props>();
@@ -388,7 +396,9 @@
       scope_id?: string,
     },
     isCrossScene: boolean,
+    isCrossSystem: boolean,
     sceneNameMap: Record<number, string>,
+    systemNameMap: Record<string, string>,
   }
 
 
@@ -411,7 +421,30 @@
     values: Array<{ id: string; name: string }>;
   }
 
-  const searchValue = ref<SearchKey[]>([]);
+  // 列表搜索条件持久化：toolsSquare ↔ toolDetail 路由 key 不同会销毁重建组件
+  const SEARCH_STORAGE_KEY = 'tools_square_list_search';
+  const loadSearchValue = (): SearchKey[] => {
+    try {
+      const raw = sessionStorage.getItem(SEARCH_STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  };
+  const persistSearchValue = (value: SearchKey[]) => {
+    if (value?.length) {
+      sessionStorage.setItem(SEARCH_STORAGE_KEY, JSON.stringify(value));
+      return;
+    }
+    sessionStorage.removeItem(SEARCH_STORAGE_KEY);
+  };
+
+  const searchValue = ref<SearchKey[]>(loadSearchValue());
+  watch(searchValue, (val) => {
+    persistSearchValue(val);
+  }, { deep: true });
 
   // bk-search-select 搜索条件配置
   const searchSelectData = [
@@ -487,53 +520,122 @@
   };
 
   const cardListRef = ref<HTMLElement | null>(null);
+  const scrollFakerRef = ref<{
+    getScroll:() => { scrollTop: number };
+    scrollTo: (scrollLeft: number, scrollTop: number) => void;
+  }>();
   const loading = ref(false);
 
-  // 场景分组折叠状态
-  const collapsedScenes = ref<Set<number>>(new Set());
+  const saveScrollPosition = () => {
+    cachedToolsSquareScrollTop = scrollFakerRef.value?.getScroll()?.scrollTop ?? 0;
+  };
 
-  // 按场景分组的工具列表
-  interface SceneGroup {
-    sceneId: number;
-    sceneName: string;
+  const restoreScrollPosition = async () => {
+    if (cachedToolsSquareScrollTop <= 0) return;
+    const apply = () => {
+      scrollFakerRef.value?.scrollTo(0, cachedToolsSquareScrollTop);
+    };
+    await nextTick();
+    apply();
+    requestAnimationFrame(() => {
+      apply();
+      // 列表刚显示时高度可能尚未稳定，再补一次
+      setTimeout(apply, 50);
+      setTimeout(apply, 320);
+    });
+  };
+
+  // 分组折叠状态
+  const collapsedGroups = ref<Set<string>>(new Set());
+
+  const UNCATEGORIZED_KEY = '__uncategorized__';
+
+  interface ToolGroup {
+    groupKey: string;
+    groupName: string;
+    groupId: string | number;
     tools: ToolInfo[];
   }
-  const groupedByScene = computed<SceneGroup[]>(() => {
-    if (!props.isCrossScene || dataList.value.length === 0) return [];
-    const groupMap = new Map<number, ToolInfo[]>();
-    // 收集所有出现的 scene_id 并保持顺序
-    const sceneOrder: number[] = [];
-    dataList.value.forEach((tool) => {
+
+  const isGroupedMode = computed(() => props.isCrossScene || props.isCrossSystem);
+
+  const buildSceneGroups = (tools: ToolInfo[]): ToolGroup[] => {
+    const groupMap = new Map<string, ToolInfo[]>();
+    const sceneOrder: string[] = [];
+    tools.forEach((tool) => {
       const sceneIds = tool.visibility?.scene_ids || [];
       if (sceneIds.length === 0) {
-        // 没有场景ID的工具放入“未分类”组（用 0 代表）
-        if (!groupMap.has(0)) {
-          groupMap.set(0, []);
-          sceneOrder.push(0);
+        if (!groupMap.has('0')) {
+          groupMap.set('0', []);
+          sceneOrder.push('0');
         }
-        groupMap.get(0)!.push(tool);
+        groupMap.get('0')!.push(tool);
       } else {
         sceneIds.forEach((sid: number) => {
+          const key = String(sid);
+          if (!groupMap.has(key)) {
+            groupMap.set(key, []);
+            sceneOrder.push(key);
+          }
+          groupMap.get(key)!.push(tool);
+        });
+      }
+    });
+    return sceneOrder.map((key) => {
+      const sid = Number(key);
+      return {
+        groupKey: key,
+        groupId: sid,
+        groupName: sid === 0 ? t('未分类') : (props.sceneNameMap[sid] || `场景 ${sid}`),
+        tools: groupMap.get(key) || [],
+      };
+    }).sort((a, b) => Number(b.groupKey) - Number(a.groupKey));
+  };
+
+  const buildSystemGroups = (tools: ToolInfo[]): ToolGroup[] => {
+    const groupMap = new Map<string, ToolInfo[]>();
+    const systemOrder: string[] = [];
+    tools.forEach((tool) => {
+      const systemIds = (tool.visibility?.system_ids || []).map(id => String(id));
+      if (systemIds.length === 0) {
+        if (!groupMap.has(UNCATEGORIZED_KEY)) {
+          groupMap.set(UNCATEGORIZED_KEY, []);
+          systemOrder.push(UNCATEGORIZED_KEY);
+        }
+        groupMap.get(UNCATEGORIZED_KEY)!.push(tool);
+      } else {
+        systemIds.forEach((sid) => {
           if (!groupMap.has(sid)) {
             groupMap.set(sid, []);
-            sceneOrder.push(sid);
+            systemOrder.push(sid);
           }
           groupMap.get(sid)!.push(tool);
         });
       }
     });
-    return sceneOrder.map(sid => ({
-      sceneId: sid,
-      sceneName: sid === 0 ? t('未分类') : (props.sceneNameMap[sid] || `场景 ${sid}`),
-      tools: groupMap.get(sid) || [],
-    })).sort((a, b) => b.sceneId - a.sceneId);
+    return systemOrder.map(key => ({
+      groupKey: key,
+      groupId: key === UNCATEGORIZED_KEY ? '-' : key,
+      groupName: key === UNCATEGORIZED_KEY
+        ? t('未分类')
+        : (props.systemNameMap[key] || `系统 ${key}`),
+      tools: groupMap.get(key) || [],
+    }));
+  };
+
+  const groupedTools = computed<ToolGroup[]>(() => {
+    if (!isGroupedMode.value || dataList.value.length === 0) return [];
+    if (props.isCrossScene) {
+      return buildSceneGroups(dataList.value);
+    }
+    return buildSystemGroups(dataList.value);
   });
 
-  const toggleSceneCollapse = (sceneId: number) => {
-    if (collapsedScenes.value.has(sceneId)) {
-      collapsedScenes.value.delete(sceneId);
+  const toggleGroupCollapse = (groupKey: string) => {
+    if (collapsedGroups.value.has(groupKey)) {
+      collapsedGroups.value.delete(groupKey);
     } else {
-      collapsedScenes.value.add(sceneId);
+      collapsedGroups.value.add(groupKey);
     }
   };
   const scrollStyle = {
@@ -560,6 +662,8 @@
   });
 
   // 监听场景切换，按当前场景拉取全量工具列表，避免缺少 scope_type/scope_id 导致的请求失败
+  // 注意：搜索条件清空只在父组件 handleSceneChange(isActualChange) 中处理，
+  // 避免路由重建 / 场景初始化时误清刚恢复的搜索条件
   watch(() => props.scopeParams, (val) => {
     if (!val || !val.scope_type) return;
     fetchAllToolsList({ ...val, status: 'published' });
@@ -757,16 +861,30 @@
    * @param toolInfo: ToolInfo 工具信息
    * @returns void
    */
-  const handleClickTool = async (toolInfo: ToolInfo) => {
+  const buildOverrideContext = (groupKey?: string) => {
+    if (!groupKey || groupKey === '0' || groupKey === UNCATEGORIZED_KEY) {
+      return undefined;
+    }
+    if (props.isCrossScene) {
+      const sceneId = Number(groupKey);
+      if (!Number.isNaN(sceneId) && sceneId > 0) {
+        return { scene_id: sceneId };
+      }
+    }
+    if (props.isCrossSystem) {
+      return { system_id: groupKey };
+    }
+    return undefined;
+  };
+
+  const handleClickTool = async (toolInfo: ToolInfo, groupKey?: string) => {
+    saveScrollPosition();
     urlToolsIds.value.add(toolInfo.uid);
-    // 在游览器地址增加参数单不刷新页面
     appendSearchParams({
       tool_id: Array.from(urlToolsIds.value).join(','),
     });
 
-    // 使用hooks中的handleOpenTool
-    // handleOpenTool(toolInfo.uid);
-    emits('openTool', toolInfo);
+    emits('openTool', toolInfo, buildOverrideContext(groupKey));
   };
 
   // 关闭弹窗
@@ -821,7 +939,16 @@
 
 
   defineExpose<Exposes>({
-    getToolsList(id: string) {
+    clearSearch() {
+      searchValue.value = [];
+      persistSearchValue([]);
+    },
+    saveScrollPosition,
+    restoreScrollPosition,
+    getToolsList(id: string, restoreScroll = false) {
+      if (!restoreScroll) {
+        cachedToolsSquareScrollTop = 0;
+      }
       nextTick(() => {
         const search: Record<string, any> = {};
         searchValue.value.forEach((item) => {
@@ -850,8 +977,11 @@
         }).then((data) => {
           dataList.value = data;
         })
-          .finally(() => {
+          .finally(async () => {
             loading.value = false;
+            if (restoreScroll) {
+              await restoreScrollPosition();
+            }
           });
       });
     },

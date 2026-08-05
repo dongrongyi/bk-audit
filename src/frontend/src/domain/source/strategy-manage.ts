@@ -45,6 +45,7 @@ class Strategy extends ModuleBase {
     label?: string,
     name?: string,
     page?: number,
+    order_field?: string
     order_type?: string
     page_size?: number
     strategy_type?: string
@@ -177,6 +178,7 @@ class Strategy extends ModuleBase {
   getTable(params: {
     table_type: string;
     scene_id?: string;
+    bk_biz_id?: string | number;
   }) {
     return Request.get<Array<{
       label: string;
@@ -208,9 +210,10 @@ class Strategy extends ModuleBase {
   // 获取表格的信息
   getTableRtMeta(params: {
     table_id: string
-  }) {
+  }, payload = {} as IRequestPayload) {
     return Request.get<RtMetaModel>(`${this.path}/strategy_table/rt_meta/`, {
       params,
+      payload,
     });
   }
   // 获取表格最后一条数据

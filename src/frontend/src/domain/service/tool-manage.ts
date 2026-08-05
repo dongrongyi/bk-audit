@@ -15,6 +15,16 @@
   to the current version of the project delivered to anyone in the future.
 */
 import ToolInfo from '../model/tool/tool-info';
+import type {
+  CreatePlatformToolPayload,
+  EditModelParseSqlParams,
+  ParseSqlParams,
+  SceneToolWritePayload,
+  ToolDebugPayload,
+  ToolExecutePayload,
+  UpdatePlatformToolPayload,
+  UpdateSceneToolPayload,
+} from '../model/tool/tool-manage-types';
 import ToolManageSources from '../source/tool-manage';
 
 export default  {
@@ -24,7 +34,6 @@ export default  {
    */
   fetchToolsList(params: {
       keyword?: string,
-      tags?: string[],
       scope_type?: string,
       scope_id?: string,
       binding_type?: string,
@@ -33,7 +42,7 @@ export default  {
       my_created?: boolean,
       recent_used?: boolean,
     }) {
-    return ToolManageSources.getToolsList(params).then(({ data }) => data.map((item: any) => new ToolInfo(item)));
+    return ToolManageSources.getToolsList(params).then(({ data }) => data.map(item => new ToolInfo(item)));
   },
   /**
    * @desc tag列表
@@ -51,7 +60,7 @@ export default  {
    * @desc 创建场景级工具
    * @param { Object } params
    */
-  createSceneTool(params: Record<string, any>) {
+  createSceneTool(params: SceneToolWritePayload) {
     return ToolManageSources.createSceneTool(params)
       .then(({ data }) => data);
   },
@@ -59,7 +68,7 @@ export default  {
    * @desc 解析sql
    * @param { Object } params
    */
-  parseSql(params: Record<string, any>) {
+  parseSql(params: ParseSqlParams) {
     return ToolManageSources.parseSql(params)
       .then(({ data }) => data);
   },
@@ -67,7 +76,7 @@ export default  {
    * @desc 编辑模式解析sql
    * @param { Object } params
    */
-  editModelParseSql(params: Record<string, any>) {
+  editModelParseSql(params: EditModelParseSqlParams) {
     return ToolManageSources.editModelParseSql(params)
       .then(({ data }) => data);
   },
@@ -77,6 +86,8 @@ export default  {
    */
   fetchToolsDetail(params: {
       uid: string,
+      scene_id?: number,
+      system_id?: string,
     }) {
     return ToolManageSources.getToolsDetail(params).then(({ data }) =>  data);
   },
@@ -84,7 +95,7 @@ export default  {
    * @desc 编辑场景级工具
    * @param { Object } params
    */
-  updateSceneTool(params: Record<string, any>) {
+  updateSceneTool(params: UpdateSceneToolPayload) {
     return ToolManageSources.updateSceneTool(params)
       .then(({ data }) => data);
   },
@@ -103,10 +114,7 @@ export default  {
      * @desc 工具执行
      * @param { Object } params
      */
-  fetchToolsExecute(params: {
-      uid: string,
-      params: Record<string, any>,
-    }) {
+  fetchToolsExecute(params: ToolExecutePayload) {
     return ToolManageSources.getToolsExecute(params).then(({ data }) =>  ({
       ...data,
     }));
@@ -115,11 +123,7 @@ export default  {
      * @desc 工具调试
      * @param { Object } params
      */
-  fetchToolsDebug(params: {
-      tool_type: string,
-      config: Record<string, any>,
-      params: Record<string, any>,
-    }) {
+  fetchToolsDebug(params: ToolDebugPayload) {
     return ToolManageSources.getToolsDebug(params).then(({ data }) =>  ({
       ...data,
     }));
@@ -145,6 +149,36 @@ export default  {
       scene_id: number,
     }) {
     return ToolManageSources.publishPlatformTool(params).then(({ data }) => data);
+  },
+  /**
+     * @desc 编辑平台级工具
+     * @param { Object } params - 工具数据（包含 uid）
+     */
+  updatePlatformTool(params: UpdatePlatformToolPayload) {
+    return ToolManageSources.updatePlatformTool(params).then(({ data }) => data);
+  },
+  /**
+     * @desc 创建平台级工具
+     * @param { Object } params - 工具数据
+     */
+  createPlatformTool(params: CreatePlatformToolPayload) {
+    return ToolManageSources.createPlatformTool(params).then(({ data }) => data);
+  },
+  /**
+     * @desc 删除平台级工具
+     * @param { string } uid - 工具ID
+     */
+  deletePlatformTool(uid: string) {
+    return ToolManageSources.deletePlatformTool({ uid }).then(({ data }) => data);
+  },
+  /**
+     * @desc 上架/下架平台级工具
+     * @param { Object } params - { uid, status }
+     */
+  publishPlatformToolStatus(params: {
+     id: string,
+     status: 'published' | 'unpublished' }) {
+    return ToolManageSources.publishPlatformToolStatus(params).then(({ data }) => data);
   },
   /**
      * @desc 收藏/取消收藏工具

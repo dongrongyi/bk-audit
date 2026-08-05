@@ -46,11 +46,14 @@
     <template #header>
       {{ isEdit ? t('编辑风险总结'): t('添加风险总结') }}
     </template>
-    <div style="padding: 24px 40px;">
+    <div class="risk-summary-editor-wrap">
       <rich-editor
         v-model:content="content"
+        class="risk-summary-rich-editor"
         :default="content"
-        height="calc(100vh - 180px)" />
+        :max-len="1000"
+        :show-image-preview="false"
+        :support-fullscreen="false" />
 
       <div class="mt16">
         <bk-button
@@ -69,16 +72,10 @@
       </div>
     </div>
   </audit-sideslider>
-  <risk-content-item
-    v-for="(item,index) in experienceData"
-    :key="item.id"
-    class="mt16"
-    :data="experienceData[index]"
-    :show-edit-btn="myExperienceData === item"
-    @edit="handleEditExperience" />
 </template>
 
 <script setup lang='ts'>
+  import DOMPurify from 'dompurify';
   import {
     computed,
     nextTick,
@@ -96,11 +93,9 @@
   import useMessage from '@hooks/use-message';
   import useRequest from '@hooks/use-request';
 
-  import RichEditor from '@components/rich-editor/index.vue';
+  import RichEditor from '@components/editor/index.vue';
 
   import { changeConfirm } from '@utils/assist';
-
-  import RiskContentItem from './components/risk-content-item.vue';
 
   interface Emits{
     (e:'update'):void,
@@ -118,6 +113,12 @@
   const { messageSuccess } = useMessage();
   const showSlider = ref(false);
   const content = ref('');
+
+  const isRichTextNotEmpty = (html: string) => {
+    if (!html) return false;
+    const text = DOMPurify.sanitize(html, { ALLOWED_TAGS: [] }).trim();
+    return text.length > 0;
+  };
 
 
   const myExperienceData = computed(() => experienceData.value
@@ -155,7 +156,7 @@
 
 
   const handleSubmit = () => {
-    if (content.value) {
+    if (isRichTextNotEmpty(content.value)) {
       saveExperience({
         risk_id: props.data.risk_id,
         content: content.value,
@@ -183,9 +184,7 @@
     });
   };
   watch(() => content.value, () => {
-    if (content.value) {
-      window.changeConfirm = true;
-    }
+    window.changeConfirm = isRichTextNotEmpty(content.value);
   });
   watch(() => props.data, () => {
     if (props.data) {
@@ -203,7 +202,25 @@
   }, {
     immediate: true,
   });
-</script>
-<!-- <style scoped>
 
-</style> -->
+  defineExpose({
+    handleEditExperience,
+  });
+</script>
+<style scoped lang="postcss">
+.risk-summary-editor-wrap {
+  padding: 24px 40px;
+}
+
+.risk-summary-rich-editor,
+:deep(.risk-summary-rich-editor .editor-wrap),
+:deep(.risk-summary-rich-editor .quill-editor) {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+:deep(.risk-summary-rich-editor .ql-container.ql-snow) {
+  min-height: calc(100vh - 280px);
+}
+</style>

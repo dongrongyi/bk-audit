@@ -23,7 +23,9 @@
     :api-base-url="apiBaseUrl"
     :auto-focus="autoFocus"
     :disabled="isDisabled"
+    :free-paste="freePasteEnabled"
     :multiple="multiple"
+    :render-list-item="renderListItem"
     :render-tag="renderTag"
     :tenant-id="tenantId"
     :user-group="userGroup"
@@ -35,7 +37,10 @@
 <script setup lang="ts">
   import {
     computed,
+    nextTick,
     ref,
+    onBeforeUnmount,
+    onMounted,
     watch,
   } from 'vue';
 
@@ -46,6 +51,8 @@
   interface Props {
     modelValue: Array<string> | string;
     allowCreate?: boolean;
+    /** 粘贴未命中用户中心的人员时是否创建（离职人员等）；默认跟随 allowCreate */
+    freePaste?: boolean;
     multiple?: boolean;
     // collapseTags?: boolean;  //bk-select 属性 bk-user-select 不支持
     // needRecord?: boolean;
@@ -64,6 +71,7 @@
   const props = withDefaults(defineProps<Props>(), {
     modelValue: () => [],
     allowCreate: false,
+    freePaste: undefined,
     multiple: true,
     // collapseTags: true,
     // needRecord: false,
@@ -75,6 +83,11 @@
 
   const emit = defineEmits<Emits>();
   const userSelectorRef = ref();
+
+  // allowCreate 开启时默认同步开启 freePaste，否则粘贴离职/不存在人员会被丢弃
+  const freePasteEnabled = computed(() => (
+    props.freePaste === undefined ? props.allowCreate : props.freePaste
+  ));
 
   const normalizeModelValue = (modelValue: Props['modelValue']): Props['modelValue'] => {
     if (props.multiple) {
@@ -111,18 +124,58 @@
       || userInfo.bk_username
       || id;
   };
+  // 离职/不存在人员：用户中心未命中（含 allowCreate、freePaste 的 custom）用灰色失效字色
+  // 命中列表（含搜索到的用户）用正常样式 —— 对齐 c77c074c8 / 776efa61b
+  const isUserInList = (userInfo: Record<string, any>) => {
+    if (userInfo.type === 'custom') {
+      return false;
+    }
+    if (userInfo.type === 'userGroup' || userInfo.type === 'virtual') {
+      return true;
+    }
+    if (userInfo.display_name || userInfo.data_source_type) {
+      return true;
+    }
+    const loginName = userInfo.login_name || userInfo.bk_username || userInfo.username || '';
+    if (loginName && userInfo.name && userInfo.name !== loginName) {
+      return true;
+    }
+    return false;
+  };
 
+  const isResignedUser = (userInfo: Record<string, any> | string) => {
+    if (!userInfo || typeof userInfo !== 'object') {
+      return false;
+    }
+    return !isUserInList(userInfo);
+  };
   // 自定义标签渲染（兼容用户组变量：无 display_name / logo）
   const renderTag = (createElement: any, userInfo: Record<string, any> | string) => {
     const displayText = getTagDisplayText(userInfo);
+    const resigned = isResignedUser(userInfo);
     const children: any[] = [];
     if (userInfo && typeof userInfo === 'object' && userInfo.logo) {
       children.push(createElement('img', { src: userInfo.logo, class: 'avatar' }));
     }
     children.push(displayText);
-    return createElement('span', { class: 'custom-tag' }, children);
+    return createElement('span', {
+      class: ['custom-tag', { 'is-resigned': resigned }],
+    }, children);
   };
 
+  const renderListItem = (createElement: any, userInfo: Record<string, any>) => {
+    const displayText = userInfo.display_name
+      || userInfo.name
+      || userInfo.username
+      || userInfo.bk_username
+      || userInfo.id
+      || '';
+    return createElement('div', {
+      class: 'audit-user-render-item',
+    }, [
+      createElement('span', { class: 'audit-user-render-item__name' }, displayText),
+    ]);
+  };
   // 从sessionStorage中获取配置
   const getConfig = () => {
     try {
@@ -135,7 +188,6 @@
     }
     return null;
   };
-
   // 计算apiBaseUrl
   // apiBaseUrl 由后端配置中的 BK_API_URL_TMPL 与 BK_USER_WEB_APIGW_URL 以及网关环境拼接而成
   const apiBaseUrl = computed(() => {
@@ -145,7 +197,6 @@
     }
     return '';
   });
-
   // 获取租户ID
   const tenantId = computed(() => {
     const config = getConfig();
@@ -163,6 +214,37 @@
   const handleBlur = () => {
     emit('blur');
   };
+
+  // bk-form 等外层表单可能会截获 Enter 触发提交/失焦，导致 allowCreate 无法按键创建自定义用户。
+  // 这里仅在 allowCreate 开启时，拦截 Enter 的冒泡/默认行为，确保 bk-user-selector 自己能处理 Enter 创建逻辑。
+  let enterInputEl: HTMLInputElement | null = null;
+  const handleUserSelectorEnterKeydown = (e: KeyboardEvent) => {
+    if (!props.allowCreate) return;
+    if (e.key !== 'Enter') return;
+    e.stopPropagation();
+    e.stopImmediatePropagation?.();
+    e.preventDefault();
+  };
+
+  onMounted(async () => {
+    await nextTick();
+    const rootEl = userSelectorRef.value?.$el as HTMLElement | null | undefined;
+    if (!rootEl) return;
+
+    // bk-user-selector 内部的搜索输入框 class 在不同场景可能略有差异，这里按优先级挑选。
+    const candidate = rootEl.querySelector('input.user-selector-input')
+      || rootEl.querySelector('input.search-input')
+      || rootEl.querySelector('input');
+    if (candidate && candidate instanceof HTMLInputElement) {
+      enterInputEl = candidate;
+      enterInputEl.addEventListener('keydown', handleUserSelectorEnterKeydown);
+    }
+  });
+
+  onBeforeUnmount(() => {
+    enterInputEl?.removeEventListener('keydown', handleUserSelectorEnterKeydown);
+    enterInputEl = null;
+  });
 
   watch(
     () => [props.modelValue, props.multiple] as const,
@@ -186,6 +268,41 @@
       color: #63656e;
       background-color: #f0f1f5;
       border-color: #f0f1f5;
+    }
+
+    /* 离职/不存在：灰色 tag + 失效字色 #c4c6cc */
+    .custom-tag.is-resigned {
+      color: #c4c6cc;
+      background-color: #f0f1f5;
+      border-color: #f0f1f5;
+    }
+
+    .user-tag.is-custom {
+      color: #c4c6cc !important;
+      background-color: #f0f1f5 !important;
+      border-color: #f0f1f5 !important;
+    }
+
+    .user-tag.is-custom:hover {
+      color: #c4c6cc !important;
+      background-color: #f0f1f5 !important;
+    }
+
+    .user-tag.is-custom .tag-content .user-name {
+      color: #c4c6cc !important;
+    }
+
+    &.nl-tag-user-selector .user-tag.is-custom,
+    &.nl-tag-user-selector .user-tag.is-custom .tag-content .user-name,
+    &.nl-tag-user-selector .custom-tag.is-resigned {
+      color: #c4c6cc !important;
+      background-color: #f0f1f5 !important;
+      border-color: #f0f1f5 !important;
+    }
+
+    &.nl-tag-user-selector .user-tag.is-custom:hover {
+      color: #c4c6cc !important;
+      background-color: #f0f1f5 !important;
     }
 
     .avatar {

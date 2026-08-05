@@ -82,10 +82,15 @@
     riskToolParams: () => ({}),
   });
 
+  const emit = defineEmits<{
+    executed: [];
+  }>();
+
   let app: any;
 
   const panelRef = ref<HTMLElement | null>(null);
   const panelId = ref('');
+  const isExecuting = ref(false);
   const { messageError } = useMessage();
   const emitBus = useEventBus().emit;
 
@@ -99,11 +104,17 @@
         panelId.value = data.data.panel_id;
         initBK(panelId.value);
       }
+      emit('executed');
+    },
+    onFinally: () => {
+      isExecuting.value = false;
     },
   });
 
   // 执行工具（使用 toolDetails.uid 作为真实工具uid来调用后端API）
   const executeTool = () => {
+    if (isExecuting.value) return;
+    isExecuting.value = true;
     fetchToolsExecute({
       uid: props.toolDetails?.uid || props.uid,
       params: {
@@ -146,6 +157,14 @@
 
   // 初始化 BKVision
   const initBK = async (id: string) => {
+    if (app) {
+      app.unmount();
+      app = null;
+    }
+    if (panelRef.value) {
+      panelRef.value.innerHTML = '';
+    }
+
     const filters: Record<string, any> = {};
     const drillDownFilters: Record<string, any> = {};
     const constants: Record<string, any> = {};
@@ -158,10 +177,20 @@
         } else {
           filters[item.raw_name] = item.default_value;
         }
+      } else if (item.field_category === 'variable') {
+        constants[item.raw_name] = '';
+      }
+    });
+
+    // URL 传参 / 用户输入优先覆盖默认值
+    props.searchList?.forEach((item) => {
+      const hasValue = item.value !== null && item.value !== undefined && item.value !== ''
+        && (!Array.isArray(item.value) || item.value.length > 0);
+      if (!hasValue) return;
+      if (item.field_category === 'variable') {
+        constants[item.raw_name] = item.value;
       } else {
-        if (item.field_category === 'variable') {
-          constants[item.raw_name] = '';
-        }
+        filters[item.raw_name] = item.value;
       }
     });
 
@@ -216,7 +245,9 @@
     }
 
     try {
-      await loadScript('https://staticfile.qq.com/bkvision/pbb9b207ba200407982a9bd3d3f2895d4/latest/main.js');
+      if (!window.BkVisionSDK) {
+        await loadScript('https://staticfile.qq.com/bkvision/pbb9b207ba200407982a9bd3d3f2895d4/latest/main.js');
+      }
       app = await window.BkVisionSDK.init(
         `#panel-${props.uid}`,
         id,

@@ -24,10 +24,10 @@
         <bk-button
           v-bk-tooltips="{
             content: t('暂不支持变更，请前往权限中心变更'),
-            disabled:(systemDetailData.source_type !== 'iam_v3' && systemDetailData.source_type !== 'iam_v4')
+            disabled: canEditSystem,
           }"
           class="mr8"
-          :disabled="!(systemDetailData.source_type !== 'iam_v3' && systemDetailData.source_type !== 'iam_v4')"
+          :disabled="!canEditSystem"
           theme="primary"
           @click="handleCreate">
           <audit-icon
@@ -53,7 +53,7 @@
       <bk-table
         :border="['outer']"
         :columns="tableColumn"
-        :data="data">
+        :data="actionList">
         <template #empty>
           <bk-exception
             v-if="searchKey.length"
@@ -89,7 +89,7 @@
   </div>
   <add-action
     ref="addActionRef"
-    :action-list="data"
+    :action-list="actionList"
     @add-resource-type="handleAddResourceType"
     @update-action="handleUpdateAction" />
 </template>
@@ -102,7 +102,6 @@
 
   import MetaManageService from '@service/meta-manage';
 
-  import SystemModel from '@model/meta/system';
   import SystemActionModel from '@model/meta/system-action';
 
   import useRequest from '@hooks/use-request';
@@ -110,6 +109,10 @@
   import addAction from './add-action/index.vue';
 
   import useMessage from '@/hooks/use-message';
+
+  interface Props {
+    canEditSystem: boolean;
+  }
 
   interface Emits {
     (e: 'updateResource'): void;
@@ -136,6 +139,7 @@
     onlyRecommendChildren?: boolean,
   }
 
+  const props = defineProps<Props>();
   const emits = defineEmits<Emits>();
   const route = useRoute();
   const { t } = useI18n();
@@ -202,10 +206,10 @@
           <bk-button
             theme='primary'
             class='mr16'
-            disabled={!(systemDetailData.value.source_type !== 'iam_v3' && systemDetailData.value.source_type !== 'iam_v4')}
+            disabled={!props.canEditSystem}
             v-bk-tooltips={{
               content: t('暂不支持变更，请前往权限中心变更'),
-              disabled: (systemDetailData.value.source_type !== 'iam_v3' && systemDetailData.value.source_type !== 'iam_v4'),
+              disabled: props.canEditSystem,
             }}
             onClick={() => handleEdit(data)}
             text>
@@ -217,10 +221,10 @@
             class="ml8"
             confirmHandler={() => handleDelete(data)}>
             <bk-button
-              disabled={!(systemDetailData.value.source_type !== 'iam_v3' && systemDetailData.value.source_type !== 'iam_v4')}
+              disabled={!props.canEditSystem}
               v-bk-tooltips={{
                 content: t('暂不支持变更，请前往权限中心变更'),
-                disabled: (systemDetailData.value.source_type !== 'iam_v3' && systemDetailData.value.source_type !== 'iam_v4'),
+                disabled: props.canEditSystem,
               }}
               theme='primary'
               text>
@@ -264,7 +268,7 @@
   const {
     run: fetchSystemActionList,
     loading,
-    data,
+    data: actionList,
   }  = useRequest(MetaManageService.fetchSystemActionList, {
     defaultParams: {
       id: route.params.id,
@@ -285,17 +289,6 @@
       });
       emits('updateResource');
     },
-  });
-
-  // 获取系统详情
-  const {
-    data: systemDetailData,
-  } = useRequest(MetaManageService.fetchSystemDetail, {
-    defaultParams: {
-      id: route.params.id,
-    },
-    defaultValue: new SystemModel(),
-    manual: true,
   });
   // 获取操作
   // const {
@@ -372,7 +365,7 @@
     fetchSystemActionList(search);
   };
 
-  watch(() => data.value, (newList) => {
+  watch(() => actionList.value, (newList) => {
     emits('updateListLength', newList.length);
   }, {
     deep: true,

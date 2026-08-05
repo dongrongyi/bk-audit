@@ -24,7 +24,7 @@
       @reset="handleReset" />
     <template
       v-if="hasQueried && !isQuerying && !userInfoLoading && !gameListLoading
-        && isUserInfoEmpty && (hideGameList || gameList.length === 0)">
+        && isUserInfoEmpty && gameList.length === 0">
       <bk-exception
         class="profile-all-empty"
         scene="part"
@@ -49,12 +49,11 @@
       </bk-loading>
 
       <div
-        v-if="!hideGameList && !(!isQuerying && !userInfoLoading && isUserInfoEmpty)"
+        v-if="!(!isQuerying && !userInfoLoading && isUserInfoEmpty)"
         class="section-divider" />
 
-      <!-- 关联游戏列表 - 独立 loading（openid 单条结果场景隐藏整个游戏列表区块） -->
+      <!-- 关联游戏列表 -->
       <bk-loading
-        v-if="!hideGameList"
         class="game-list-loading-wrapper"
         :loading="isQuerying || userInfoLoading || gameListLoading">
         <div
@@ -175,7 +174,7 @@
 <script setup lang="ts">
   import { computed, h, nextTick, onMounted, ref, watch } from 'vue';
   import { useI18n } from 'vue-i18n';
-  import { useRouter } from 'vue-router';
+  import { useRoute, useRouter } from 'vue-router';
   import * as XLSX from 'xlsx';
 
   import ToolManageService from '@service/tool-manage';
@@ -190,6 +189,10 @@
   import ProfileUserInfo from './profile-user-info.vue';
 
   import useRequest from '@/hooks/use-request';
+  import {
+    parseSmartPageGameDetailIntent,
+    parseSmartPageUrlParams,
+  } from '@/views/tools/tools-square/utils/tool-url-params';
 
   import '@blueking/tdesign-ui/vue3/index.css';
 
@@ -208,6 +211,7 @@
 
   interface Emits {
     (e: 'openGameDetail', gameData: Record<string, any>, initialTab?: string): void;
+    (e: 'urlParamsSync', params: { accountType: string; accountId: string }): void;
   }
 
   const props = withDefaults(defineProps<Props>(), {
@@ -217,9 +221,45 @@
   const emit = defineEmits<Emits>();
   const { t } = useI18n();
   const router = useRouter();
+  const route = useRoute();
 
   const queryInputRef = ref();
   const hasQueried = ref(false);
+  const hasAppliedUrlQuery = ref(false);
+  const pendingGameDetailIntent = ref<{ gameid: string; initialTab: string } | null>(null);
+  const smartPageIntentSnapshot = ref('');
+
+  /** 当前路由是否正停留在本智能页（而非游戏详情等其它 tab） */
+  const isCurrentSmartPageRoute = () => {
+    const routeUid = typeof route.params.uid === 'string' ? route.params.uid : '';
+    return !!props.toolUid && routeUid === props.toolUid;
+  };
+
+  const getSmartPageIntentKey = () => {
+    const parsed = parseSmartPageUrlParams(route.query as Record<string, unknown>, props.toolConfig);
+    const intent = parseSmartPageGameDetailIntent(route.query as Record<string, unknown>);
+    return JSON.stringify({
+      account: parsed ? `${parsed.accountType}:${parsed.accountId}` : '',
+      gameid: intent?.gameid || '',
+      initialTab: intent?.initialTab || '',
+    });
+  };
+
+  const markSmartPageIntentApplied = () => {
+    smartPageIntentSnapshot.value = getSmartPageIntentKey();
+  };
+
+  /** 当前是否已按相同账号条件完成过查询（避免切 tab / URL 同步时重复 execute） */
+  const isSameAccountQuery = (accountType: string, accountId: string) => {
+    if (!accountType || !accountId || lastAccountType.value !== accountType) return false;
+    if (accountType === 'ctx') {
+      return lastQueryParams.value?.form_ctx === accountId;
+    }
+    if (accountType === 'openid') {
+      return lastQueryParams.value?.form_openid === accountId;
+    }
+    return lastQueryParams.value?.[accountType] === accountId;
+  };
   // 查询进行中标志：从点击查询起立即为 true，待 useRequest 的 loading 真正接管后自动置 false，
   // 避免请求发起前出现"用户信息块不渲染、loading 也未起来"的空白时间窗
   const isQuerying = ref(false);
@@ -335,8 +375,6 @@
 
   // 关联游戏列表（接口返回后填充）
   const gameList = ref<Array<Record<string, any>>>([]);
-  // 是否隐藏"关联游戏列表"区块（openid 搜索仅 1 条结果时，已自动跳转到游戏详情，工具页不再展示游戏列表，但仍展示用户信息）
-  const hideGameList = ref(false);
 
   // 缓存 openid_list_first_ctx（微信/QQ/openid 搜索时，从 main_openid_list 首条结果获取的 ctx）
   const openidListFirstCtx = ref('');
@@ -659,9 +697,6 @@
 
         // 微信/QQ/openid 搜索时，游戏列表返回后需要级联查询用户信息
         if (['form_wechat', 'form_qq', 'openid'].includes(lastAccountType.value)) {
-          // 正常展示游戏列表区块
-          hideGameList.value = false;
-
           // openid 搜索时，结果返回后展示工具页内容
           if (lastAccountType.value === 'openid') {
             hasQueried.value = true;
@@ -672,6 +707,8 @@
             executeUserInfoByCtx(openidListFirstCtx.value);
           }
         }
+
+        tryOpenGameDetailFromUrlIntent();
       }
     },
   });
@@ -686,6 +723,25 @@
       }
     },
   );
+
+  const matchGameByRouteGameId = (gameid: string) => {
+    const targetId = String(gameid);
+    return gameList.value.find((row) => {
+      const rowGameId = row.gameid ?? row.game_id;
+      return rowGameId !== undefined && rowGameId !== null && String(rowGameId) === targetId;
+    });
+  };
+
+  const tryOpenGameDetailFromUrlIntent = () => {
+    const intent = pendingGameDetailIntent.value;
+    if (!intent || !gameList.value.length) return;
+
+    const matchedGame = matchGameByRouteGameId(intent.gameid);
+    if (!matchedGame) return;
+
+    pendingGameDetailIntent.value = null;
+    emit('openGameDetail', mapGameData(matchedGame), intent.initialTab);
+  };
 
   // 映射游戏数据字段
   const mapGameData = (row: Record<string, any>) => ({
@@ -750,7 +806,7 @@
     emit('openGameDetail', mapGameData(gameData), 'overview');
   };
 
-  // 点击查看记录 - 打开新工具tab，自动展示登录记录tab
+  // 点击查看记录 - 打开新工具tab，自动展示登录记录 tab
   const handleViewRecord = (gameData: Record<string, any>) => {
     emit('openGameDetail', mapGameData(gameData), 'login');
   };
@@ -781,14 +837,21 @@
 
   // 表格列配置（按设计稿：游戏名称 | openid | 代币存量(元) | 累计充值(元)
   // | 累计发放(¥) | 累计赠送次数(隐藏) | 累计交易次数(隐藏) | 登录次数/月(隐藏) | 责任单数(隐藏) | 操作）
-  // 代币字段已替换为元，null时醒目提示"未设汇率"
+  // 代币字段已替换为元，null时醒目提示"未设代币兑换比例"
+  const isEmptyCoinUnitValue = (val: unknown) => val === null || val === undefined || val === '';
+  const COIN_UNIT_EMPTY_TEXT = () => t('未设代币兑换比例');
+  const formatCoinUnitExportValue = (val: unknown): string | number => {
+    if (isEmptyCoinUnitValue(val)) return COIN_UNIT_EMPTY_TEXT();
+    const num = Number(val);
+    return Number.isFinite(num) ? num : val as string | number;
+  };
   const renderCoinField = (data: Record<string, any>, field: string) => {
     const val = data[field];
-    if (val === null || val === undefined || val === '') {
+    if (isEmptyCoinUnitValue(val)) {
       return h(
         'span',
         { style: 'color: #ea3636; cursor: default;' },
-        t('未设汇率'),
+        COIN_UNIT_EMPTY_TEXT(),
       );
     }
     return h('span', {}, val);
@@ -962,12 +1025,11 @@
     lastAccountType.value = accountType;
     // 保存查询状态到 sessionStorage
     saveQueryState(accountType, accountId);
+    emit('urlParamsSync', { accountType, accountId });
 
     // 重置中间变量
     openidListFirstCtx.value = '';
     gameList.value = [];
-    // 重置游戏列表隐藏标识（仅 openid 单条结果时会再次置 true）
-    hideGameList.value = false;
     // 重置排序状态为默认：按代币存量降序
     sortState.value = { column: PROFILE_FIELDS.COIN_BALANCE_UNIT, type: 'desc' };
     pagination.value.current = 1;
@@ -1022,12 +1084,13 @@
   const handleReset = () => {
     hasQueried.value = false;
     isQuerying.value = false;
+    pendingGameDetailIntent.value = null;
     lastQueryParams.value = null;
     lastAccountType.value = '';
     openidListFirstCtx.value = '';
-    hideGameList.value = false;
     // 清除保存的查询状态
     clearQueryState();
+    emit('urlParamsSync', { accountType: '', accountId: '' });
     // 重置用户信息
     userInfo.value = {
       avatar: '', wecom: '', username: '', wechat: '', qq: '',
@@ -1087,7 +1150,13 @@
   // 默认全选
   const exportContentChecked = ref<string[]>(exportContentOptions.map(item => item.id));
 
-  // 设置列宽自适应 & 表头自动筛选
+  const getCellDisplayLength = (cell: XLSX.CellObject) => {
+    const text = cell.w !== null && cell.w !== undefined && cell.w !== '' ? String(cell.w) : String(cell.v ?? '');
+    const len = text.length;
+    const cnLen = (text.match(/[\u4e00-\u9fa5]/g) || []).length;
+    return len + cnLen;
+  };
+
   const applyExcelStyles = (wb: XLSX.WorkBook) => {
     wb.SheetNames.forEach((sheetName: string) => {
       const ws = wb.Sheets[sheetName];
@@ -1100,10 +1169,7 @@
         for (let { r } = range.s; r <= range.e.r; r++) {
           const cell = ws[XLSX.utils.encode_cell({ r, c })];
           if (cell && cell.v !== null && cell.v !== undefined) {
-            const len = String(cell.v).length;
-            // 中文字符按2倍宽度计算
-            const cnLen = (String(cell.v).match(/[\u4e00-\u9fa5]/g) || []).length;
-            const totalLen = len + cnLen;
+            const totalLen = getCellDisplayLength(cell);
             if (totalLen > maxLen) maxLen = totalLen;
           }
         }
@@ -1129,6 +1195,10 @@
       const exportData = filteredGameList.value.map((game) => {
         const row: Record<string, any> = {};
         selectedColumns.forEach((col) => {
+          if (col.id === 'coinBalance' || col.id === 'totalRecharge') {
+            row[col.name] = formatCoinUnitExportValue(game[col.field]);
+            return;
+          }
           row[col.name] = game[col.field] ?? (col.fallbackField ? game[col.fallbackField] : '') ?? '';
         });
         return row;
@@ -1157,18 +1227,57 @@
   };
 
   // ========== 组件挂载时恢复查询状态 ==========
+  const applyUrlQueryIfPresent = () => {
+    if (!props.toolUid || hasAppliedUrlQuery.value) return false;
+    // 游戏详情 URL 也会带 openid/wecom 等字段；仅在当前路由为本智能页时才解析执行，避免误触发其它账号类型查询
+    if (!isCurrentSmartPageRoute()) return false;
+    const parsed = parseSmartPageUrlParams(route.query as Record<string, unknown>, props.toolConfig);
+    const gameDetailIntent = parseSmartPageGameDetailIntent(route.query as Record<string, unknown>);
+    if (!parsed && !gameDetailIntent) return false;
+    hasAppliedUrlQuery.value = true;
+    if (gameDetailIntent) {
+      pendingGameDetailIntent.value = gameDetailIntent;
+    }
+    markSmartPageIntentApplied();
+    if (!parsed) {
+      tryOpenGameDetailFromUrlIntent();
+      return true;
+    }
+    // 已查询过相同账号时不再重复 execute，仅补齐游戏详情跳转意图
+    if (isSameAccountQuery(parsed.accountType, parsed.accountId)) {
+      queryInputRef.value?.setForm(parsed.accountType, parsed.accountId);
+      tryOpenGameDetailFromUrlIntent();
+      return true;
+    }
+    nextTick(() => {
+      queryInputRef.value?.setForm(parsed.accountType, parsed.accountId);
+      handleQuery(parsed.accountType, parsed.accountId);
+    });
+    return true;
+  };
+
   onMounted(() => {
+    if (applyUrlQueryIfPresent()) {
+      return;
+    }
     const savedState = loadQueryState();
-    // 仅当保存的 toolUid 与当前一致时才恢复（避免不同工具实例间串数据）
     if (savedState && savedState.toolUid === props.toolUid && savedState.accountId) {
       nextTick(() => {
-        // 恢复表单输入
         queryInputRef.value?.setForm(savedState.accountType, savedState.accountId);
-        // 重新执行查询
         handleQuery(savedState.accountType, savedState.accountId);
       });
     }
   });
+
+  watch(
+    () => [props.toolUid, props.toolConfig, route.params.uid, getSmartPageIntentKey()] as const,
+    ([, , , intentKey]) => {
+      if (!isCurrentSmartPageRoute()) return;
+      if (intentKey === smartPageIntentSnapshot.value) return;
+      hasAppliedUrlQuery.value = false;
+      applyUrlQueryIfPresent();
+    },
+  );
 </script>
 
 <style scoped lang="postcss">

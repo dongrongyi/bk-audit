@@ -17,15 +17,20 @@
 <template>
   <div
     ref="rootRef"
-    class="risk-manage-detail-handle-part">
-    <div class="title mb16">
+    class="risk-manage-detail-handle-part"
+    :class="{ 'is-embedded': embedded }">
+    <div
+      v-if="!embedded"
+      class="title mb16">
       {{ t('工单处理') }}
     </div>
-    <div class="header">
+    <div
+      v-if="showHeaderActions"
+      class="header">
       <div style="margin-right: auto;">
         <!-- 标记误报 / 解除误报 -->
         <mark-misreport-btn
-          v-if="(data.risk_label === 'misreport')|| (data.risk_label==='normal')"
+          v-if="showHeaderMisreportBtn"
           class="mr16"
           :data="data"
           :last-ticket-history="_.last(ticketHistory)"
@@ -43,6 +48,7 @@
         <!-- 风险总结 -->
         <risk-content-btn
           v-if="data.status==='closed'"
+          ref="riskContentRef"
           :data="data"
           :user-info="userInfo"
           @update="handleUpdate" />
@@ -66,6 +72,8 @@
           :risk-id="riskId"
           :status-data="statusData"
           :user-info="userInfo"
+          v-bind="getTimelineContentProps(getIndexByTag(tag))"
+          @edit="handleEditRiskExperience"
           @update="handleUpdate" />
       </template>
     </bk-timeline>
@@ -75,11 +83,12 @@
 <script setup lang='tsx'>
   import _ from 'lodash';
   import {
+    computed,
     nextTick,
-    // computed,
     onMounted,
     ref,
     watch,
+    withDefaults,
   } from 'vue';
   import {
     useI18n,
@@ -88,11 +97,14 @@
   import AccountManageService from '@service/account-manage';
   import ItsmManageService from '@service/itsm-manage';
   import ProcessApplicationManageService from '@service/process-application-manage';
+  import RiskExperienceManage from '@service/risk-experience-manage';
   import RiskManageService from '@service/risk-manage';
   import SoapManageService from '@service/soap-manage';
 
   import AccountModel from '@model/account/account';
   import type RiskManageModel from '@model/risk/risk';
+
+  import dialogueIconUrl from '@images/dialogue.svg';
 
   import useRequest from '@hooks/use-request';
   import useUrlSearch from '@hooks/use-url-search';
@@ -105,6 +117,7 @@
   import CustomProcess  from './components/custom-process.vue';
   import ForApprove from './components/for-approve.vue';
   import MisReport from './components/misreport.vue';
+  import RiskExperience from './components/risk-experience.vue';
   import ReOpenMisReport from './components/reopen-misreport.vue';
 
   interface Emits{
@@ -114,14 +127,43 @@
     data: RiskManageModel,
     riskId: number,
     eventDataList: Record<string, any>[],
+    embedded?: boolean,
   }
-  const props = defineProps<Props>();
+  const props = withDefaults(defineProps<Props>(), {
+    embedded: false,
+  });
   const emits = defineEmits<Emits>();
+
+  const showHeaderMisreportBtn = computed(() => {
+    // 已标记误报时展示「解除误报」
+    if (props.data.risk_label === 'misreport') {
+      return true;
+    }
+    // 单据关闭后不展示「标记误报」
+    if (props.data.status === 'closed') {
+      return false;
+    }
+    if (props.data.risk_label !== 'normal') {
+      return false;
+    }
+    if (props.embedded && ['await_deal', 'processing'].includes(props.data.status)) {
+      return false;
+    }
+    return true;
+  });
+
+  const showHeaderActions = computed(() => (
+    showHeaderMisreportBtn.value
+    || (props.data.status === 'closed' && props.data.risk_label === 'normal')
+    || props.data.status === 'closed'
+  ));
+
   const { getSearchParams, removeSearchParam } = useUrlSearch();
   const { t } = useI18n();
   const ticketHistory = ref([] as Record<string, any>[]);
 
   const rootRef = ref();
+  const riskContentRef = ref<InstanceType<typeof RiskContentBtn> | null>(null);
   const needScrollToContent = ref(false);
 
   const historyActionMap: Record<string, {
@@ -168,6 +210,10 @@
       name: t('重开单据'),
       icon: 'reopen',
     },
+    RiskExperience: {
+      name: t('风险总结'),
+      icon: 'dialogue',
+    },
   };
   const comMap = {
     ReOpenMisReport,
@@ -180,6 +226,7 @@
     AutoProcess: ForApprove,
     NewRisk: 'div',
     await_deal: AwaitDeal,
+    RiskExperience,
   };
   const processPackageIdToDetailMap = ref<Record<string, any>>({});
   let isInit = false;
@@ -241,10 +288,94 @@
     manual: true,
   });
 
+  const {
+    run: fetchExperience,
+    data: experienceData,
+  } = useRequest(RiskExperienceManage.fetchExperience, {
+    defaultValue: [],
+  });
+
+  const handleEditRiskExperience = () => {
+    riskContentRef.value?.handleEditExperience();
+  };
+
+  const isOwnRiskExperience = (item: Record<string, any>) => (
+    item?.action === 'RiskExperience'
+    && item.experience?.created_by === userInfo.value.username
+  );
+
+  const compareExperienceByTime = (
+    a: { created_at: string },
+    b: { created_at: string },
+  ) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+
+  const appendRiskExperienceTimeline = () => {
+    const experiences = [...(experienceData.value || [])].sort(compareExperienceByTime);
+    experiences.forEach((exp) => {
+      const action = 'RiskExperience';
+      list.value.unshift({
+        tag: renderTimelineTag(
+          action,
+          `exp-${exp.id}`,
+          historyActionMap[action].name,
+          exp.created_at,
+        ),
+        content: '<template/>',
+        icon: () => renderTimelineIcon(action),
+      });
+      ticketHistory.value.unshift({
+        action: 'RiskExperience',
+        time: exp.created_at,
+        experience: exp,
+      });
+    });
+  };
+
   const handleUpdate = () => {
     isInit = false;
     emits('update');
   };
+
+  const getTimelineContentProps = (item: Record<string, any>) => {
+    if (item?.action === 'RiskExperience') {
+      return {
+        showEditBtn: isOwnRiskExperience(item),
+      };
+    }
+    return {};
+  };
+
+  const renderTimelineIcon = (action: string, active = false) => (
+    <span
+      class="risk-handle-timeline-icon"
+      style={{
+        background: active ? '#E1ECFF' : '#F0F1F5',
+        color: active ? '#3A84FF' : '#989CA7',
+      }}>
+      {action === 'RiskExperience' ? (
+        <img
+          alt=""
+          class="risk-handle-timeline-dialogue-icon"
+          src={dialogueIconUrl} />
+      ) : (
+        <audit-icon type={ historyActionMap[action].icon } />
+      )}
+    </span>
+  );
+
+  const renderTimelineTag = (action: string, index: number | string, title: string, time: string) => (
+    `<p class="risk-handle-timeline-tag ${action}-${index}">
+      <span class="risk-handle-timeline-tag__title">${title}</span>
+      <span class="risk-handle-timeline-tag__time">${time}</span>
+    </p>`
+  );
+
+  const getTimelineTitle = (item: Record<string, any>) => (
+    ['MisReport', 'ReOpenMisReport'].includes(item.action)
+      ? `${item.operator} ${historyActionMap[item.action].name}`
+      : historyActionMap[item.action].name || item.action
+  );
+
   const getIndexByTag = (tag: string) => {
     const index = list.value.findIndex(item => item.tag === tag);
     return ticketHistory.value[index];
@@ -286,17 +417,9 @@
       ticketHistory.value = [];
       data.ticket_history.forEach((item, index) => {
         const listParam = {
-          tag: `<p style='font-size: 12px;' class='${item.action}-${index}'>
-                <span style='color: #313238;margin-left:4px;'>
-                  ${['MisReport', 'ReOpenMisReport'].includes(item.action)
-          ? `${item.operator} ${historyActionMap[item.action].name}`
-          : historyActionMap[item.action].name || item.action}</span>
-                <span style='color: #979BA5;margin-left: 8px;'>${item.time}</span>
-              <p>`,
+          tag: renderTimelineTag(item.action, index, getTimelineTitle(item), item.time),
           content: '<template/>',
-          icon: () => <span style='background: #F0F1F5;width: 26px;height: 26px;border-radius: 50%;display: inline-block;text-align:center;line-height: 26px;'>
-            <audit-icon type={ historyActionMap[item.action].icon }  style='color: #989CA7;font-size: 16px;' />
-          </span>,
+          icon: () => renderTimelineIcon(item.action),
         };
         if (!['ForApprove', 'AutoProcess'].includes(item.action)) {
           list.value.push(listParam);
@@ -324,32 +447,38 @@
         const item = Object.assign({}, data.ticket_history[data.ticket_history.length - 1]);
         item.action = 'await_deal'; // 使用await_deal组件来处理两种状态
         list.value.push({
-          tag: `<p style='font-size: 12px;' class='${item.action}-${data.ticket_history.length}'>
-                <span style='color: #313238;margin-left: 4px;'>${historyActionMap[item.action].name || item.action}</span>
-                <span style='color: #979BA5;margin-left: 8px;'>${item.time}</span>
-              <p>`,
+          tag: renderTimelineTag(
+            item.action,
+            data.ticket_history.length,
+            historyActionMap[item.action].name || item.action,
+            item.time,
+          ),
           content: '<template/>',
-          icon: () => <span style='background: #F0F1F5;width: 26px;height: 26px;border-radius: 50%;display: inline-block;text-align:center;line-height: 26px;'>
-            <audit-icon type={ historyActionMap[item.action].icon }  style='color: #989CA7;font-size: 16px;'/>
-          </span>,
+          icon: () => renderTimelineIcon(item.action, true),
         });
         ticketHistory.value.push(item);
       }
       // 翻转列表
       list.value.reverse();
       ticketHistory.value.reverse();
-      isInit = true;
 
-      if (ticketHistory.value.length > 0) {
-        handleFetchParamsDetail();
-      }
-      nextTick(() => {
-        const el =  document.getElementById('risk-manage-content-btn');
-        if (el && needScrollToContent.value) {
-          el.scrollIntoView();
-          needScrollToContent.value = false;
-          removeSearchParam('scrollToContent');
+      fetchExperience({
+        risk_id: data.risk_id,
+      }).then(() => {
+        appendRiskExperienceTimeline();
+        isInit = true;
+
+        if (ticketHistory.value.length > 0) {
+          handleFetchParamsDetail();
         }
+        nextTick(() => {
+          const el =  document.getElementById('risk-manage-content-btn');
+          if (el && needScrollToContent.value) {
+            el.scrollIntoView();
+            needScrollToContent.value = false;
+            removeSearchParam('scrollToContent');
+          }
+        });
       });
     }
     if (data.scene_id) {
@@ -366,6 +495,14 @@
 .risk-manage-detail-handle-part {
   padding: 0 14px 14px;
 
+  &.is-embedded {
+    padding: 0;
+
+    .risk-handle-timeline {
+      padding-left: 0;
+    }
+  }
+
   .title {
     font-size: 14px;
     font-weight: 700;
@@ -375,15 +512,200 @@
 
   .header {
     display: flex;
-    padding-bottom: 20px;
+    padding-bottom: 12px;
     justify-content: space-between;
     align-items: center;
   }
 }
 
 .risk-handle-timeline {
-  :deep(.bk-timeline-dot .bk-timeline-content) {
-    max-width: 100%;
+  --timeline-icon-size: 26px;
+  --timeline-icon-gap: 12px;
+
+  width: 100%;
+  margin-top: 0;
+
+  :deep(.bk-timeline) {
+    margin-top: 0;
+  }
+
+  :deep(.bk-timeline-dot) {
+    position: relative;
+    display: grid;
+    grid-template-columns: var(--timeline-icon-size) minmax(0, 1fr);
+    grid-template-rows: auto auto;
+    column-gap: var(--timeline-icon-gap);
+    padding: 0 0 24px !important;
+    margin-top: 0 !important;
+    overflow: visible;
+    font-size: 12px;
+    border-left: none !important;
+
+    &::before {
+      display: none !important;
+    }
+
+    &:not(:last-child)::after {
+      position: absolute;
+      top: var(--timeline-icon-size);
+      bottom: 0;
+      left: calc(var(--timeline-icon-size) / 2 - .5px);
+      width: 1px;
+      background: #dcdee5;
+      content: '';
+    }
+
+    &:last-child {
+      padding-bottom: 0 !important;
+    }
+  }
+
+  :deep(.bk-timeline-item-custom-icon) {
+    margin-top: 0 !important;
+  }
+
+  :deep(.bk-timeline-icon) {
+    position: relative !important;
+    top: auto !important;
+    left: auto !important;
+    z-index: 1;
+    display: flex;
+    width: var(--timeline-icon-size) !important;
+    height: var(--timeline-icon-size) !important;
+    background: transparent !important;
+    border: none !important;
+    grid-column: 1;
+    grid-row: 1;
+    align-self: start;
+    align-items: center;
+    justify-content: center;
+
+    .bk-timeline-icon-inner {
+      display: flex;
+      width: var(--timeline-icon-size);
+      height: var(--timeline-icon-size);
+      align-items: center;
+      justify-content: center;
+      transform: none !important;
+    }
+  }
+
+  :deep(.bk-timeline-section) {
+    position: static !important;
+    top: auto !important;
+    display: contents !important;
+  }
+
+  :deep(.bk-timeline-title) {
+    display: block;
+    grid-column: 2;
+    grid-row: 1;
+    align-self: start;
+    padding-bottom: 12px;
+    margin-top: 0;
+    font-size: 12px;
+    line-height: 20px;
+    color: inherit;
+    cursor: default;
+  }
+
+  :deep(.bk-timeline-dot:has(.bk-timeline-content:empty) .bk-timeline-title) {
+    padding-bottom: 0;
+  }
+
+  :deep(.bk-timeline-content) {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    max-width: none !important;
+    font-size: 12px;
+    color: inherit;
+    word-break: normal;
+    grid-column: 2;
+    grid-row: 2;
+
+    &:empty {
+      display: none;
+    }
+  }
+
+  :deep(.risk-handle-timeline-tag) {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0;
+  }
+
+  :deep(.risk-handle-timeline-tag__title) {
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 22px;
+    color: #313238;
+  }
+
+  :deep(.risk-handle-timeline-tag__time) {
+    font-size: 12px;
+    line-height: 20px;
+    color: #979ba5;
+  }
+
+  :deep(.risk-handle-timeline-icon) {
+    display: inline-flex;
+    width: var(--timeline-icon-size);
+    height: var(--timeline-icon-size);
+    border-radius: 50%;
+    align-items: center;
+    justify-content: center;
+
+    .audit-icon {
+      font-size: 16px;
+      line-height: 1;
+    }
+
+    .risk-handle-timeline-dialogue-icon {
+      display: block;
+      width: 12px;
+      height: 12px;
+      object-fit: contain;
+    }
+  }
+
+  :deep(.bk-timeline-content .reopen-mis-report-wrap),
+  :deep(.bk-timeline-content .approve-wrap),
+  :deep(.bk-timeline-content .risk-experience-wrap) {
+    padding: 0;
+    font-size: 12px;
+    color: #63656e;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  :deep(.bk-timeline-content .approve-wrap > .mis-content),
+  :deep(.bk-timeline-content .reopen-mis-report-wrap > .mis-content),
+  :deep(.bk-timeline-content .risk-experience-wrap > .mis-content) {
+    padding: 12px 8px 12px 12px;
+    margin-top: 8px;
+    background: #f5f7fa;
+    border-radius: 2px;
+
+    .render-info-item .info-label {
+      width: auto !important;
+      max-width: none !important;
+      min-width: 0 !important;
+      text-align: left;
+      flex: 0 0 auto !important;
+    }
+
+    .render-info-item .info-value {
+      padding-left: 4px;
+    }
+  }
+
+  :deep(.bk-timeline-content .reopen-mis-report-wrap > .mis-title),
+  :deep(.bk-timeline-content .approve-wrap > .mis-title) {
+    padding: 0;
   }
 }
 </style>

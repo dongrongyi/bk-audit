@@ -17,6 +17,16 @@
 import type ParseSqlModel from '@model/tool/parse-sql';
 import type ToolDetailModel from '@model/tool/tool-detail';
 import type ToolInfoModel from '@model/tool/tool-info';
+import type {
+  CreatePlatformToolPayload,
+  EditModelParseSqlParams,
+  ParseSqlParams,
+  SceneToolWritePayload,
+  ToolDebugPayload,
+  ToolExecutePayload,
+  UpdatePlatformToolPayload,
+  UpdateSceneToolPayload,
+} from '@model/tool/tool-manage-types';
 
 import Request from '@utils/request';
 import { processedParams } from '@utils/request/lib/utils';
@@ -34,7 +44,6 @@ class ToolManage extends ModuleBase {
   // 获取工具列表（不再分页，直接返回数组）
   getToolsList(params: {
     keyword?: string,
-    tags?: string[],
     scope_type?: string,
     scope_id?: string,
     binding_type?: string,
@@ -65,7 +74,7 @@ class ToolManage extends ModuleBase {
     }>>(`${this.path}/tool/tags/${query}`);
   }
   // 创建场景级工具
-  createSceneTool(params: Record<string, any>) {
+  createSceneTool(params: SceneToolWritePayload) {
     const sceneId = getSceneSystemParams().scope_id;
     return Request.post(`${this.path}/tool/scene/?scene_id=${sceneId}`, {
       params: {
@@ -75,13 +84,13 @@ class ToolManage extends ModuleBase {
     });
   }
   // 解析sql
-  parseSql(params: Record<string, any>) {
+  parseSql(params: ParseSqlParams) {
     return Request.post<ParseSqlModel>(`${this.path}/tool/sql_analyse/`, {
       params,
     });
   }
   // 编辑模式解析sql
-  editModelParseSql(params: Record<string, any>) {
+  editModelParseSql(params: EditModelParseSqlParams) {
     return Request.post<ParseSqlModel>(`${this.path}/tool/${params.uid}/sql_analyse_with_tool/`, {
       params,
     });
@@ -89,11 +98,17 @@ class ToolManage extends ModuleBase {
   // 获取工具详情
   getToolsDetail(params: {
     uid: string,
+    scene_id?: number,
+    system_id?: string,
   }) {
-    return Request.get<ToolDetailModel>(`${this.path}/tool/${params.uid}/`);
+    const { uid, ...queryParams } = params;
+    const query = Object.keys(queryParams).length > 0
+      ? `?${processedParams(queryParams).toString()}`
+      : '';
+    return Request.get<ToolDetailModel>(`${this.path}/tool/${uid}/${query}`);
   }
   // 编辑工具
-  updateSceneTool(params: Record<string, any>) {
+  updateSceneTool(params: UpdateSceneToolPayload) {
     const sceneId = getSceneSystemParams().scope_id;
     return Request.put(`${this.path}/tool/scene/${params.uid}/?scene_id=${sceneId}`, {
       params: {
@@ -107,28 +122,27 @@ class ToolManage extends ModuleBase {
     scope_type?: string,
     scope_id?: string,
     status?: string[],
+    namespace?: string,
   }) {
+    // scope_type 为后端必填；无参/空参调用时回退当前场景/系统，避免 /tool/all/? 空查询 500
     const sceneParams = getSceneSystemParams();
+    const { scope_type: paramScopeType, scope_id: paramScopeId, ...rest } = params || {};
+    const scopeType = paramScopeType || sceneParams.scope_type || 'cross_scene';
+    const scopeId = paramScopeId || sceneParams.scope_id;
     const mergedParams = {
-      scope_type: sceneParams.scope_type,
-      scope_id: sceneParams.scope_id,
-      ...params,
+      ...rest,
+      scope_type: scopeType,
+      ...(scopeId ? { scope_id: scopeId } : {}),
     };
-    return Request.get<Array<ToolDetailModel>>(`${this.path}/tool/all/?${processedParams(mergedParams).toString()}`);
+    const query = `?${processedParams(mergedParams).toString()}`;
+    return Request.get<Array<ToolDetailModel>>(`${this.path}/tool/all/${query}`);
   }
   // 工具执行
-  getToolsExecute(params: {
-    uid: string,
-    params: Record<string, any>,
-  }) {
+  getToolsExecute(params: ToolExecutePayload) {
     return Request.post(`${this.path}/tool/${params.uid}/execute/`, { params });
   }
   // 工具调试
-  getToolsDebug(params: {
-    tool_type: string,
-    config: Record<string, any>,
-    params: Record<string, any>,
-  }) {
+  getToolsDebug(params: ToolDebugPayload) {
     return Request.post(`${this.path}/tool/tool_execute_debug/`, { params });
   }
   // 删除场景级工具
@@ -147,6 +161,33 @@ class ToolManage extends ModuleBase {
       params: {
         uid: params.uid,
         scene_id: params.scene_id,
+      },
+    });
+  }
+  // 编辑平台级工具
+  updatePlatformTool(params: UpdatePlatformToolPayload) {
+    return Request.put(`${this.path}/tool/platform/${params.uid}/`, {
+      params: {
+        ...params,
+      },
+    });
+  }
+  // 创建平台级工具
+  createPlatformTool(params: CreatePlatformToolPayload) {
+    return Request.post(`${this.path}/tool/platform/`, {
+      params,
+    });
+  }
+  // 删除平台级工具
+  deletePlatformTool(params: { uid: string }) {
+    return Request.delete(`${this.path}/tool/platform/${params.uid}/`);
+  }
+  // 上架/下架平台级工具
+  publishPlatformToolStatus(params: { id: string, status: 'published' | 'unpublished' }) {
+    return Request.post(`${this.path}/tool/platform/${params.id}/publish/`, {
+      params: {
+        id: params.id,
+        status: params.status,
       },
     });
   }

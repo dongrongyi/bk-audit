@@ -36,15 +36,15 @@ export default {
         nodeSideContent: false,
       },
     },
-    {
-      path: 'platform-report-config',
-      component: () => import('@views/platform-manage/report-config/index.vue'),
-      name: 'platformReportConfig',
-      meta: {
-        title: '报表管理',
-        nodeSideContent: false,
-      },
-    },
+    // {
+    //   path: 'platform-report-config',
+    //   component: () => import('@views/platform-manage/report-config/index.vue'),
+    //   name: 'platformReportConfig',
+    //   meta: {
+    //     title: '报表管理',
+    //     nodeSideContent: false,
+    //   },
+    // },
     {
       path: 'platform-tool-config',
       component: () => import('@views/platform-manage/tool-manage/index.vue'),
@@ -54,6 +54,24 @@ export default {
         nodeSideContent: false,
       },
     },
+    {
+      path: 'platform-tool-create',
+      component: () => import('@views/platform-manage/tool-manage/create-tool/index.vue'),
+      name: 'platformToolCreate',
+      meta: {
+        title: '新建工具',
+        nodeSideContent: false,
+      },
+    },
+    {
+      path: 'platform-tool-edit/:id',
+      component: () => import('@views/platform-manage/tool-manage/create-tool/index.vue'),
+      name: 'platformToolEdit',
+      meta: {
+        title: '编辑工具',
+        skeleton: 'strategyEdit',
+        nodeSideContent: false,
+      },
+    },
   ],
 };
-

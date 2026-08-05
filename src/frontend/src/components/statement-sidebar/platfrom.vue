@@ -28,9 +28,7 @@
     </audit-menu-item>
 
     <!-- 资源管理 -->
-    <div
-      v-if="0"
-      class="side-group">
+    <div class="side-group">
       <div
         class="side-group-header"
         @click="toggleGroup('resourceManage')">
@@ -47,14 +45,7 @@
         v-show="expandedGroups.includes('resourceManage')"
         class="side-group-children">
         <audit-menu-item
-          :class="{ active: currentRoute === 'platformReportConfig' }"
-          index="platformReportConfig"
-          @click="handleMenuClick('platformReportConfig')">
-          <span class="side-child-dot" />
-          {{ t('报表管理') }}
-        </audit-menu-item>
-        <audit-menu-item
-          :class="{ active: currentRoute === 'platformToolConfig' }"
+          :class="{ active: ['platformToolConfig', 'platformToolCreate', 'platformToolEdit'].includes(currentRoute) }"
           index="platformToolConfig"
           @click="handleMenuClick('platformToolConfig')">
           <span class="side-child-dot" />
@@ -126,8 +117,9 @@
 
   // 路由与分组的映射关系
   const routeGroupMap: Record<string, string> = {
-    platformReportConfig: 'resourceManage',
     platformToolConfig: 'resourceManage',
+    platformToolCreate: 'resourceManage',
+    platformToolEdit: 'resourceManage',
     storageManage: 'dataManage',
     storageList: 'dataManage',
   };
@@ -219,4 +211,3 @@
     }
   }
 </style>
-

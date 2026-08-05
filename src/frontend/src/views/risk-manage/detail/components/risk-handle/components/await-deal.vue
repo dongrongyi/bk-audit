@@ -15,16 +15,20 @@
   to the current version of the project delivered to anyone in the future.
 -->
 <template>
-  <div class="risk-await-deal-wrap">
+  <div
+    class="risk-await-deal-wrap"
+    :class="{ 'is-editor-boosted': isDockEditorBoosted }">
     <audit-form
       ref="formRef"
       form-type="vertical"
       :model="formData"
       :rules="rules">
       <bk-form-item
+        class="risk-await-deal-method"
         :label="t('处理方法')"
         required>
         <bk-radio-group
+          class="risk-await-deal-method__group"
           :model-value="formData.method"
           @change="handleChangeMethod">
           <bk-radio
@@ -45,8 +49,11 @@
           <rich-editor
             ref="richEditor"
             v-model:content="formData.description"
+            class="await-deal-rich-editor"
             :default="formData.description"
-            :max-len="1000" />
+            fullscreen-scope="parent"
+            :max-len="1000"
+            @expand-change="handleEditorExpandChange" />
         </bk-form-item>
       </template>
       <!-- 转单 -->
@@ -57,7 +64,10 @@
           required>
           <audit-user-selector-tenant
             v-model="formData.new_operators"
-            :placeholder="t('请输入人员')" />
+            allow-create
+            class="transfer-user-selector"
+            :placeholder="t('请输入人员')"
+            @change="handleTransferOperatorsChange" />
         </bk-form-item>
         <bk-form-item
           :label="t('处理说明')"
@@ -66,15 +76,40 @@
           <rich-editor
             ref="richEditor"
             v-model:content="formData.description"
+            class="await-deal-rich-editor"
             :default="formData.description"
-            :max-len="1000" />
+            fullscreen-scope="parent"
+            :max-len="1000"
+            @expand-change="handleEditorExpandChange" />
+        </bk-form-item>
+      </template>
+
+      <!-- 标记误报 -->
+      <template v-else-if="formData.method === 'misreport'">
+        <bk-alert
+          class="misreport-alert"
+          theme="warning"
+          :title="t('标记误报后，风险单会自动关闭，请谨慎确认是否为误报？')" />
+        <bk-form-item
+          class="is-required"
+          :label="t('误报说明')"
+          property="misreport_description"
+          required>
+          <rich-editor
+            ref="misreportRichEditor"
+            v-model:content="formData.misreport_description"
+            class="await-deal-rich-editor"
+            :default="formData.misreport_description"
+            fullscreen-scope="parent"
+            :max-len="1000"
+            @expand-change="handleEditorExpandChange" />
         </bk-form-item>
       </template>
 
       <!-- 处理套餐 -->
       <template v-else-if="formData.method === 'ProcessPackage'">
         <bk-form-item
-          class="is-required"
+          class="is-required process-package-select-item"
           :label="t('处理套餐')"
           property="pa_id">
           <bk-select
@@ -93,69 +128,41 @@
         <bk-loading :loading="detailLoading">
           <bk-form-item
             v-if="Object.keys(paramsDetailData)?.length"
-            class="is-required"
+            class="is-required pa-params-form-item"
             :label="t('套餐参数')"
             property="pa_params">
-            <div style="padding: 16px 12px;background: rgb(245 247 250 / 100%)">
+            <div class="pa-params-grid">
               <template
                 v-for="(val, index) in Object.values(sortByIndex (paramsDetailData))"
                 :key="`${val.key}-${index}`">
-                <!-- 只显示需要显示的字段 -->
                 <bk-form-item
                   v-if="val.show_type === 'show' && !val.is_hide"
+                  class="pa-params-field"
                   :label="val.name"
-                  :label-width="300"
                   :property="`pa_params.${val.key}`"
                   required
                   :rules="[
                     { message: t('不能为空'),
                       validator: (value: any) => handlePaValidate(value) },
-                  ]"
-                  style="margin-bottom: 16px;">
+                  ]">
                   <application-parameter
                     v-model="formData.pa_params[val.key]"
                     clearable
                     :config="val"
                     :detail-data="detailData"
                     :event-data-list="eventDataList"
-                    :risk-field-list="riskFieldList" />
+                    :risk-field-list="riskFieldList"
+                    use-field-insert />
                   <template #error="message">
                     <div>{{ val.name }}{{ message }}</div>
                   </template>
                   <template #label>
-                    <div
-                      class="val-label">
-                      <span
-                        v-bk-tooltips="{
-                          content: t(val.desc),
-                          disabled: val.desc === '',
-                        }"
-                        :class="val.desc === '' ? 'label-name' : 'label-name underline'">{{ val.name }} </span>
-                      <bk-dropdown
-                        v-if="val.custom_type === 'datetime' || val.custom_type === 'textarea'
-                          || val.custom_type === 'input' || val.custom_type === 'bk_date_picker'
-                          || val.custom_type === ''"
-
-                        ref="dropdownRef"
-                        :is-show="val.dropdownShow"
-                        trigger="hover">
-                        <span
-                          class="label-text"
-                          @click="handleShow(val)">{{ typeText(val?.type) }} <audit-icon
-                            class="line-down"
-                            type="angle-line-down" /></span>
-                        <template #content>
-                          <bk-dropdown-menu>
-                            <bk-dropdown-item
-                              v-for="item in dropdownList"
-                              :key="item.id"
-                              @click="handleClick(item, val)">
-                              {{ item.name }}
-                            </bk-dropdown-item>
-                          </bk-dropdown-menu>
-                        </template>
-                      </bk-dropdown>
-                    </div>
+                    <span
+                      v-bk-tooltips="{
+                        content: t(val.desc),
+                        disabled: val.desc === '',
+                      }"
+                      :class="val.desc === '' ? 'label-name' : 'label-name underline'">{{ val.name }}</span>
                   </template>
                 </bk-form-item>
               </template>
@@ -163,14 +170,16 @@
           </bk-form-item>
         </bk-loading>
         <bk-form-item
-          class="mr16"
+          class="auto-close-risk-form-item"
           label="">
           <bk-checkbox v-model="formData.auto_close_risk">
             <span style="font-size: 12px;">{{ t('套餐执行成功后自动关单') }}</span>
           </bk-checkbox>
         </bk-form-item>
       </template>
-      <bk-form-item label="">
+      <bk-form-item
+        class="submit-actions-form-item"
+        label="">
         <auth-button
           action-id="process_risk"
           :loading="loading"
@@ -195,14 +204,15 @@
   import DOMPurify from 'dompurify';
   import {
     computed,
+    inject,
+    nextTick,
     ref,
     watch,
+    type Ref,
   } from 'vue';
   import { useI18n } from 'vue-i18n';
   import {
     onBeforeRouteLeave,
-    useRoute,
-    useRouter,
   } from 'vue-router';
 
   import ProcessApplicationManageService from '@service/process-application-manage';
@@ -257,36 +267,53 @@
 
   const props = defineProps<Props>();
   const emits = defineEmits<Emits>();
+  const dockEditorExpand = inject<(expanded: boolean) => void>('dockEditorExpand', () => {});
+  const dockBoostState = inject<{
+    isEditorBoosted: Ref<boolean>;
+    panelHeight: Ref<number>;
+  } | null>('dockBoostState', null);
+  const dockCollapse = inject<(() => void) | null>('dockCollapse', null);
+  const isDockEditorBoosted = computed(() => dockBoostState?.isEditorBoosted.value ?? false);
+  const handleEditorExpandChange = (expanded: boolean) => {
+    dockEditorExpand(expanded);
+  };
   const { t } = useI18n();
-  const router = useRouter();
-  const route = useRoute();
   const { messageSuccess } = useMessage();
-  const typeText = (val: string | undefined) => (val === 'self' ?  t('自定义输入') : t('字段值引用'));
-  const handleShow = (val:ParamItem) => {
-    Object.keys(paramsDetailData.value).forEach((obj) => {
-      if (obj  === val.key) {
-        paramsDetailData.value[obj].dropdownShow = true;
-      }
+
+  // 判断富文本内容是否为实质性输入（排除编辑器产生的空内容HTML标签）
+  const isRichTextNotEmpty = (html: string) => {
+    if (!html) return false;
+    const text = DOMPurify.sanitize(html, { ALLOWED_TAGS: [] }).trim();
+    return text.length > 0;
+  };
+
+  const hasTransferOperators = (value: string | string[] | undefined) => {
+    if (Array.isArray(value)) {
+      return value.length > 0;
+    }
+    return !!value;
+  };
+
+  const clearFieldValidateIfValid = (field: string, isValid: boolean) => {
+    if (!isValid) return;
+    nextTick(() => {
+      formRef.value?.clearValidate?.(field);
     });
   };
-  const dropdownList = ref([
-    {
-      id: 'self',
-      name: t('自定义输入'),
-    },
-    {
-      id: 'field',
-      name: t('字段值引用'),
-    },
-  ]);
+
   const rules = {
     new_operators: [{
-      validator: (value: string) => !!value && value.length > 0,
+      validator: (value: string | string[]) => hasTransferOperators(value),
       trigger: 'change',
       message: t('转单人不能为空'),
     }],
     description: [{
-      validator: (value: string) => !!value,
+      validator: (value: string) => isRichTextNotEmpty(value),
+      trigger: 'change',
+      message: t('说明不能为空'),
+    }],
+    misreport_description: [{
+      validator: (value: string) => isRichTextNotEmpty(value),
       trigger: 'change',
       message: t('说明不能为空'),
     }],
@@ -304,39 +331,28 @@
       },
     ],
   };
-  const radioGroup = [
-    {
-      id: 'closeOrder',
-      name: t('人工关单'),
-    },
-    {
-      id: 'transfer',
-      name: t('转单'),
-    },
-    {
-      id: 'ProcessPackage',
-      name: t('处理套餐'),
-    },
-  ];
+  const radioGroup = computed(() => {
+    const options = [
+      { id: 'closeOrder', name: '人工关单' },
+      { id: 'transfer', name: '转单' },
+      { id: 'ProcessPackage', name: '处理套餐' },
+    ];
+    if (props.detailData.risk_label !== 'misreport') {
+      options.push({ id: 'misreport', name: '标记误报' });
+    }
+    return options;
+  });
 
   const formData = ref<Record<string, any>>({
     method: 'closeOrder',
     risk_id: props.riskId,
   });
   const formRef = ref();
-  const loading = computed(() => transLoading.value || autoProcessLoading.value || closeLoading.value);
+  const loading = computed(() => transLoading.value || autoProcessLoading.value
+    || closeLoading.value || misreportLoading.value);
   const filterProcessApplicationList = computed(() => processApplicationList.value
     .filter(item => item.is_enabled));
 
-  const dropdownRef = ref();
-  const handleClick = (label: Record<string, any>, item: ParamItem) => {
-    Object.keys(paramsDetailData.value).forEach((obj) => {
-      if (obj  === item.key) {
-        paramsDetailData.value[obj].type = label.id;
-        paramsDetailData.value[obj].dropdownShow = false;
-      }
-    });
-  };
   const handlePaIdChange = (id: string) => {
     if (id) {
       const sopsTemplateId = processApplicationList.value
@@ -361,6 +377,13 @@
     const isValueEmpty = isEmpty(val);
     // field 和 value 同时为空，才算不通过
     return !(isFieldEmpty && isValueEmpty);
+  };
+
+  const handleTransferOperatorsChange = () => {
+    clearFieldValidateIfValid(
+      'new_operators',
+      hasTransferOperators(formData.value.new_operators),
+    );
   };
 
 
@@ -403,8 +426,6 @@
         // eslint-disable-next-line no-param-reassign
         data[key].type = 'self';
         // eslint-disable-next-line no-param-reassign
-        data[key].dropdownShow = false;
-        // eslint-disable-next-line no-param-reassign
         data[key].is_hide = false;
       });
       paramsDetailData.value = data;
@@ -419,6 +440,32 @@
     },
   });
 
+  const resetForm = () => {
+    paramsDetailData.value = {};
+    handleChangeMethod('closeOrder');
+    formRef.value?.clearValidate?.();
+  };
+
+  const handleSubmitSuccess = (message: string, shouldCollapse = false) => {
+    handleEditorExpandChange(false);
+    resetForm();
+    if (shouldCollapse) {
+      dockCollapse?.();
+    }
+    emits('update');
+    messageSuccess(message);
+  };
+
+  // 标记误报
+  const {
+    run: updateRiskLabel,
+    loading: misreportLoading,
+  } = useRequest(RiskManageService.updateRiskLabel, {
+    defaultValue: null,
+    onSuccess() {
+      handleSubmitSuccess(t('标记误报成功'));
+    },
+  });
   // 人工执行处理套餐
   const {
     run: autoProcess,
@@ -426,9 +473,7 @@
   } = useRequest(RiskManageService.autoProcess, {
     defaultValue: null,
     onSuccess() {
-      // retToList();
-      emits('update');
-      messageSuccess(t('人工处理提交处理套餐成功'));
+      handleSubmitSuccess(t('人工处理提交处理套餐成功'));
     },
   });
   // 人工关单
@@ -438,8 +483,7 @@
   } = useRequest(RiskManageService.close, {
     defaultValue: null,
     onSuccess() {
-      emits('update');
-      messageSuccess(t('人工关单成功'));
+      handleSubmitSuccess(t('人工关单成功'));
     },
   });
   // 人工转单
@@ -449,9 +493,7 @@
   } = useRequest(RiskManageService.transRisk, {
     defaultValue: null,
     onSuccess() {
-      emits('update');
-      handleChangeMethod('closeOrder');
-      messageSuccess(t('人工转单成功'));
+      handleSubmitSuccess(t('人工转单成功'));
     },
   });
 
@@ -478,6 +520,11 @@
       paramsDetailData.value = {};
       formData.value.pa_params = {};
       break;
+    case 'misreport':
+      params = {
+        misreport_description: '',
+      };
+      break;
     }
     formData.value = {
       method: val,
@@ -499,43 +546,42 @@
       case 'ProcessPackage':
         autoProcess(formData.value);
         break;
+      case 'misreport':
+        updateRiskLabel({
+          risk_id: props.riskId,
+          risk_label: 'misreport',
+          description: formData.value.misreport_description,
+        });
+        break;
       }
     });
   };
 
-  // 判断富文本内容是否为实质性输入（排除编辑器产生的空内容HTML标签）
-  const isRichTextNotEmpty = (html: string) => {
-    if (!html) return false;
-    // 使用 DOMPurify 安全地去除所有HTML标签，只保留纯文本内容
-    const text = DOMPurify.sanitize(html, { ALLOWED_TAGS: [] }).trim();
-    return text.length > 0;
-  };
-
   // 判断当前表单是否有实质性用户输入
   const hasSubstantialInput = () => {
-    const { method, description, new_operators: newOperators, pa_id: paId } = formData.value;
+    const { method, description, new_operators: newOperators, pa_id: paId,
+            misreport_description: misreportDescription } = formData.value;
     switch (method) {
     case 'closeOrder':
       return isRichTextNotEmpty(description);
     case 'transfer':
-      return isRichTextNotEmpty(description) || (newOperators && newOperators.length > 0);
+      return isRichTextNotEmpty(description) || hasTransferOperators(newOperators);
     case 'ProcessPackage':
       return !!paId;
+    case 'misreport':
+      return isRichTextNotEmpty(misreportDescription);
     default:
       return false;
     }
   };
 
   const handleCancel = () => {
-    // 取消按钮点击时，如果没有实质性输入则重置 changeConfirm
     if (!hasSubstantialInput()) {
       window.changeConfirm = false;
     }
-    router.push({
-      name: route.name === 'riskManageDetail'
-        ? 'riskManageList'
-        : 'handleManageList',
-    });
+    handleEditorExpandChange(false);
+    resetForm();
+    dockCollapse?.();
   };
 
   // 路由离开前判断：如果没有实质性输入，则不弹确认弹窗
@@ -544,6 +590,28 @@
       window.changeConfirm = false;
     }
   });
+
+  watch(
+    () => formData.value.new_operators,
+    (operators) => {
+      clearFieldValidateIfValid('new_operators', hasTransferOperators(operators));
+    },
+    { deep: true },
+  );
+
+  watch(
+    () => formData.value.description,
+    (description) => {
+      clearFieldValidateIfValid('description', isRichTextNotEmpty(description));
+    },
+  );
+
+  watch(
+    () => formData.value.misreport_description,
+    (description) => {
+      clearFieldValidateIfValid('misreport_description', isRichTextNotEmpty(description));
+    },
+  );
 
   watch(
     () => formData.value, (val) => {
@@ -580,28 +648,209 @@
 </script>
 <style scoped>
 .risk-await-deal-wrap {
-  padding: 10px 16px;
+  width: 100%;
+  max-width: 100%;
+  padding: 16px;
+  margin: 0;
   font-size: 12px;
-  background: #fff;
+  background: #f5f7fa;
   border: 1px solid #eaebf0;
-  border-radius: 6px;
-  box-shadow: 0 2px 6px 0 #0000000a;
+  border-radius: 4px;
+  box-sizing: border-box;
 }
 
-.val-label {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%
+.risk-await-deal-wrap :deep(.bk-form),
+.risk-await-deal-wrap :deep(.bk-form-item),
+.risk-await-deal-wrap :deep(.bk-form-content) {
+  width: 100%;
+  max-width: 100%;
 }
 
-.line-down {
+.risk-await-deal-wrap :deep(.bk-form-item) {
+  margin-bottom: 16px;
+}
+
+.risk-await-deal-wrap :deep(.bk-form-item:last-child) {
+  margin-bottom: 0;
+}
+
+.risk-await-deal-wrap :deep(.bk-form-label) {
   font-size: 12px;
-  cursor: pointer;
+  line-height: 20px;
+  color: #313238;
 }
 
-.label-text {
-  cursor: pointer;
+.risk-await-deal-method__group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+}
+
+.risk-await-deal-method__group :deep(.bk-radio) {
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 20px;
+  color: #4d4f56;
+}
+
+.risk-await-deal-method__group :deep(.bk-radio .bk-radio-label) {
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 20px;
+  color: #4d4f56;
+}
+
+.risk-await-deal-wrap :deep(.bk-select),
+.risk-await-deal-wrap :deep(.bk-input),
+.risk-await-deal-wrap :deep(.transfer-user-selector),
+.risk-await-deal-wrap :deep(.pa-params-grid .bk-user-selector) {
+  width: 100%;
+}
+
+.risk-await-deal-wrap :deep(.bk-user-selector) {
+  min-width: 0;
+
+  .custom-tag {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+:deep(.await-deal-rich-editor),
+:deep(.await-deal-rich-editor .editor-wrap),
+:deep(.await-deal-rich-editor .quill-editor) {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.misreport-alert {
+  margin-bottom: 16px;
+}
+
+.pa-params-form-item {
+  margin-top: 24px !important;
+  margin-bottom: 0 !important;
+
+  :deep(.bk-form-content) {
+    max-width: 100%;
+  }
+}
+
+.process-package-select-item {
+  margin-bottom: 0 !important;
+}
+
+.auto-close-risk-form-item {
+  margin-top: 24px !important;
+  margin-bottom: 24px !important;
+}
+
+.submit-actions-form-item {
+  margin-bottom: 0 !important;
+}
+
+.pa-params-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  padding: 16px 12px;
+  background: #f0f1f5;
+  border: 1px solid #dcdee5;
+  border-radius: 2px;
+
+  /* 套餐参数组件统一高度 32px */
+  :deep(.bk-select),
+  :deep(.bk-input:not(textarea, .bk-textarea)),
+  :deep(.bk-date-picker),
+  :deep(.bk-date-picker-rel),
+  :deep(.bk-date-picker-editor),
+  :deep(.pa-user-selector.bk-user-selector),
+  :deep(.pa-user-selector .user-selector-input) {
+    height: 32px;
+    max-height: 32px;
+    min-height: 32px;
+    box-sizing: border-box;
+  }
+
+  :deep(.field-insert-wrapper:not(.is-textarea).has-suffix) {
+    height: 32px;
+    align-items: center;
+  }
+
+  :deep(.field-insert-wrapper:not(.is-textarea) .field-insert-wrapper__main),
+  :deep(.field-insert-wrapper:not(.is-textarea) .field-insert-wrapper__control),
+  :deep(.field-insert-wrapper:not(.is-textarea) .field-insert-wrapper__suffix-host),
+  :deep(.field-insert-wrapper:not(.is-textarea) .field-insert-wrapper__suffix) {
+    height: 32px;
+    max-height: 32px;
+    min-height: 32px;
+    box-sizing: border-box;
+  }
+}
+
+.pa-params-field {
+  width: 100%;
+  margin-bottom: 0 !important;
+
+  :deep(.bk-form-item) {
+    display: block;
+  }
+
+  :deep(.bk-form-label) {
+    width: 100% !important;
+    padding-bottom: 0;
+    text-align: left;
+  }
+
+  :deep(.bk-form-content) {
+    max-width: 100%;
+    min-width: 0;
+    margin-left: 0 !important;
+  }
+}
+
+.risk-await-deal-wrap.is-editor-boosted {
+  :deep(.await-deal-rich-editor.expanded-mode) {
+    display: flex;
+    flex-direction: column;
+  }
+
+  :deep(.bk-form-item:has(.await-deal-rich-editor.expanded-mode)) {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    margin-bottom: 12px;
+
+    .bk-form-content {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+  }
+}
+
+:deep(.await-deal-rich-editor .ql-container) {
+  min-height: 180px;
+  transition: min-height .2s ease, height .2s ease;
+}
+
+:deep(.await-deal-rich-editor.expanded-mode) {
+  height: var(--editor-expanded-height, 360px);
+}
+
+:deep(.await-deal-rich-editor.expanded-mode .ql-container) {
+  height: auto !important;
+  min-height: 0 !important;
+  flex: 1;
+}
+
+:deep(.await-deal-rich-editor.expanded-mode .ql-editor) {
+  min-height: 0 !important;
 }
 
 :deep(.bk-form-item.is-required .bk-form-label::after) {

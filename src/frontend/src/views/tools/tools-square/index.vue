@@ -60,7 +60,7 @@
           <div class="scene-selector-wrapper">
             <scene-system-selector
               v-model="selectedScene"
-              :list-scope="['scene']"
+              :list-scope="['scene','system']"
               :popover-width="228"
               scene-permission="view_scene"
               system-permission="view_system"
@@ -97,10 +97,12 @@
             <content-card
               ref="ContentCardRef"
               :is-cross-scene="scopeParams.scope_type === 'cross_scene'"
+              :is-cross-system="scopeParams.scope_type === 'cross_system'"
               :my-created="tagId === '-4'"
               :recent-used="tagId === '-5'"
               :scene-name-map="sceneNameMap"
               :scope-params="scopeParams"
+              :system-name-map="systemNameMap"
               :tag-id="tagId"
               :tags-enums="tagsEnums"
               @change="handleChange"
@@ -108,9 +110,11 @@
           </div>
           <tool-info-panel
             v-show="hasOpenedTools"
+            ref="toolInfoPanelRef"
             :active-uid="activeToolUid"
             :scene-name-map="sceneNameMap"
             :scope-params="scopeParams"
+            :system-name-map="systemNameMap"
             :tags-enums="tagsEnums"
             :tool-list="openedTools"
             @add-tool="handleAddToolFromPopover"
@@ -125,11 +129,11 @@
 </template>
 
 <script setup lang='ts'>
-  import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+  import { computed, nextTick, onActivated, onDeactivated, onMounted, onUnmounted, ref, watch } from 'vue';
   import { useI18n } from 'vue-i18n';
-  import type { LocationQueryRaw } from 'vue-router';
   import { useRoute, useRouter } from 'vue-router';
 
+  import MetaManageService from '@service/meta-manage';
   import SceneManageService from '@service/scene-manage';
   import ToolManageService from '@service/tool-manage';
 
@@ -146,15 +150,22 @@
   import useRequest from '@/hooks/use-request';
   import type { DrillDownParams } from '@/hooks/use-tool-tabs';
   import useToolTabs from '@/hooks/use-tool-tabs';
+  import type { ToolDetailOverrideContext } from '@/utils/assist/scene-system-params';
   import foldLeftIcon from '@/images/fold-left.svg';
   import foldRightIcon from '@/images/fold-right.svg';
   import infoBlueSvg from '@/images/info-blue.svg';
+  import {
+    buildGameDetailTabLabel,
+    getRouteQueryValue,
+    getRouteScopeQuery,
+  } from '@/views/tools/tools-square/utils/tool-url-params';
 
   interface TagItem {
     tag_id: string;
     tag_name: string;
     tool_count: number;
-    icon?: string;
+    strategy_count: number;
+    icon: string;
   }
 
   interface SceneItem {
@@ -163,22 +174,9 @@
     type: 'aggregate' | 'scene' | 'system';
   }
 
-  interface GameDetailRouteQuery {
-    game_id?: string;
-    game_name?: string;
-    openid?: string;
-    tool_uid?: string;
-    initial_tab?: string;
-    ctx?: string;
-    plat_type?: string;
-    plat_account?: string;
-    coin_balance?: string;
-    total_recharge?: string;
-    total_issue?: string;
-  }
-
   const renderLabelRef = ref();
   const ContentCardRef = ref<InstanceType<typeof ContentCard>>();
+  const toolInfoPanelRef = ref<InstanceType<typeof ToolInfoPanel>>();
 
   // 场景ID → 场景名称映射
   const sceneNameMap = ref<Record<number, string>>({});
@@ -194,8 +192,26 @@
       sceneNameMap.value = map;
     },
   });
-  // 初始化获取场景列表
+  // 系统ID → 系统名称映射
+  const systemNameMap = ref<Record<string, string>>({});
+  const {
+    run: fetchSystemList,
+  } = useRequest(MetaManageService.fetchSystemWithAction, {
+    defaultValue: [],
+    onSuccess: (data: any[]) => {
+      const map: Record<string, string> = {};
+      (data || []).forEach((item) => {
+        map[String(item.system_id)] = item.name;
+        if (item.id !== undefined && item.id !== null) {
+          map[String(item.id)] = item.name;
+        }
+      });
+      systemNameMap.value = map;
+    },
+  });
+  // 初始化获取场景/系统列表
   fetchSceneAll();
+  fetchSystemList({ audit_status__in: 'accessed', namespace: 'default' });
   const tagsEnums = ref<Array<TagItem>>([]);
   const tagId = ref(sessionStorage.getItem('tools_square_selected_tag') || '');
   // 监听 tagId 变化，保存到 sessionStorage（用于记忆选中的tab）
@@ -214,6 +230,26 @@
   const isSidebarAnimating = ref(false);
   let sidebarAnimateTimer: ReturnType<typeof setTimeout> | null = null;
   const isReturningHome = ref(false);
+  // 从详情回到广场：跳过侧栏展开触发的列表重载，并在动画结束后还原滚动
+  const isRestoringListScroll = ref(false);
+  let restoreListScrollTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const restoreListScrollAfterReturn = () => {
+    if (restoreListScrollTimer) clearTimeout(restoreListScrollTimer);
+    const tryRestore = () => {
+      ContentCardRef.value?.restoreScrollPosition?.();
+    };
+    nextTick(() => {
+      tryRestore();
+      requestAnimationFrame(tryRestore);
+    });
+    // 侧栏展开动画约 320ms，结束后再还原一次，避免布局变化把滚动冲掉
+    restoreListScrollTimer = setTimeout(() => {
+      tryRestore();
+      isRestoringListScroll.value = false;
+      restoreListScrollTimer = null;
+    }, 360);
+  };
   const isInitialSceneSetup = ref(false);
   const route = useRoute();
   const router = useRouter();
@@ -278,10 +314,12 @@
 
   // 点击继续使用工具
   const handleContinueUsingTool = () => {
+    ContentCardRef.value?.saveScrollPosition();
     const lastTool = openedTools.value[openedTools.value.length - 1];
     if (lastTool) {
       switchTab(lastTool.uid);
-      handleOpenTool(lastTool);
+      isSidebarCollapsed.value = true;
+      syncToolRouteToUrl(lastTool.uid);
     }
   };
 
@@ -290,70 +328,20 @@
   const isRefreshRestore = !!(routeUid && !route.query.drillKey && !route.query.drillConfig);
   const isProgrammaticReset = ref(false);
 
-  const GAME_DETAIL_STORAGE_KEY = 'tool_tabs_game_detail_map';
+  const getFirstQueryValue = getRouteQueryValue;
 
-  const getFirstQueryValue = (value: unknown) => {
-    if (Array.isArray(value)) {
-      return value[0] ? String(value[0]) : '';
-    }
-    if (value === undefined || value === null) {
-      return '';
-    }
-    return String(value);
-  };
-
-  const loadGameDetailRouteCache = (): {
-    data: Record<string, any>;
-    tab: Record<string, string>;
-    toolUid: Record<string, string>;
-  } => {
-    try {
-      const raw = sessionStorage.getItem(GAME_DETAIL_STORAGE_KEY);
-      return raw ? JSON.parse(raw) : { data: {}, tab: {}, toolUid: {} };
-    } catch {
-      return { data: {}, tab: {}, toolUid: {} };
-    }
-  };
-
-  const buildGameDetailQuery = (uid: string): LocationQueryRaw => {
-    const cache = loadGameDetailRouteCache();
-    const gameData = cache.data?.[uid] || {};
-    const query: GameDetailRouteQuery = {
-      game_id: gameData.gameid ? String(gameData.gameid) : '',
-      game_name: gameData.name || '',
-      openid: gameData.openid || '',
-      tool_uid: cache.toolUid?.[uid] || '',
-      initial_tab: cache.tab?.[uid] || 'overview',
-      ctx: gameData.ctx || '',
-      plat_type: gameData.platType || '',
-      plat_account: gameData.platAccount || '',
-      coin_balance: gameData.coinBalance !== undefined ? String(gameData.coinBalance) : '',
-      total_recharge: gameData.totalRecharge !== undefined ? String(gameData.totalRecharge) : '',
-      total_issue: gameData.totalIssue !== undefined ? String(gameData.totalIssue) : '',
-    };
-
-    return Object.fromEntries(Object.entries(query).filter(([, value]) => value !== ''));
-  };
-
-  const getGameDetailTabName = (uid: string) => {
+  const getGameDetailTabName = () => {
     const query = route.query as Record<string, unknown>;
-    const gameName = getFirstQueryValue(query.game_name);
-    const ctx = getFirstQueryValue(query.ctx);
-    if (routeUid === uid && gameName) {
-      return ctx ? `${ctx} - ${gameName}` : gameName;
-    }
-    return uid;
+    return buildGameDetailTabLabel({
+      ctx: getFirstQueryValue(query.wecom) || getFirstQueryValue(query.ctx),
+      gameid: getFirstQueryValue(query.game_id),
+      name: '',
+    }, { resolving: true });
   };
 
   // 从其他页面回到工具广场时，恢复之前打开的工具 tab 状态
   // 条件：URL 无 uid 参数（非下钻/刷新恢复），但内存中有打开的工具
-  if (!routeUid && openedTools.value.length > 0) {
-    if (activeToolUid.value) {
-      // activeToolUid 有值说明离开前在工具详情，恢复 URL 到对应的工具详情路由
-      syncRouteToUrl(activeToolUid.value);
-    }
-    // activeToolUid 为空说明离开前在工具列表（首页），保持在工具列表页面，不自动打开工具详情
-  }
+  // URL 同步在 onMounted 中执行（需等待 tool-info-panel 挂载）
 
   // 场景切换
   const getSceneKey = (item: SceneItem | null) => (item ? `${item.type}:${item.id}` : '');
@@ -367,7 +355,6 @@
       saveSceneState(lastSceneKey.value!);
       try {
         sessionStorage.removeItem('tool_tabs_search_list_map');
-        sessionStorage.removeItem('tool_tabs_game_detail_map');
       } catch {
         // 静默处理
       }
@@ -380,12 +367,17 @@
     if (isActualChange) {
       restoreSceneState(newKey);
       isSidebarCollapsed.value = hasOpenedTools.value;
-      syncRouteToUrl(activeToolUid.value || undefined);
+      if (activeToolUid.value) {
+        syncToolRouteToUrl(activeToolUid.value);
+      } else {
+        syncRouteToUrl();
+      }
     }
     // 无论是初始化还是切换，都重新拉取标签和工具列表
-    // 切换场景时，重置选中的标签为"全部工具"
+    // 切换场景时，重置选中的标签为"全部工具"，并清空列表搜索条件
     if (isActualChange) {
       tagId.value = '-3';
+      ContentCardRef.value?.clearSearch();
       // 更新UI选中状态为"全部工具"
       nextTick(() => {
         renderLabelRef.value?.setLabel('-3');
@@ -437,7 +429,7 @@
     if (!alreadyInList) {
       const tempTool = new ToolInfo({
         uid: routeUid,
-        name: routeUid.startsWith('game_detail_') ? getGameDetailTabName(routeUid) : routeUid,
+        name: routeUid.startsWith('game_detail_') ? getGameDetailTabName() : routeUid,
       } as ToolInfo);
       openTool(tempTool);
     } else if (activeToolUid.value !== routeUid) {
@@ -493,28 +485,29 @@
       // 前5项为固定分类，按目标顺序重排；后续为动态标签
       const fixedTags = data
         .slice(0, FIXED_TAG_COUNT)
-        .sort((a: any, b: any) => fixedTagOrder.indexOf(a.tag_id) - fixedTagOrder.indexOf(b.tag_id));
+        .sort((a, b) => fixedTagOrder.indexOf(a.tag_id) - fixedTagOrder.indexOf(b.tag_id));
       const dynamicTags = data.slice(FIXED_TAG_COUNT);
+      const toLabelItem = (
+        item: { tag_id: string; tag_name: string; tool_count: number },
+        icon: string,
+      ): TagItem => ({
+        tag_id: item.tag_id,
+        tag_name: item.tag_name,
+        tool_count: item.tool_count ?? 0,
+        strategy_count: item.tool_count ?? 0,
+        icon,
+      });
       strategyLabelList.value = [
-        ...fixedTags.map((item: any) => ({
-          ...item,
-          strategy_count: item.tool_count ?? 0,
-          icon: iconMap[item.tag_id] || 'tag',
-        })),
-        ...dynamicTags.map((item: any) => ({
-          ...item,
-          strategy_count: item.tool_count ?? 0,
-          icon: 'tag',
-        })),
+        ...fixedTags.map(item => toLabelItem(item, iconMap[item.tag_id] || 'tag')),
+        ...dynamicTags.map(item => toLabelItem(item, 'tag')),
       ];
       tagsEnums.value = strategyLabelList.value;
       // 工具已打开时，仅更新标签数据，不重置标签选中状态（侧边栏已收起，避免触发 goHome）
       if (hasOpenedTools.value) return;
-      // 始终清空 all，避免 render-label 顶部出现空白行
-      renderLabelRef.value?.resetAll([]);
-      // 初始化阶段（lastSceneKey 为 null）或 tagId 为空时：需要触发加载工具列表
-      // 场景切换阶段（lastSceneKey 不为 null 且 tagId 已有值）：只更新标签数据，工具列表已在 handleSceneChange 中触发
+      // 初始化阶段才 resetAll（active=-3 时会 emit checked 拉列表）；
+      // 从详情 keep-alive 返回时只更新数量，避免重新请求把滚动重置到顶部
       if (isInitialSceneSetup.value || lastSceneKey.value === null || !tagId.value) {
+        renderLabelRef.value?.resetAll([]);
         if ((isInitialSceneSetup.value || lastSceneKey.value === null) && tagId.value) {
           // 初始化阶段且 tagId 有值（从 sessionStorage 恢复）：直接设置选中状态并加载对应列表
           renderLabelRef.value?.setLabel(tagId.value);
@@ -533,64 +526,98 @@
     fetchToolsTagsList({ ...scopeParams.value, status: 'published' });
   };
 
-  function syncRouteToUrl(uid?: string) {
+  const syncToolRouteToUrl = (uid: string) => {
+    nextTick(() => {
+      toolInfoPanelRef.value?.syncRouteForTool(uid);
+    });
+  };
+
+  function syncRouteToUrl(uid?: string, options?: { scopeOnly?: boolean }) {
+    const scopeQuery = getRouteScopeQuery(route.query as Record<string, unknown>);
     if (uid) {
-      const query = uid.startsWith('game_detail_') ? buildGameDetailQuery(uid) : {};
-      router.replace({ name: 'toolDetail', params: { uid }, query });
-    } else if (!uid && route.name !== 'toolsSquare') {
-      router.replace({ name: 'toolsSquare' });
+      if (uid.startsWith('game_detail_')) {
+        syncToolRouteToUrl(uid);
+        return;
+      }
+      if (options?.scopeOnly) {
+        router.replace({ name: 'toolDetail', params: { uid }, query: scopeQuery });
+        return;
+      }
+      syncToolRouteToUrl(uid);
+      return;
+    }
+    if (!uid && route.name !== 'toolsSquare') {
+      router.replace({ name: 'toolsSquare', query: scopeQuery });
     }
   }
 
-  const handleOpenTool = (tool: ToolInfo) => {
-    openTool(tool);
+  const handleOpenTool = (tool: ToolInfo, overrideContext?: ToolDetailOverrideContext) => {
+    ContentCardRef.value?.saveScrollPosition();
+    openTool(tool, { overrideContext });
     isSidebarCollapsed.value = true;
-    syncRouteToUrl(tool.uid);
-    // 打开工具后刷新标签数量（如最近使用计数）
+    syncRouteToUrl(tool.uid, { scopeOnly: true });
     refreshTagsList();
   };
 
-  const handleAddToolFromPopover = (tool: ToolInfo) => {
-    openTool(tool);
+  const handleAddToolFromPopover = (tool: ToolInfo, overrideContext?: ToolDetailOverrideContext) => {
+    ContentCardRef.value?.saveScrollPosition();
+    openTool(tool, { overrideContext });
     isSidebarCollapsed.value = true;
-    syncRouteToUrl(tool.uid);
-    // 打开工具后刷新标签数量（如最近使用计数）
+    syncRouteToUrl(tool.uid, { scopeOnly: true });
     refreshTagsList();
   };
 
   const handleGoHomePage = async () => {
     isReturningHome.value = true;
+    isRestoringListScroll.value = true;
+    ContentCardRef.value?.saveScrollPosition();
     goHome();
     syncRouteToUrl();
     await nextTick();
     // 保持用户之前选择的标签，不强制重置为"全部工具"
     renderLabelRef.value?.setLabel(tagId.value || '-3');
-    ContentCardRef.value?.getToolsList(tagId.value || '-3');
+    if (tagId.value === '-5') {
+      ContentCardRef.value?.getToolsList(tagId.value || '-3', true);
+    } else {
+      restoreListScrollAfterReturn();
+    }
     isReturningHome.value = false;
   };
 
   const handleCloseToolPanel = async () => {
+    isRestoringListScroll.value = true;
+    ContentCardRef.value?.saveScrollPosition();
     clearAll();
     isSidebarCollapsed.value = false;
     syncRouteToUrl();
     await nextTick();
-    ContentCardRef.value?.getToolsList(tagId.value);
+    if (tagId.value === '-5') {
+      ContentCardRef.value?.getToolsList(tagId.value, true);
+      isRestoringListScroll.value = false;
+    } else {
+      restoreListScrollAfterReturn();
+    }
   };
 
   const handleCloseTab = async (uid: string) => {
     closeTab(uid);
     if (!hasOpenedTools.value) {
+      isRestoringListScroll.value = true;
+      ContentCardRef.value?.saveScrollPosition();
       syncRouteToUrl();
       await nextTick();
-      ContentCardRef.value?.getToolsList(tagId.value);
-    } else {
-      syncRouteToUrl(activeToolUid.value);
+      if (tagId.value === '-5') {
+        ContentCardRef.value?.getToolsList(tagId.value, true);
+        isRestoringListScroll.value = false;
+      } else {
+        restoreListScrollAfterReturn();
+      }
     }
   };
 
   watch(hasOpenedTools, (val) => {
     isSidebarCollapsed.value = val;
-    if (!val) {
+    if (!val && !isRestoringListScroll.value) {
       // 工具全部关闭，回到广场时刷新标签数量（如最近使用计数）
       refreshTagsList();
     }
@@ -604,7 +631,8 @@
       window.dispatchEvent(new Event('resize'));
     }, 320);
 
-    if (val || isReturningHome.value) return;
+    // 从详情返回时不要 resetAll/checked 重拉列表，否则滚动会回到顶部
+    if (val || isReturningHome.value || isRestoringListScroll.value) return;
     nextTick(() => {
       safeResetLabels();
       if (hasOpenedTools.value) {
@@ -615,10 +643,9 @@
     });
   });
 
-  // 切换 tab 时同步 URL
+  // 切换 tab 时同步 URL（业务参数由 tool-info-panel 根据 activeUid 恢复）
   const handleSwitchTab = (uid: string) => {
     switchTab(uid);
-    syncRouteToUrl(uid);
   };
 
   // 监听场景切换事件
@@ -636,14 +663,35 @@
     onEvent('scene:change', () => {
       refreshAllData();
     });
-    if (hasOpenedTools.value && !isDrillDownRoute && !isRefreshRestore) {
-      syncRouteToUrl(activeToolUid.value);
+    if (activeToolUid.value && hasOpenedTools.value) {
+      if (!routeUid || (!isDrillDownRoute && !isRefreshRestore)) {
+        syncToolRouteToUrl(activeToolUid.value);
+      }
     }
+  });
+
+  // 进详情前缓存滚动；从详情返回后还原（同实例 keep-alive 下作为兜底）
+  onDeactivated(() => {
+    ContentCardRef.value?.saveScrollPosition();
+  });
+
+  onActivated(() => {
+    if (hasOpenedTools.value) return;
+    isRestoringListScroll.value = true;
+    nextTick(() => {
+      if (tagId.value === '-5') {
+        ContentCardRef.value?.getToolsList(tagId.value, true);
+        isRestoringListScroll.value = false;
+        return;
+      }
+      restoreListScrollAfterReturn();
+    });
   });
 
   onUnmounted(() => {
     off('scene:change');
     if (sidebarAnimateTimer) clearTimeout(sidebarAnimateTimer);
+    if (restoreListScrollTimer) clearTimeout(restoreListScrollTimer);
   });
 </script>
 

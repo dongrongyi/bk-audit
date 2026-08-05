@@ -62,6 +62,7 @@
           required>
           <audit-user-selector-tenant
             v-model="formData.new_operators"
+            allow-create
             :placeholder="t('请输入人员')" />
         </bk-form-item>
         <bk-form-item
@@ -197,6 +198,7 @@
   const tableColumns = computed(() => {
     if (!initTableColumns.length) {
       initTableColumns = useRiskColumns({
+        t,
         deps: { levelData, strategyTagMap, strategyList, riskStatusCommon, sceneList, handleToDetail },
         detailRouteName: 'handleManageDetail',
         appendColumns: [actionColumn],

@@ -21,14 +21,14 @@ import datetime
 import traceback
 from collections import defaultdict
 from copy import deepcopy
-from typing import List
+from typing import List, Tuple
 
 from bk_resource import Resource, api, resource
 from bk_resource.utils.common_utils import get_md5
 from blueapps.utils.logger import logger
 from django.db import transaction
 from django.db.models import Count, Exists, OuterRef, Q
-from django.utils.translation import gettext_lazy
+from django.utils.translation import gettext, gettext_lazy
 from pypinyin import lazy_pinyin
 from rest_framework import serializers as drf_serializers
 
@@ -40,12 +40,12 @@ from apps.meta.models import EnumMappingRelatedType, System, Tag
 from apps.meta.serializers import EnumMappingSerializer
 from apps.permission.handlers.actions import ActionEnum
 from apps.permission.handlers.resource_types import ResourceEnum
+from core.exceptions import PermissionException
 from apps.permission.handlers.service import PermissionService
 from core.models import get_request_username
 from core.sql.parser.model import ParsedSQLInfo
 from core.sql.parser.praser import SqlQueryAnalysis
 from core.utils.data import preserved_order_sort
-from core.utils.tools import get_app_info
 from services.web.common.caller_permission import (
     CurrentType,
     should_skip_permission_from,
@@ -91,12 +91,13 @@ from services.web.tool.models import Tool, ToolFavorite, ToolTag
 from services.web.tool.serializers import (
     ExecuteToolReqSerializer,
     ExecuteToolRespSerializer,
+    GetMCPToolDetailByNameRequestSerializer,
     GetToolDetailByNameAPIGWRequestSerializer,
-    GetToolDetailByNameAPIGWResponseSerializer,
     ListRequestSerializer,
     ListToolAllRequestSerializer,
     ListToolTagsRequestSerializer,
     ListToolTagsResponseSerializer,
+    MCPToolDetailResponseSerializer,
     PlatformSceneToolCreateRequestSerializer,
     PlatformSceneToolPublishRequestSerializer,
     PlatformSceneToolUpdateRequestSerializer,
@@ -416,6 +417,40 @@ class ListTool(ToolBase):
         favorite_subquery = ToolFavorite.objects.filter(tool_uid=OuterRef("uid"), username=current_user)
         queryset = Tool.all_latest_tools().annotate(favorite=Exists(favorite_subquery))
         queryset = self.filter_queryset_by_scope(queryset, validated_request_data, current_user)
+
+        visibility_type = validated_request_data.get("visibility_type")
+        scene_ids = validated_request_data.get("scene_ids") or []
+        system_ids = validated_request_data.get("system_ids") or []
+        if visibility_type or scene_ids or system_ids:
+            binding_type = BindingType.PLATFORM_BINDING
+            matched_uids = None
+
+            # 1) 按 visibility_type 匹配（全部场景或系统没有具体场景/系统 ID）
+            if visibility_type:
+                binding_qs = ResourceBinding.objects.filter(
+                    resource_type=ResourceVisibilityType.TOOL,
+                    visibility_type=visibility_type,
+                )
+                if binding_type:
+                    binding_qs = binding_qs.filter(binding_type=binding_type)
+                matched_uids = {str(uid) for uid in binding_qs.values_list("resource_id", flat=True)}
+
+            # 2) 按具体 scene/system ID 可见范围
+            if scene_ids or system_ids:
+                scoped_uids = {
+                    str(uid)
+                    for uid in CompositeScopeFilter.filter_queryset(
+                        queryset=queryset,
+                        binding_type=binding_type,
+                        scene_id=scene_ids,
+                        system_id=system_ids,
+                        resource_type=ResourceVisibilityType.TOOL,
+                        pk_field="uid",
+                    ).values_list("uid", flat=True)
+                }
+                matched_uids = scoped_uids if matched_uids is None else (matched_uids & scoped_uids)
+
+            queryset = queryset.filter(uid__in=matched_uids or [])
 
         # 处理虚拟标签：清空 tags 以避免后续按普通标签筛选
         if any(
@@ -971,6 +1006,101 @@ class ExecuteTool(ToolBase):
     RequestSerializer = ExecuteToolReqSerializer
     ResponseSerializer = ExecuteToolRespSerializer
 
+    def _get_user_allowed_scopes(self, username: str) -> Tuple[List[str], List[str]]:
+        """
+        获取用户有权限的场景和系统列表。
+        """
+        scope_permission = ScopePermission(username=username)
+        scene_ids = scope_permission.get_scene_ids(ScopeContext(ScopeType.CROSS_SCENE), ActionEnum.VIEW_SCENE)
+        system_ids = scope_permission.get_system_ids(ScopeContext(ScopeType.CROSS_SYSTEM), ActionEnum.VIEW_SYSTEM)
+
+        return [str(scene_id) for scene_id in scene_ids], list(system_ids)
+
+    def _validate_default_value_permissions(self, tool, params, username):
+        """校验执行时默认值的权限
+
+        校验规则：
+        1. 仅对 is_show=False（用户不可见）的参数做校验；is_show=True 的参数
+           用户可自由修改，无需校验（用户可见场景）。
+        2. 允许用户使用其权限范围内场景/系统配置的默认值覆盖。
+        """
+        config = tool.config
+        if not config:
+            return
+
+        default_value_overrides = config.get("default_value_overrides", {})
+        if not default_value_overrides:
+            return
+
+        # 获取用户有权限的场景/系统列表
+        user_allowed_scene_ids, user_allowed_system_ids = self._get_user_allowed_scopes(username)
+
+        # 获取工具的输入变量配置
+        input_variables_config = config.get("input_variable", [])
+
+        # 获取用户输入的变量值
+        tool_variables = params.get("tool_variables", [])
+
+        # 收集用户有权限的场景/系统允许的默认值
+        allowed_defaults = {}
+
+        # 场景级别的默认值
+        scenes_overrides = default_value_overrides.get("scenes", {})
+        for scene_id, overrides in scenes_overrides.items():
+            if scene_id in user_allowed_scene_ids and isinstance(overrides, dict):
+                for raw_name, default_value in overrides.items():
+                    if raw_name:
+                        allowed_defaults.setdefault(raw_name, []).append(default_value)
+
+        # 系统级别的默认值
+        systems_overrides = default_value_overrides.get("systems", {})
+        for system_id, overrides in systems_overrides.items():
+            if system_id in user_allowed_system_ids and isinstance(overrides, dict):
+                for raw_name, default_value in overrides.items():
+                    if raw_name:
+                        allowed_defaults.setdefault(raw_name, []).append(default_value)
+
+        input_variable_map = {}
+        for var in tool_variables:
+            raw_name = var.get("raw_name")
+            if not raw_name:
+                continue
+            input_variable_map[raw_name] = var.get("value")
+        input_var_config_map = {}
+        for var in input_variables_config:
+            raw_name = var.get("raw_name")
+            if raw_name:
+                input_var_config_map[raw_name] = var
+
+        # 校验 is_show=False 的参数
+        for raw_name, value in input_variable_map.items():
+
+            input_var_config = input_var_config_map.get(raw_name, {})
+            # 仅校验 is_show=False 的参数
+            if not input_var_config.get("is_show", True):
+                # 豁免时间范围选择器的权限校验（支持相对时间表达式）
+                if input_var_config.get("field_category") in ["time_range_select", "time-ranger"]:
+                    continue
+
+                # 获取工具的原始默认值
+                original_default = input_var_config.get("default_value")
+
+                # 如果用户在允许的场景/系统下有默认值覆盖，则允许使用覆盖值
+                # 如果用户传入的值不在允许的范围内，则提示越权
+                if raw_name in allowed_defaults:
+                    if value not in allowed_defaults[raw_name] and value != original_default:
+                        raise PermissionException(
+                            action_name=gettext_lazy("使用隐藏参数 %(var_name)s 的默认值") % {"var_name": raw_name},
+                            permission=gettext("参数 %(var_name)s 的默认值不存在") % {"var_name": raw_name},
+                        )
+
+                else:
+                    if value != original_default:
+                        raise PermissionException(
+                            action_name=gettext_lazy("使用隐藏参数 %(var_name)s 的默认值") % {"var_name": raw_name},
+                            permission=gettext("参数 %(var_name)s 不可见，只能使用默认值") % {"var_name": raw_name},
+                        )
+
     def perform_request(self, validated_request_data):
         """
         1. 获取工具
@@ -990,6 +1120,9 @@ class ExecuteTool(ToolBase):
         check_request_data["current_object_id"] = uid
         check_request_data["tool_variables"] = params.get("tool_variables", [])
         should_skip_permission_from(check_request_data, get_request_username())
+        # 校验默认值的权限
+        self._validate_default_value_permissions(tool, params, get_request_username())
+
         current_user = get_request_username()
         try:
             recent_tool_usage_manager.record_usage(current_user, uid)
@@ -1004,13 +1137,30 @@ class ExecuteTool(ToolBase):
         return {"data": data, "tool_type": tool.tool_type}
 
 
+class MCPExecuteTool(ExecuteTool):
+    """用户态 MCP 工具执行，移除结果中的 SQL 执行实现细节。"""
+
+    name = gettext_lazy("工具执行(MCP)")
+
+    def perform_request(self, validated_request_data):
+        response_data = super().perform_request(validated_request_data)
+        result = response_data.get("data") or {}
+        if response_data["tool_type"] == ToolTypeEnum.DATA_SEARCH.value:
+            result.pop("query_sql", None)
+            result.pop("count_sql", None)
+        if response_data["tool_type"] == ToolTypeEnum.SMART_PAGE.value:
+            nested_result = result.get("result")
+            if isinstance(nested_result, dict):
+                nested_result.pop("rendered_sql", None)
+        return response_data
+
+
 class ExecuteToolAPIGW(ExecuteTool):
     """
-    工具执行(APIGW)，仅校验 app_code
+    工具执行(APIGW)，应用身份校验由 ViewSet 统一处理。
     """
 
     def perform_request(self, validated_request_data):
-        get_app_info()
         uid = validated_request_data["uid"]
         params = validated_request_data["params"]
         tool: Tool = Tool.last_version_tool(uid=uid)
@@ -1119,29 +1269,29 @@ class ListToolAll(ToolBase):
         if status:
             tool_qs = tool_qs.filter(status=status)
 
-        name = validated_request_data.get("name", [])
-        description = validated_request_data.get("description", [])
-        tool_type = validated_request_data.get("tool_type", [])
-        created_by = validated_request_data.get("created_by", [])
-        updated_by = validated_request_data.get("updated_by", [])
+        name_list = validated_request_data.get("name", [])
+        description_list = validated_request_data.get("description", [])
+        tool_type_list = validated_request_data.get("tool_type", [])
+        created_by_list = validated_request_data.get("created_by", [])
+        updated_by_list = validated_request_data.get("updated_by", [])
 
-        def apply_multi_value_filter(field_name, values, lookup='icontains'):
+        def apply_multi_value_filter(qs, field_name, values, lookup='icontains'):
             q_filter = Q()
             for value in values:
                 if value:
                     q_filter |= Q(**{f"{field_name}__{lookup}": value})
-            return tool_qs.filter(q_filter)
+            return qs.filter(q_filter) if q_filter else qs
 
-        if name:
-            tool_qs = apply_multi_value_filter("name", name)
-        if description:
-            tool_qs = apply_multi_value_filter("description", description)
-        if tool_type:
-            tool_qs = tool_qs.filter(tool_type__in=tool_type)
-        if created_by:
-            tool_qs = tool_qs.filter(created_by__in=created_by)
-        if updated_by:
-            tool_qs = tool_qs.filter(updated_by__in=updated_by)
+        if name_list:
+            tool_qs = apply_multi_value_filter(tool_qs, "name", name_list)
+        if description_list:
+            tool_qs = apply_multi_value_filter(tool_qs, "description", description_list)
+        if tool_type_list:
+            tool_qs = tool_qs.filter(tool_type__in=tool_type_list)
+        if created_by_list:
+            tool_qs = tool_qs.filter(created_by__in=created_by_list)
+        if updated_by_list:
+            tool_qs = tool_qs.filter(updated_by__in=updated_by_list)
 
         tools = list(tool_qs)
 
@@ -1238,6 +1388,14 @@ class GetToolDetail(ToolBase):
             # 将权限信息添加到每个表
             for table in tool.config["referenced_tables"]:
                 table["permission"] = auth_results.get(table["table_name"], {})
+
+        # 获取场景和系统信息
+        scene_id = validated_request_data.get("scene_id")
+        system_id = validated_request_data.get("system_id")
+        # 根据场景/系统ID动态覆盖默认值
+        if scene_id or system_id:
+            self._override_default_values(tool, scene_id, system_id)
+
         data = self.ResponseSerializer(instance=tool).data
 
         # 权限判定仅用于 API 配置脱敏：平台工具需平台管理员，场景工具需对应场景管理员
@@ -1248,6 +1406,70 @@ class GetToolDetail(ToolBase):
                 data["config"]["api_config"] = None
 
         return data
+
+    def _override_default_values(self, tool, scene_id, system_id):
+        """根据场景/系统ID动态覆盖默认值
+
+        default_value_overrides 位于 config 层级，结构：
+        {
+            "scenes": {
+                "场景ID1": {"raw_name1": "默认值1", "raw_name2": "默认值2"}
+            },
+            "systems": {
+                "系统ID1": {"raw_name1": "默认值3"}
+            }
+        }
+        """
+        # 如果没有场景或系统信息，直接返回
+        if not scene_id and not system_id:
+            return
+
+        # 获取工具配置
+        config = tool.config
+        if not config:
+            return
+
+        # 从 config 层级获取 default_value_overrides
+        default_value_overrides = config.get("default_value_overrides", {})
+        if not default_value_overrides:
+            return
+
+        # 获取输入变量配置
+        input_variables = config.get("input_variable", [])
+        if not input_variables:
+            return
+
+        # 收集当前场景/系统的默认值覆盖映射
+        # 结构: {raw_name: overridden_default_value}
+        overridden_defaults = {}
+
+        # 优先检查场景级别的参数覆盖
+        if scene_id:
+            scene_id_str = str(scene_id)
+            scene_overrides = default_value_overrides.get("scenes", {})
+            if scene_id_str in scene_overrides:
+                # scene_overrides[scene_id_str] 是 {raw_name: default_value} 字典
+                scene_defaults = scene_overrides[scene_id_str]
+                if isinstance(scene_defaults, dict):
+                    overridden_defaults.update(scene_defaults)
+
+        # 其次检查系统级别的参数覆盖（会覆盖场景级别的同名参数）
+        if system_id:
+            system_overrides = default_value_overrides.get("systems", {})
+            if system_id in system_overrides:
+                # system_overrides[system_id] 是 {raw_name: default_value} 字典
+                system_defaults = system_overrides[system_id]
+                if isinstance(system_defaults, dict):
+                    overridden_defaults.update(system_defaults)
+
+        # 根据收集到的映射，覆盖输入变量的默认值
+        for var_config in input_variables:
+            raw_name = var_config.get("raw_name")
+            if not raw_name:
+                continue
+
+            if raw_name in overridden_defaults:
+                var_config["default_value"] = overridden_defaults[raw_name]
 
 
 class SqlAnalyseResource(ToolBase, Resource):
@@ -1409,63 +1631,48 @@ class FavoriteTool(ToolBase):
 
 
 class GetToolDetailByNameAPIGW(ToolBase):
-    """
-    通过工具名称获取工具详情(APIGW)
-
-    仅做应用权限校验，不校验用户权限。
-    支持 lite_mode 模式，默认只返回 input_variable 定义。
-
-    请求参数：
-    ```json
-    {
-        "name": "工具名称",
-        "lite_mode": true  // 可选，默认 true，只返回 input_variable
-    }
-    ```
-
-    响应结构（lite_mode=true）：
-    ```json
-    {
-        "uid": "xxx",
-        "name": "xxx",
-        "tool_type": "data_search",
-        "version": 1,
-        "description": "xxx",
-        "namespace": "xxx",
-        "config": {
-            "input_variable": [...]
-        }
-    }
-    ```
-
-    响应结构（lite_mode=false）：返回完整的工具配置
-    """
+    """按名称获取工具的安全调用契约，应用态鉴权由 ViewSet 统一处理。"""
 
     name = gettext_lazy("通过名称获取工具详情(APIGW)")
     RequestSerializer = GetToolDetailByNameAPIGWRequestSerializer
-    ResponseSerializer = GetToolDetailByNameAPIGWResponseSerializer
+    ResponseSerializer = MCPToolDetailResponseSerializer
 
-    def validate_response_data(self, response_data):
-        return response_data
+    def get_tool(self, validated_request_data):
+        return Tool.all_latest_tools().filter(name=validated_request_data["name"]).first()
 
-    def perform_request(self, validated_request_data):
-        from core.utils.tools import get_app_info
+    def raise_tool_not_published(self):
+        raise ToolNotPublished()
 
-        # 仅做应用权限校验
-        get_app_info()
-
-        tool_name = validated_request_data["name"]
-        lite_mode = validated_request_data.get("lite_mode", True)
-
-        # 通过名称查找最新版本的工具
-        tool = Tool.all_latest_tools().filter(name=tool_name).first()
+    def get_tool_detail(self, validated_request_data):
+        tool = self.get_tool(validated_request_data)
         if not tool:
             raise ToolDoesNotExist()
         if tool.status != PanelStatus.PUBLISHED:
-            raise ToolNotPublished()
+            self.raise_tool_not_published()
+        if tool.tool_type == ToolTypeEnum.SMART_PAGE:
+            raise ToolTypeNotSupport()
 
-        serializer = GetToolDetailByNameAPIGWResponseSerializer(tool, lite_mode=lite_mode)
-        return serializer.data
+        return tool
+
+    def perform_request(self, validated_request_data):
+        return self.get_tool_detail(validated_request_data)
+
+
+class GetMCPToolDetailByName(GetToolDetailByNameAPIGW):
+    """按命名空间查询用户可使用的 MCP 工具详情。"""
+
+    name = gettext_lazy("通过名称获取工具详情(MCP)")
+    RequestSerializer = GetMCPToolDetailByNameRequestSerializer
+
+    def get_tool(self, validated_request_data):
+        return (
+            Tool.all_latest_tools()
+            .filter(
+                namespace=validated_request_data["namespace"],
+                name=validated_request_data["name"],
+            )
+            .first()
+        )
 
 
 # ==================== 场景工具管理 ====================

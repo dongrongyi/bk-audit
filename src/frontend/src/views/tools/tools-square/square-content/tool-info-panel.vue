@@ -34,7 +34,11 @@
         <div
           v-for="(item, index) in toolList"
           :key="`${item.uid}-${index}`"
-          v-bk-tooltips="{ content: item.name, disabled: !isTabTextOverflow[`${item.uid}-${index}`], delay: [300, 0] }"
+          v-bk-tooltips="{
+            content: getToolTabName(item),
+            disabled: !isTabTextOverflow[`${item.uid}-${index}`],
+            delay: [300, 0],
+          }"
           class="panel-tab-item"
           :class="{ active: activeUid === item.uid }"
           @click="handleTabClick(item.uid)"
@@ -51,7 +55,7 @@
             :type="itemIcon(item)" />
           <span
             :ref="(el) => setTabTextRef(`${item.uid}-${index}`, el as HTMLElement)"
-            class="tab-text">{{ item.name }}</span>
+            class="tab-text">{{ getToolTabName(item) }}</span>
           <img
             alt="delete"
             class="delete-fill"
@@ -63,9 +67,10 @@
           v-if="toolList.length > 0"
           :scene-name-map="props.sceneNameMap"
           :scope-params="props.scopeParams"
+          :system-name-map="props.systemNameMap"
           :tags-enums="tagsEnums"
           :tool-list="toolList"
-          @add-tool="(tool) => emit('addTool', tool)"
+          @add-tool="(tool, ctx) => emit('addTool', tool, ctx)"
           @switch-tool="(tool) => emit('switchTab', tool.uid)" />
       </div>
     </div>
@@ -124,14 +129,17 @@
           v-show="activeUid === tool.uid"
           :tool-config="toolDetailMap[tool.uid]?.config"
           :tool-uid="tool.uid"
-          @open-game-detail="handleOpenGameDetail" />
+          @open-game-detail="handleOpenGameDetail"
+          @url-params-sync="(params) => handleSmartPageUrlParamsSync(tool.uid, params)" />
         <!-- 游戏数据详情 -->
         <game-detail
           v-else-if="tool.uid.startsWith('game_detail_')"
           v-show="activeUid === tool.uid"
           :game-data="gameDetailDataMap[tool.uid]"
+          :game-name-resolving="!!gameDetailNameResolvingMap[tool.uid]"
           :initial-tab="gameDetailInitialTabMap[tool.uid]"
-          :tool-uid="gameDetailToolUidMap[tool.uid]" />
+          :tool-uid="gameDetailToolUidMap[tool.uid]"
+          @tab-change="(tab) => handleGameDetailTabChange(tool.uid, tab)" />
         <!-- 普通工具 -->
         <tool-content
           v-else-if="toolDetailMap[tool.uid]"
@@ -144,6 +152,7 @@
           :tool-details="toolDetailMap[tool.uid]"
           :uid="tool.uid"
           @open-field-down="handleOpenFieldDown"
+          @query="() => syncToolParamsToRoute(tool.uid)"
           @update:search-list="(val) => setSearchList(tool.uid, val)" />
       </template>
     </div>
@@ -168,9 +177,37 @@
 
   import AddToolPopover from './add-tool-popover.vue';
 
+  import {
+    fetchGameDetailNameByOpenid,
+    needsResolveGameDetailName,
+  } from '../components/game/game-data-fetcher';
+
   import useRequest from '@/hooks/use-request';
   import useToolTabs from '@/hooks/use-tool-tabs';
   import userProfileIcon from '@/images/user.svg';
+  import {
+    getToolDetailScopeQuery,
+    isToolDetailScopeReady,
+    resolveToolDetailScopeParams,
+    resolveToolOverrideContextFromTool,
+    type ToolDetailOverrideContext,
+  } from '@/utils/assist/scene-system-params';
+  import {
+    buildSearchValuesCacheKey,
+    clearSearchValuesCacheByUid,
+    getSearchItemDefaultValue,
+  } from '@/views/tools/tools-square/utils/search-item-default';
+  import {
+    applyUrlParamsToSearchList,
+    buildGameDetailTabLabel,
+    buildGameDetailUid,
+    getFlatToolParamsFromRoute,
+    getRouteQueryValue,
+    mergeGameDetailRouteQuery,
+    mergeToolRouteQuery,
+    parseGameDetailFromRoute,
+    shouldAutoExecuteToolOnLoad,
+  } from '@/views/tools/tools-square/utils/tool-url-params';
 
   interface SearchItem {
     value: any;
@@ -205,6 +242,8 @@
     };
     // eslint-disable-next-line vue/no-unused-properties
     sceneNameMap?: Record<number, string>;
+    // eslint-disable-next-line vue/no-unused-properties
+    systemNameMap?: Record<string, string>;
   }
 
   const props = defineProps<Props>();
@@ -213,7 +252,7 @@
     goHome: [];
     closeTab: [uid: string];
     switchTab: [uid: string];
-    addTool: [tool: ToolInfo];
+    addTool: [tool: ToolInfo, overrideContext?: ToolDetailOverrideContext];
   }>();
 
   const router = useRouter();
@@ -222,6 +261,7 @@
   const {
     getDrillDownParams,
     clearDrillDownParams,
+    getToolOverrideContext,
   } = useToolTabs();
 
 
@@ -457,7 +497,7 @@
       list.forEach((item) => {
         valuesObj[item.raw_name] = item.value;
       });
-      searchValuesMap.value[uid] = valuesObj;
+      searchValuesMap.value[getSearchValuesCacheKey(uid)] = valuesObj;
     });
     syncSearchValuesToStorage();
   };
@@ -469,34 +509,94 @@
     defaultValue: [],
   });
 
-  // 监听场景切换，按当前场景拉取全量工具列表，避免缺少 scope_type/scope_id 导致的请求失败
-  watch(() => props.scopeParams, (val) => {
-    if (!val || !val.scope_type) return;
-    fetchAllToolsList({ ...val, status: 'published' });
-  }, { immediate: true, deep: true });
-
-  const setToolContentRef = (uid: string, el: any) => {
-    if (el) {
-      toolContentRefs.value[uid] = el;
-    }
-  };
-
-  const getSearchList = (uid: string): SearchItem[] => searchListMap.value[uid] || [];
-  const setSearchList = (uid: string, val: SearchItem[]) => {
-    searchListMap.value[uid] = val;
-    syncSearchListToStorage();
-  };
-
   // 记录当前正在请求详情的激活 uid（用于复制工具时区分原始uid和副本uid）
   const pendingActiveUid = ref<string>('');
+  const lastToolDetailFetchKey = ref('');
+  const pendingToolDetailFetchKey = ref('');
+
+  const resolveOverrideContextForUid = (tabUid: string): ToolDetailOverrideContext | undefined => {
+    const stored = getToolOverrideContext(tabUid);
+    if (stored && (stored.scene_id !== undefined || stored.system_id)) {
+      return stored;
+    }
+    const realUid = copyUidMap.value[tabUid] || tabUid;
+    const storedByReal = realUid !== tabUid ? getToolOverrideContext(realUid) : undefined;
+    if (storedByReal && (storedByReal.scene_id !== undefined || storedByReal.system_id)) {
+      return storedByReal;
+    }
+    const scope = resolveToolDetailScopeParams(props.scopeParams);
+    if (scope.scope_type !== 'cross_scene' && scope.scope_type !== 'cross_system') {
+      return undefined;
+    }
+    const tool = props.toolList.find(t => t.uid === tabUid || t.uid === realUid);
+    if (!tool) return undefined;
+    const fallback = resolveToolOverrideContextFromTool(tool, scope.scope_type);
+    return fallback.scene_id !== undefined || fallback.system_id ? fallback : undefined;
+  };
+
+  const buildFetchToolDetailParams = (realUid: string, tabUid: string) => ({
+    uid: realUid,
+    ...getToolDetailScopeQuery(
+      resolveToolDetailScopeParams(props.scopeParams),
+      resolveOverrideContextForUid(tabUid),
+    ),
+  });
+
+  const buildToolDetailFetchKey = (realUid: string, tabUid: string) => {
+    const scopeQuery = getToolDetailScopeQuery(
+      resolveToolDetailScopeParams(props.scopeParams),
+      resolveOverrideContextForUid(tabUid),
+    );
+    return `${realUid}:${scopeQuery.scene_id ?? ''}:${scopeQuery.system_id ?? ''}`;
+  };
+
+  const getSearchValuesCacheKey = (uid: string) => buildSearchValuesCacheKey(
+    uid,
+    getToolDetailScopeQuery(
+      resolveToolDetailScopeParams(props.scopeParams),
+      resolveOverrideContextForUid(uid),
+    ),
+  );
+
+  const tryFetchActiveToolDetail = () => {
+    const newUid = props.activeUid;
+    if (!newUid || newUid.startsWith('game_detail_')) return;
+    if (!isToolDetailScopeReady(props.scopeParams)) return;
+
+    const realUid = copyUidMap.value[newUid] || newUid;
+    const fetchKey = buildToolDetailFetchKey(realUid, newUid);
+    const drillParams = getDrillDownParams(newUid);
+    const fetchKeyChanged = lastToolDetailFetchKey.value !== fetchKey;
+
+    if (!fetchKeyChanged && toolDetailMap.value[newUid] && !drillParams) return;
+    if (pendingToolDetailFetchKey.value === fetchKey) return;
+
+    if (fetchKeyChanged && toolDetailMap.value[newUid]) {
+      delete toolDetailMap.value[newUid];
+      delete searchListMap.value[newUid];
+    }
+
+    lastToolDetailFetchKey.value = fetchKey;
+    pendingActiveUid.value = newUid;
+    pendingToolDetailFetchKey.value = fetchKey;
+    fetchToolDetail(buildFetchToolDetailParams(realUid, newUid));
+  };
 
   // 获取工具详情
   const {
     run: fetchToolDetail,
   } = useRequest(ToolManageService.fetchToolsDetail, {
     defaultValue: new ToolDetailModel(),
+    onFinally: () => {
+      pendingToolDetailFetchKey.value = '';
+    },
     onSuccess: (data) => {
+      const currentActiveUid = pendingActiveUid.value;
       toolDetailMap.value[data.uid] = data;
+      // 复制工具场景：先写入 tab uid 映射，避免 toolList 变更触发 watch 时重复拉取详情
+      if (currentActiveUid && copyUidMap.value[currentActiveUid]) {
+        toolDetailMap.value[currentActiveUid] = data;
+      }
       // 对于复制的工具，也将详情映射到 copy uid 下
       Object.entries(copyUidMap.value).forEach(([copyUid, originalUid]) => {
         if (originalUid === data.uid && !toolDetailMap.value[copyUid]) {
@@ -512,15 +612,150 @@
         toolInList.strategies = data.strategies || [];
       }
       // 如果是复制工具触发的请求，用 copyUid 作为 key 来初始化
-      const currentActiveUid = pendingActiveUid.value;
       if (currentActiveUid && copyUidMap.value[currentActiveUid]) {
-        toolDetailMap.value[currentActiveUid] = data;
         applyToolDetail(data, currentActiveUid);
       } else {
         applyToolDetail(data);
       }
     },
   });
+
+  // 监听可见范围变化，拉取全量工具列表；与 activeUid 合并触发详情请求，避免重复调用
+  watch(
+    () => ({
+      uid: props.activeUid,
+      scope: props.scopeParams,
+      toolList: props.toolList,
+    }),
+    (val) => {
+      if (val.scope?.scope_type) {
+        fetchAllToolsList({ ...val.scope, status: 'published' });
+      }
+      tryFetchActiveToolDetail();
+    },
+    { immediate: true, deep: true },
+  );
+
+  const setToolContentRef = (uid: string, el: any) => {
+    if (el) {
+      toolContentRefs.value[uid] = el;
+    }
+  };
+
+  const getSearchList = (uid: string): SearchItem[] => searchListMap.value[uid] || [];
+  const setSearchList = (uid: string, val: SearchItem[]) => {
+    searchListMap.value[uid] = val;
+    syncSearchListToStorage();
+  };
+
+  const smartPageUrlParamsMap = ref<Record<string, { accountType: string; accountId: string }>>({});
+  const isSyncingToolRoute = ref(false);
+  const toolRouteQuerySnapshot = ref<Record<string, string>>({});
+
+  const markRouteQueryApplied = (uid: string) => {
+    toolRouteQuerySnapshot.value[uid] = JSON.stringify(route.query);
+  };
+
+  const shouldReapplyRouteQuery = (uid: string) => (
+    toolRouteQuerySnapshot.value[uid] !== JSON.stringify(route.query)
+  );
+
+  const syncGameDetailToRoute = (uid: string) => {
+    if (isSyncingToolRoute.value || !uid.startsWith('game_detail_')) return;
+    const gameData = gameDetailDataMap.value[uid];
+    if (!gameData) return;
+
+    const query = mergeGameDetailRouteQuery(
+      route.query as Record<string, unknown>,
+      gameData,
+      {
+        toolUid: gameDetailToolUidMap.value[uid],
+        initialTab: gameDetailInitialTabMap.value[uid] || 'overview',
+      },
+    );
+
+    isSyncingToolRoute.value = true;
+    router.replace({
+      name: 'toolDetail',
+      params: { uid },
+      query,
+    }).finally(() => {
+      nextTick(() => {
+        isSyncingToolRoute.value = false;
+        markRouteQueryApplied(uid);
+      });
+    });
+  };
+
+  const handleGameDetailTabChange = (uid: string, tab: string) => {
+    gameDetailInitialTabMap.value[uid] = tab;
+    if (props.activeUid === uid) {
+      syncGameDetailToRoute(uid);
+    }
+  };
+
+  const syncToolParamsToRoute = (uid: string) => {
+    if (isSyncingToolRoute.value || uid.startsWith('game_detail_')) return;
+    const detail = toolDetailMap.value[uid];
+    if (!detail) return;
+
+    const smartPageParams = smartPageUrlParamsMap.value[uid];
+    const query = mergeToolRouteQuery(route.query as Record<string, unknown>, detail.tool_type, {
+      searchList: searchListMap.value[uid],
+      accountType: smartPageParams?.accountType,
+      accountId: smartPageParams?.accountId,
+    });
+
+    isSyncingToolRoute.value = true;
+    router.replace({
+      name: 'toolDetail',
+      params: { uid },
+      query,
+    }).finally(() => {
+      nextTick(() => {
+        isSyncingToolRoute.value = false;
+        markRouteQueryApplied(uid);
+      });
+    });
+  };
+
+  const handleSmartPageUrlParamsSync = (
+    uid: string,
+    params: { accountType: string; accountId: string },
+  ) => {
+    if (params.accountId) {
+      smartPageUrlParamsMap.value[uid] = params;
+    } else {
+      delete smartPageUrlParamsMap.value[uid];
+    }
+    if (props.activeUid === uid) {
+      syncToolParamsToRoute(uid);
+    }
+  };
+
+  watch(
+    () => props.activeUid,
+    (uid) => {
+      if (!uid) return;
+      if (uid.startsWith('game_detail_')) {
+        void resolveGameDetailNameIfNeeded(uid);
+        if (gameDetailDataMap.value[uid]) {
+          syncGameDetailToRoute(uid);
+        }
+        return;
+      }
+      const detail = toolDetailMap.value[uid];
+      if (!detail) return;
+      if (detail.tool_type === 'smart_page') {
+        // 始终同步路由，避免从游戏详情切回时残留 game_id / openid 等导致再次自动打开游戏详情
+        syncToolParamsToRoute(uid);
+        return;
+      }
+      if (searchListMap.value[uid]?.length) {
+        syncToolParamsToRoute(uid);
+      }
+    },
+  );
 
   const extractDataByPath = (data: any, path: string): any => {
     if (!path || !data) return null;
@@ -537,35 +772,105 @@
     return result;
   };
 
-  const checkRequiredFieldsFilled = (searchList: SearchItem[]): boolean => {
-    if (!searchList || searchList.length === 0) return false;
-    const requiredFields = searchList.filter(item => item.required);
-    if (requiredFields.length === 0) {
-      // 没有必填项时，如果所有字段都为空，也触发自动查询
-      return searchList.every((item) => {
-        if (Array.isArray(item.value)) {
-          return item.value.length === 0;
-        }
-        return item.value === null || item.value === undefined || item.value === '';
-      });
-    }
-    return requiredFields.every((item) => {
-      if (Array.isArray(item.value)) {
-        return item.value.length > 0;
-      }
-      return item.value !== null && item.value !== undefined && item.value !== '';
+  const getToolInputRawNames = (data: ToolDetailModel) => (
+    (data.config?.input_variable || []).map((item: { raw_name: string }) => item.raw_name)
+  );
+
+  const runToolAutoExecute = (uid: string, detail: ToolDetailModel) => {
+    const shouldAutoExecute = shouldAutoExecuteToolOnLoad(detail.tool_type, {
+      searchList: searchListMap.value[uid],
     });
+    if (!shouldAutoExecute) return;
+
+    nextTick(() => {
+      const ref = toolContentRefs.value[uid];
+      if (!ref) return;
+      if (detail.tool_type === 'bk_vision') {
+        ref.executeBkVision();
+      } else {
+        ref.submit();
+      }
+    });
+  };
+
+  const reapplyUrlParamsForUid = (uid: string) => {
+    const detail = toolDetailMap.value[uid];
+    if (!detail || detail.tool_type === 'smart_page') return;
+    if (!searchListMap.value[uid]?.length) return;
+
+    const inputRawNames = getToolInputRawNames(detail);
+    const urlParams = getFlatToolParamsFromRoute(route.query as Record<string, unknown>, {
+      inputRawNames,
+    });
+    if (!Object.keys(urlParams).length) {
+      markRouteQueryApplied(uid);
+      return;
+    }
+
+    const urlApplied = applyUrlParamsToSearchList(searchListMap.value[uid], urlParams);
+    if (!urlApplied.hasApplied) {
+      markRouteQueryApplied(uid);
+      return;
+    }
+
+    searchListMap.value[uid] = urlApplied.list;
+    syncSearchListToStorage();
+    markRouteQueryApplied(uid);
+
+    nextTick(() => {
+      const ref = toolContentRefs.value[uid];
+      if (!ref) return;
+      ref.setFormItemData(searchListMap.value[uid]);
+      syncToolParamsToRoute(uid);
+      // 等表单 setData 完成后再自动查询，避免 UI 与请求参数不一致
+      nextTick(() => {
+        runToolAutoExecute(uid, detail);
+      });
+    });
+  };
+
+  /**
+   * 将当前工具业务参数同步到 URL。
+   * 详情 / searchList 未就绪时绝不改写 query，避免把深链参数（如 operator）清成仅 scope。
+   */
+  const syncRouteForTool = (uid: string) => {
+    if (!uid) return;
+    if (uid.startsWith('game_detail_')) {
+      if (gameDetailDataMap.value[uid]) {
+        syncGameDetailToRoute(uid);
+      } else {
+        restoreGameDetailFromRoute();
+      }
+      return;
+    }
+
+    const detail = toolDetailMap.value[uid];
+    // 详情未就绪：保留现有 URL（含深链业务参数），等 applyToolDetail 完成后再同步
+    if (!detail) return;
+
+    if (detail.tool_type === 'smart_page') {
+      if (smartPageUrlParamsMap.value[uid]?.accountId) {
+        syncToolParamsToRoute(uid);
+      }
+      // 尚无账号参数时保留 URL 中的 openid 等深链参数
+      return;
+    }
+
+    if (searchListMap.value[uid]?.length) {
+      syncToolParamsToRoute(uid);
+    }
   };
 
   const applyToolDetail = (data: ToolDetailModel, overrideUid?: string) => {
     const uid = overrideUid || data.uid;
     // 检查是否有下钻参数
     const drillParams = getDrillDownParams(uid);
+    const inputRawNames = getToolInputRawNames(data);
 
     if (data.tool_type !== 'bk_vision') {
       const createSearchItem = (item: any) => ({
         ...item,
-        value: item.default_value || (item.field_category === 'person_select' || item.field_category === 'time_range_select' ? [] : null),
+        value: getSearchItemDefaultValue(item),
         required: item.required,
         disabled: false,
       });
@@ -606,7 +911,7 @@
         clearDrillDownParams(uid);
       } else if (!searchListMap.value[uid]) {
         // 非下钻：从工具配置构建完整 searchList，并尝试恢复缓存的用户输入值
-        const cachedValues = searchValuesMap.value[uid];
+        const cachedValues = searchValuesMap.value[getSearchValuesCacheKey(uid)];
         searchListMap.value[uid] = (data.config?.input_variable || []).map((item: any) => {
           const searchItem = createSearchItem(item);
           // 如果有缓存的用户输入值，优先使用缓存值
@@ -618,24 +923,120 @@
         syncSearchListToStorage();
       }
 
+      let hasUrlParams = false;
+      if (!drillParams) {
+        const urlParams = getFlatToolParamsFromRoute(route.query as Record<string, unknown>, {
+          inputRawNames,
+        });
+        const urlApplied = applyUrlParamsToSearchList(searchListMap.value[uid], urlParams);
+        hasUrlParams = urlApplied.hasApplied;
+        if (hasUrlParams) {
+          searchListMap.value[uid] = urlApplied.list;
+          syncSearchListToStorage();
+        }
+      }
+
+      const shouldAutoExecute = shouldAutoExecuteToolOnLoad(data.tool_type, {
+        searchList: searchListMap.value[uid],
+        hasDrillParams: !!drillParams,
+      });
+
       nextTick(() => {
         const ref = toolContentRefs.value[uid];
         if (ref) {
           ref.setFormItemData(searchListMap.value[uid]);
-          const shouldAutoSubmit = drillParams || checkRequiredFieldsFilled(searchListMap.value[uid]);
-          if (shouldAutoSubmit) {
+          if (hasUrlParams || shouldAutoExecute) {
+            syncToolParamsToRoute(uid);
+          }
+          if (shouldAutoExecute) {
             nextTick(() => {
               ref.submit();
             });
           }
+          markRouteQueryApplied(uid);
         }
       });
     } else {
-      nextTick(() => {
-        const ref = toolContentRefs.value[uid];
-        if (ref) {
-          ref.executeBkVision();
+      const createBkVisionSearchItem = (item: any) => ({
+        ...item,
+        value: getSearchItemDefaultValue(item),
+        required: item.required,
+        disabled: false,
+      });
+
+      if (drillParams) {
+        const configMap = new Map<string, any>();
+        drillParams.drillConfig.forEach((configItem) => {
+          configMap.set(configItem.source_field, configItem);
+        });
+
+        searchListMap.value[uid] = (data.config?.input_variable || []).map((item: any) => {
+          const searchItem = createBkVisionSearchItem(item);
+          const configItem = configMap.get(searchItem.raw_name);
+          if (!configItem) return searchItem;
+
+          let dynamicValue: any = '';
+          if (configItem.target_value_type !== 'fixed_value') {
+            if (configItem.target_value.includes('.')) {
+              dynamicValue = extractDataByPath(drillParams.rowData, configItem.target_value);
+            } else if (configItem.target_field_type === 'basic' || !configItem.target_field_type) {
+              dynamicValue = drillParams.rowData?.[configItem.target_value] ?? searchItem.value;
+            } else {
+              dynamicValue = drillParams.rowData?.event_data?.[configItem.target_value] ?? searchItem.value;
+            }
+          }
+
+          return {
+            ...searchItem,
+            value: configItem.target_value_type === 'fixed_value'
+              ? configItem.target_value
+              : dynamicValue,
+          };
+        });
+        syncSearchListToStorage();
+        clearDrillDownParams(uid);
+      } else {
+        const cachedValues = searchValuesMap.value[getSearchValuesCacheKey(uid)];
+        searchListMap.value[uid] = (data.config?.input_variable || []).map((item: any) => {
+          const searchItem = createBkVisionSearchItem(item);
+          if (cachedValues && cachedValues[searchItem.raw_name] !== undefined) {
+            searchItem.value = cachedValues[searchItem.raw_name];
+          }
+          return searchItem;
+        });
+        syncSearchListToStorage();
+      }
+
+      let hasUrlParams = false;
+      if (!drillParams) {
+        const urlParams = getFlatToolParamsFromRoute(route.query as Record<string, unknown>, {
+          inputRawNames,
+        });
+        const urlApplied = applyUrlParamsToSearchList(searchListMap.value[uid], urlParams);
+        hasUrlParams = urlApplied.hasApplied;
+        if (hasUrlParams) {
+          searchListMap.value[uid] = urlApplied.list;
+          syncSearchListToStorage();
         }
+      }
+      const shouldAutoExecute = shouldAutoExecuteToolOnLoad(data.tool_type, {
+        searchList: searchListMap.value[uid],
+        hasDrillParams: !!drillParams,
+      });
+
+      // 等待 searchList 同步到子组件后再执行，避免 execute 时 tool_variables 未带上 URL 参数
+      nextTick(() => {
+        nextTick(() => {
+          const ref = toolContentRefs.value[uid];
+          if (!ref) return;
+          if (hasUrlParams || shouldAutoExecute) {
+            syncToolParamsToRoute(uid);
+          }
+          if (shouldAutoExecute) {
+            ref.executeBkVision();
+          }
+          markRouteQueryApplied(uid);
+        });
       });
     }
     if (data.tool_type === 'smart_page') {
@@ -658,79 +1059,128 @@
     };
   };
 
-  // 游戏详情数据缓存（从 sessionStorage 恢复）
-  const STORAGE_KEY_GAME_DETAIL = 'tool_tabs_game_detail_map';
-  const loadGameDetailCache = () => {
-    try {
-      const raw = sessionStorage.getItem(STORAGE_KEY_GAME_DETAIL);
-      return raw ? JSON.parse(raw) : { data: {}, tab: {}, toolUid: {} };
-    } catch {
-      return { data: {}, tab: {}, toolUid: {} };
-    }
-  };
-  const savedGameCache = loadGameDetailCache();
-  const gameDetailDataMap = ref<Record<string, any>>(savedGameCache.data);
-  // 游戏详情初始 tab 缓存
-  const gameDetailInitialTabMap = ref<Record<string, string>>(savedGameCache.tab);
-  // 游戏详情对应的 smart_page 工具 uid 缓存
-  const gameDetailToolUidMap = ref<Record<string, string>>(savedGameCache.toolUid);
+  // 游戏详情数据（从 URL 恢复，保证链接可跨页面打开）
+  const gameDetailDataMap = ref<Record<string, any>>({});
+  const gameDetailInitialTabMap = ref<Record<string, string>>({});
+  const gameDetailToolUidMap = ref<Record<string, string>>({});
+  const gameDetailNameResolvingMap = ref<Record<string, boolean>>({});
 
-  const syncGameDetailToStorage = () => {
-    try {
-      sessionStorage.setItem(STORAGE_KEY_GAME_DETAIL, JSON.stringify({
-        data: gameDetailDataMap.value,
-        tab: gameDetailInitialTabMap.value,
-        toolUid: gameDetailToolUidMap.value,
-      }));
-    } catch {
-      // 静默处理
+  const getToolTabName = (item: ToolInfo) => {
+    if (!item.uid.startsWith('game_detail_')) return item.name;
+    const gameData = gameDetailDataMap.value[item.uid];
+    if (gameData) {
+      return buildGameDetailTabLabel(gameData, {
+        resolving: !!gameDetailNameResolvingMap.value[item.uid],
+      });
     }
+    return item.name;
   };
 
-  // 打开游戏数据详情
-  const getRouteQueryValue = (value: unknown) => {
-    if (Array.isArray(value)) {
-      return value[0] ? String(value[0]) : '';
+  const syncOpenedGameDetailTabName = (uid: string) => {
+    const tool = props.toolList.find(t => t.uid === uid);
+    if (!tool) return;
+    tool.name = getToolTabName(tool);
+  };
+
+  const resolveGameDetailNameIfNeeded = async (uid: string) => {
+    if (!uid.startsWith('game_detail_') || gameDetailNameResolvingMap.value[uid]) return;
+    const gameData = gameDetailDataMap.value[uid];
+    const toolUid = gameDetailToolUidMap.value[uid];
+    if (!needsResolveGameDetailName(gameData) || !toolUid) return;
+
+    gameDetailNameResolvingMap.value[uid] = true;
+    try {
+      const name = await fetchGameDetailNameByOpenid(toolUid, gameData.openid, gameData.gameid);
+      if (!name || !gameDetailDataMap.value[uid]) return;
+      gameDetailDataMap.value[uid] = {
+        ...gameDetailDataMap.value[uid],
+        name,
+      };
+      syncOpenedGameDetailTabName(uid);
+    } finally {
+      gameDetailNameResolvingMap.value[uid] = false;
+      syncOpenedGameDetailTabName(uid);
     }
-    if (value === undefined || value === null) {
-      return '';
-    }
-    return String(value);
+  };
+
+  const resolveSmartPageToolUid = (): string => {
+    const fromList = props.toolList.find(t => t.tool_type === 'smart_page')?.uid;
+    if (fromList) return fromList;
+    return allToolsData.value?.find((t: ToolDetailModel) => t.tool_type === 'smart_page')?.uid || '';
   };
 
   const restoreGameDetailFromRoute = () => {
+    if (isSyncingToolRoute.value) return;
     const routeUid = typeof route.params.uid === 'string' ? route.params.uid : '';
     if (!routeUid.startsWith('game_detail_')) return;
-    if (gameDetailDataMap.value[routeUid] && gameDetailToolUidMap.value[routeUid]) return;
 
-    const gameName = getRouteQueryValue(route.query.game_name);
-    const openid = getRouteQueryValue(route.query.openid);
-    const toolUid = getRouteQueryValue(route.query.tool_uid);
-    if (!gameName || !openid || !toolUid) return;
+    const parsed = parseGameDetailFromRoute(route.query as Record<string, unknown>, {
+      fallbackToolUid: resolveSmartPageToolUid(),
+    });
+    if (!parsed) return;
 
+    const existing = gameDetailDataMap.value[routeUid];
     gameDetailDataMap.value[routeUid] = {
-      name: gameName,
-      openid,
-      gameid: getRouteQueryValue(route.query.game_id),
-      ctx: getRouteQueryValue(route.query.ctx),
-      wechat: '',
-      platType: getRouteQueryValue(route.query.plat_type),
-      platAccount: getRouteQueryValue(route.query.plat_account),
-      loginDays31: 0,
-      coinBalance: Number(getRouteQueryValue(route.query.coin_balance) || 0),
-      totalRecharge: Number(getRouteQueryValue(route.query.total_recharge) || 0),
-      totalGift: 0,
-      totalIssue: Number(getRouteQueryValue(route.query.total_issue) || 0),
+      ...parsed.gameData,
+      name: existing?.name && existing.name !== String(existing.gameid || '')
+        ? existing.name
+        : parsed.gameData.name,
+      // 内存中已有 ctx 时优先保留，避免刷新前顶栏信息被空值覆盖
+      ctx: parsed.gameData.ctx || existing?.ctx || '',
     };
-    gameDetailInitialTabMap.value[routeUid] = getRouteQueryValue(route.query.initial_tab) || 'overview';
-    gameDetailToolUidMap.value[routeUid] = toolUid;
-    syncGameDetailToStorage();
+    // 仅当 URL 显式带了 initial_tab，或本地尚未记录时才写入，避免丢失用户当前子 tab
+    const urlInitialTab = getRouteQueryValue((route.query as Record<string, unknown>).initial_tab);
+    if (urlInitialTab || !gameDetailInitialTabMap.value[routeUid]) {
+      gameDetailInitialTabMap.value[routeUid] = parsed.initialTab;
+    }
+    gameDetailToolUidMap.value[routeUid] = parsed.toolUid;
+    void resolveGameDetailNameIfNeeded(routeUid);
   };
 
   restoreGameDetailFromRoute();
 
+  watch(
+    () => [route.params.uid, route.query],
+    () => {
+      restoreGameDetailFromRoute();
+    },
+    { deep: true },
+  );
+
+  watch(
+    () => route.query,
+    () => {
+      if (isSyncingToolRoute.value) return;
+      const uid = props.activeUid;
+      const routeUid = typeof route.params.uid === 'string' ? route.params.uid : '';
+      if (!uid || uid !== routeUid || uid.startsWith('game_detail_')) return;
+      if (!shouldReapplyRouteQuery(uid)) return;
+      if (!toolDetailMap.value[uid] || toolDetailMap.value[uid].tool_type === 'smart_page') return;
+      if (!searchListMap.value[uid]?.length) return;
+      reapplyUrlParamsForUid(uid);
+    },
+    { deep: true },
+  );
+
+  watch(
+    () => props.scopeParams,
+    () => {
+      if (props.activeUid) {
+        nextTick(() => syncRouteForTool(props.activeUid));
+      }
+    },
+    { deep: true },
+  );
+
+  watch(
+    () => allToolsData.value?.length,
+    () => {
+      restoreGameDetailFromRoute();
+    },
+  );
+
   const handleOpenGameDetail = (gameData: Record<string, any>, initialTab?: string) => {
-    const gameUid = `game_detail_${gameData.openid || ''}_${gameData.name}`;
+    const gameUid = buildGameDetailUid(gameData);
     // 缓存游戏数据（保留 gameid 用于子接口查询）
     gameDetailDataMap.value[gameUid] = {
       name: gameData.name,
@@ -747,16 +1197,16 @@
       totalIssue: gameData.totalIssue || 0,
     };
     // 找到 smart_page 工具的 uid，传递给 game-detail 用于接口调用
-    const smartPageTool = props.toolList.find(t => t.tool_type === 'smart_page');
-    if (smartPageTool) {
-      gameDetailToolUidMap.value[gameUid] = smartPageTool.uid;
+    const smartPageToolUid = resolveSmartPageToolUid();
+    if (smartPageToolUid) {
+      gameDetailToolUidMap.value[gameUid] = smartPageToolUid;
     }
     // 缓存初始 tab
     gameDetailInitialTabMap.value[gameUid] = initialTab || 'overview';
     // 构造一个 ToolInfo 实例用于 tab 展示
     const gameTool = new ToolInfo({
       uid: gameUid,
-      name: `${gameData.ctx || ''} - ${gameData.name}`,
+      name: buildGameDetailTabLabel(gameData),
       version: 1,
       tool_type: 'game_detail',
       description: '',
@@ -770,11 +1220,11 @@
       updated_by: '',
       updated_at: '',
     } as any);
-    // 同步游戏详情缓存后再切 tab，避免 URL 同步时拿到空 query。
-    syncGameDetailToStorage();
-    syncGameDetailToStorage();
     emit('addTool', gameTool);
     emit('switchTab', gameUid);
+    nextTick(() => {
+      syncGameDetailToRoute(gameUid);
+    });
   };
 
   // 处理下钻事件：在新浏览器标签页中打开目标工具
@@ -819,26 +1269,6 @@
     window.open(routeData.href, '_blank');
   };
 
-  // 监听激活工具变化，仅在未加载过时请求详情
-  watch(
-    () => props.activeUid,
-    (newUid) => {
-      if (!newUid) return;
-      // 跳过游戏详情等固定工具
-      if (newUid.startsWith('game_detail_')) return;
-      const drillParams = getDrillDownParams(newUid);
-      // 如果该工具详情尚未加载，或者有下钻参数需要重新填充，则请求
-      if (!toolDetailMap.value[newUid] || drillParams) {
-        // 对于复制的工具，使用原始uid来获取详情
-        const realUid = copyUidMap.value[newUid] || newUid;
-        pendingActiveUid.value = newUid;
-        fetchToolDetail({ uid: realUid });
-      }
-      // 已加载的工具无需任何操作，v-show 会自动切换显示
-    },
-    { immediate: true },
-  );
-
   // smart_page（审计用户画像）查询状态在 sessionStorage 中按 toolUid 区分存储的 key 前缀
   // 关闭工具 tab 时清理对应 key，避免下次打开时仍恢复上次输入
   const STORAGE_KEY_PROFILE_QUERY_PREFIX = 'tool_audit_profile_query_';
@@ -853,7 +1283,7 @@
         if (!activeUids.has(uid)) {
           delete toolDetailMap.value[uid];
           delete searchListMap.value[uid];
-          delete searchValuesMap.value[uid];
+          searchValuesMap.value = clearSearchValuesCacheByUid(searchValuesMap.value, uid);
           delete toolContentRefs.value[uid];
         }
       });
@@ -879,10 +1309,13 @@
         // 静默处理
       }
       syncSearchValuesToStorage();
-      syncGameDetailToStorage();
     },
     { deep: true },
   );
+
+  defineExpose({
+    syncRouteForTool,
+  });
 </script>
 
 <style scoped lang="postcss">

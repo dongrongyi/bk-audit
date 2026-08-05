@@ -261,6 +261,7 @@
   import _ from 'lodash';
   import {
     computed,
+    nextTick,
     onMounted,
     onUnmounted,
     ref,
@@ -386,6 +387,10 @@
   const { locale, t } = useI18n();
   const switchStrategyParams = ref({ strategy_id: 0, toggle: false });
   const leftLabelFilterCondition = ref('');
+  // 记录最近一次请求所用的场景，供 scene:change 比对，避免漏接场景事件导致空列表
+  const lastFetchedScopeId = ref<string | null>(null);
+  // 列表是否已成功加载过（用于区分「场景相同但首屏请求失败」与「无需重复请求」）
+  const hasListLoadedOnce = ref(false);
   const strategyTagMap = ref<Record<string, string>>({});
   const statusMap = ref<Record<string, string>>({});
   // 挂起的需要轮询的id列表
@@ -481,11 +486,30 @@
     },
   ] as { name: string, id: string, placeholder: string, children?: any[] }[];
 
-  const dataSource = (params: Record<string, any> = {}) => StrategyManageService.fetchStrategyList({
-    ...params,
-    order_type: 'asc',
-    tag: leftLabelFilterCondition.value,
-  });
+  const dataSource = (params: Record<string, any> = {}) => {
+    // 记录本次请求实际使用的场景，供 scene:change 判断场景是否真正变化
+    lastFetchedScopeId.value = getSceneSystemParams().scope_id;
+    // render-list 统一产出 sort: ['-field'] / ['field']，策略后台接口使用 order_field + order_type
+    const { sort, order_field: orderFieldFromParams, order_type: orderTypeFromParams, ...rest } = params;
+    let orderField = orderFieldFromParams;
+    let orderType = orderTypeFromParams;
+    let primarySort = '';
+    if (Array.isArray(sort)) {
+      primarySort = sort[0] || '';
+    } else if (typeof sort === 'string') {
+      primarySort = sort;
+    }
+    if (primarySort) {
+      const isDesc = primarySort.startsWith('-');
+      orderField = isDesc ? primarySort.slice(1) : primarySort;
+      orderType = isDesc ? 'desc' : 'asc';
+    }
+    return StrategyManageService.fetchStrategyList({
+      ...rest,
+      ...(orderField ? { order_field: orderField, order_type: orderType || 'asc' } : {}),
+      tag: leftLabelFilterCondition.value,
+    });
+  };
   const initStatusFilterList = [
     {
       text: t('已停用', 2),
@@ -571,14 +595,14 @@
       label: () => t('策略ID'),
       field: () => 'strategy_id',
       fixed: 'left',
-      width: 120,
+      width: 90,
       sort: 'custom',
     },
     {
       label: () => t('策略名称'),
       fixed: 'left',
-      sort: 'custom',
       field: () => 'strategy_name',
+      minWidth: 220,
       render: ({ data }: { data: StrategyModel}) => {
         const isNew = isNewData(data);
         return isNew
@@ -621,7 +645,7 @@
     {
       label: () => t('标签'),
       field: () => 'tags',
-      minWidth: 230,
+      width: 120,
       render: ({ data }: { data: StrategyModel }) => {
         const tags = data.tags.map(item => strategyTagMap.value[item] || item);
         return <EditTag data={tags} key={data.strategy_id} />;
@@ -630,7 +654,7 @@
     {
       label: () => t('状态'),
       field: () => 'status',
-      width: '170px',
+      width: 110,
       filter: {
         list: initStatusFilterList,
         filterScope: SortScope.CURRENT,
@@ -676,7 +700,7 @@
               style='color: #3a84ff; margin-left: 4px; cursor: pointer;'
               onClick={() => handleRecord(data)}
               type='yunxingjilu' />
-          </p>;
+            </p>;
         }
         // failed
         if (data.status_msg) {
@@ -740,7 +764,9 @@
       label: () => t('产生风险单'),
       field: () => 'risk_count',
       sort: 'custom',
+      width: 120,
       render: ({ data }: { data: StrategyModel }) => {
+        const riskCount = data.risk_count ?? 0;
         const to = {
           name: 'sceneRiskManageList',
           query: {
@@ -749,17 +775,18 @@
             strategy_id: data.strategy_id,
           },
         };
-        return data.risk_count ? <router-link to = {to} target='_blank'>
+        return riskCount ? <router-link to = {to} target='_blank'>
           <span v-bk-tooltips={{
             content: t('近6个月此策略产生风险单总数，点击查看'),
-            disabled: !data.risk_count,
-          }}>{data.risk_count}</span>
-        </router-link> : <span>{data.risk_count}</span>;
+            disabled: !riskCount,
+          }}>{riskCount}</span>
+        </router-link> : <span>{riskCount}</span>;
       },
     },
     {
       label: () => t('事件调查报告'),
       field: () => 'report_status',
+      width: 140,
       filter: {
         list: initReportStatusFilterList,
         filterScope: SortScope.CURRENT,
@@ -774,7 +801,7 @@
     {
       label: () => t('启停'),
       field: () => 'status',
-      width: 110,
+      width: 90,
       filter: {
         list: initEnableFilterList,
         filterScope: SortScope.ALL,
@@ -817,8 +844,7 @@
     {
       label: () => t('最近更新人'),
       field: () => 'updated_by',
-      width: 140,
-      sort: 'custom',
+      width: 120,
     },
     {
       label: () => t('最近更新时间'),
@@ -1232,6 +1258,7 @@
   // 详情
   const handleDetail = (data: StrategyModel) => {
     if (!data) return;
+    recordPageParams();
     strategyItem.value = data;
     showDetail.value = true;
   };
@@ -1413,6 +1440,7 @@
   };
   let isRequest = false;
   const handleRequestSuccess = (data: Strategy) => {
+    hasListLoadedOnce.value = true;
     // 先检验策略列表权限再获取通知组
     if (!groupList.value.results.length) {
       fetchGroupList();
@@ -1533,22 +1561,75 @@
   };
   const fetchData = () => {
     const hasKey = setSearchKey();
-    if (hasKey) {
-      fetchStrategyTags().then(() => {
+    // 标签与列表并行加载：列表不再依赖标签接口成功，避免标签失败时列表不渲染
+    void fetchStrategyTags();
+    const tryFetch = (retry = 0) => {
+      if (!listRef.value) {
+        if (retry < 5) {
+          nextTick(() => tryFetch(retry + 1));
+        }
+        return;
+      }
+      if (hasKey) {
         handleSearch(searchKey.value);
-      });
-    } else {
-      fetchStrategyTags().then(() => {
+      } else {
         listRef.value.fetchData();
-      });
-    }
+      }
+    };
+    nextTick(() => tryFetch());
   };
   const handlFetchData = () => {
+    const currentScopeId = getSceneSystemParams().scope_id;
+    // 深链场景：URL 已携带 strategy_id 等筛选条件时，首屏的 fetchData() 会立刻触发筛选请求；
+    // 若此刻收到 scene:change 事件，handlFetchData 里调用无筛选的 listRef.fetchData() 会把筛选冲掉。
+    // 因此在“尚未首次加载成功”阶段，若存在 URL 筛选参数则直接跳过。
+    const urlSearch = getSearchParams();
+    const hasUrlStrategyFilter = Boolean(urlSearch.strategy_id
+      || urlSearch.strategy_name
+      || urlSearch.strategy_type
+      || urlSearch.tag
+      || urlSearch.status
+      || urlSearch.report_status);
+    if (hasUrlStrategyFilter && !hasListLoadedOnce.value) {
+      return;
+    }
+    // 场景未变且列表已成功加载过时才跳过；首屏因 sort 解析失败/请求取消等未加载成功时仍需重试
+    if (
+      lastFetchedScopeId.value !== null
+      && currentScopeId === lastFetchedScopeId.value
+      && hasListLoadedOnce.value
+    ) {
+      return;
+    }
+    const isSceneChanged = lastFetchedScopeId.value !== null
+      && currentScopeId !== lastFetchedScopeId.value;
+
     total.value = 0;
+    hasListLoadedOnce.value = false;
     groupList.value.results = [];
     isRequest = false;
     shouldHighlightNewRow.value = false; // 场景切换后不再高亮新建行
-    listRef.value.fetchData();
+
+    // 真正切换场景：清空搜索/筛选/排序，避免旧场景参数带到新场景
+    if (isSceneChanged) {
+      searchKey.value = [];
+      renderLabelRef.value?.resetAllLabel();
+      leftLabelFilterCondition.value = '';
+      tableColumn.value.forEach((column) => {
+        if (column.filter && Array.isArray(column.filter.checked)) {
+          // eslint-disable-next-line no-param-reassign
+          column.filter.checked.length = 0;
+        }
+        if (column.sort) {
+          // eslint-disable-next-line no-param-reassign
+          column.sort = 'custom';
+        }
+      });
+      listRef.value?.resetFetchData();
+      return;
+    }
+
+    listRef.value?.fetchData();
   };
   // 页面刷新前标记，刷新后不再高亮
   const handleBeforeUnload = () => {
@@ -1562,10 +1643,9 @@
       sessionStorage.removeItem('audit-strategy-page-reloaded');
       shouldHighlightNewRow.value = false;
     }
+    // 立即注册监听，避免场景选择器在首屏解析场景时漏接事件导致空列表
+    onEvent('scene:change', handlFetchData);
     fetchData();
-    setTimeout(() => {
-      onEvent('scene:change', handlFetchData);
-    }, 1000);
   });
   onUnmounted(() => {
     off('scene:change', handlFetchData);

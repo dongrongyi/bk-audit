@@ -68,6 +68,7 @@ from core.exceptions import PermissionException
 from core.observability import submit_with_observation_context
 from core.utils.data import choices_to_dict, compare_dict_specific_keys
 from core.utils.page import paginate_queryset
+from core.utils.retry import FuncRunner
 from services.web.analyze.constants import (
     BaseControlTypeChoices,
     FilterOperator,
@@ -1147,14 +1148,10 @@ class GetStrategyCommon(StrategyV2Base):
             "risk_level": choices_to_dict(RiskLevel, val="value", name="label"),
             "strategy_type": choices_to_dict(StrategyType, val="value", name="label"),
             "link_table_join_type": choices_to_dict(LinkTableJoinType, val="value", name="label"),
-            "link_table_table_type": choices_to_dict(
-                LinkTableTableType, val="value", name="label", exclude_vals=["MineBizRt"]
-            ),
+            "link_table_table_type": choices_to_dict(LinkTableTableType, val="value", name="label"),
             "rule_audit_aggregate_type": choices_to_dict(RuleAuditAggregateType, val="value", name="label"),
             "rule_audit_field_type": choices_to_dict(RuleAuditFieldType, val="value", name="label"),
-            "rule_audit_config_type": choices_to_dict(
-                RuleAuditConfigType, val="value", name="label", exclude_vals=["MineBizRt"]
-            ),
+            "rule_audit_config_type": choices_to_dict(RuleAuditConfigType, val="value", name="label"),
             "rule_audit_source_type": choices_to_dict(RuleAuditSourceType, val="value", name="label"),
             "rule_audit_condition_operator": choices_to_dict(RuleAuditConditionOperator, val="value", name="label"),
             "rule_audit_where_connector": choices_to_dict(RuleAuditWhereConnector, val="value", name="label"),
@@ -1183,7 +1180,6 @@ class GetScenePermissionTables(StrategyV2Base):
             choices=[
                 (ListTableType.BUILD_ID_ASSET.value, ListTableType.BUILD_ID_ASSET.label),
                 (ListTableType.BIZ_RT.value, ListTableType.BIZ_RT.label),
-                (ListTableType.MINE_BIZ_RT.value, ListTableType.MINE_BIZ_RT.label),
             ],
             required=True,
         )
@@ -1299,8 +1295,16 @@ class GetRTMeta(StrategyV2Base, CacheResource):
     def get_data_manager(self, result_table_id):
         """获取数据表的维护者。"""
         result = {
-            'managers': api.bk_base.get_role_users_list(role_id="result_table.manager", scope_id=result_table_id),
-            'viewers': api.bk_base.get_role_users_list(role_id="result_table.viewer", scope_id=result_table_id),
+            'managers': FuncRunner(
+                func=api.bk_base.get_role_users_list,
+                kwargs={"role_id": "result_table.manager", "scope_id": result_table_id},
+                max_retry=2,
+            ).run(),
+            'viewers': FuncRunner(
+                func=api.bk_base.get_role_users_list,
+                kwargs={"role_id": "result_table.viewer", "scope_id": result_table_id},
+                max_retry=2,
+            ).run(),
         }
         return result
 

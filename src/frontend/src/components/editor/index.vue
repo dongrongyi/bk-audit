@@ -16,24 +16,17 @@
 -->
 <template>
   <div
+    ref="editorWrapRef"
     :active="!disabled"
-    class="editor-wrap">
-    <bk-upload
+    class="editor-wrap editor-wrap--report"
+    :class="{ 'expanded-mode': isExpanded && fullscreenScope === 'parent' }">
+    <input
       v-if="supportImage"
-      id="editor-upload-image"
-      ref="imageRef"
+      ref="imageInputRef"
       accept="image/png,image/jpeg,image/jpg"
-      :handle-res-code="handleRes"
-      :headers="headers"
-      method="post"
-      :multiple="false"
-      name="file"
       style="display: none"
-      tip="只允许上传JPG、PNG、JPEG的文件"
-      :url="`${attachmentUrl}`"
-      with-credentials
-      @error="onImageLoadError"
-      @success="onImageLoadSuccess" />
+      type="file"
+      @change="onImageFileChange">
     <quill-editor
       ref="editorRef"
       v-model:content="content"
@@ -51,15 +44,17 @@
     </div>
     <!-- 编辑器中的图片预览 -->
     <editor-image-preview
-      v-if="editorImages.length > 0"
+      v-if="showImagePreview && editorImages.length > 0"
       :images="editorImages"
       :title="t('编辑器中的图片预览')" />
+    <insert-table-dialog
+      ref="insertTableDialogRef"
+      @confirm="handleInsertTableConfirm" />
   </div>
 </template>
 
 <script setup lang="ts">
-  import Cookie from 'js-cookie';
-  import { nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
+  import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch, inject, type Ref } from 'vue';
   import {
     useI18n,
   } from 'vue-i18n';
@@ -69,7 +64,15 @@
   import useMessage from '@hooks/use-message';
   import useRequest from '@hooks/use-request';
 
+  import InsertTableDialog from '@views/risk-manage/detail/components/event-report/insert-table-dialog.vue';
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  import ReportTableBlot, {
+    hasTableContent,
+    insertReportTable,
+    registerReportTableMatcher,
+  } from '@views/risk-manage/detail/components/event-report/report-table-blot';
   import { QuillEditor } from '@vueup/vue-quill';
+  import DOMPurify from 'dompurify';
 
   import '@vueup/vue-quill/dist/vue-quill.snow.css';
   import '@vueup/vue-quill/dist/vue-quill.bubble.css';
@@ -78,6 +81,7 @@
   interface Emits {
     (e: 'update:content', value: string): void;
     (e: 'blur', value: string): void;
+    (e: 'expand-change', value: boolean): void;
   }
   interface Props {
     disabled?: boolean;
@@ -85,7 +89,12 @@
     maxLen?: number;
     placeholder?: string;
     supportImage?: boolean;
-    // typeAssess?: boolean;
+    supportFullscreen?: boolean;
+    showImagePreview?: boolean;
+    /** viewport/main: 浮层全屏; parent: 原地增高编辑器 */
+    fullscreenScope?: 'viewport' | 'main' | 'parent';
+    /** parent 模式下放大后的编辑区高度 */
+    expandHeight?: number;
   }
   interface ResponseData {
     result: boolean;
@@ -107,6 +116,10 @@
     placeholder: '',
     disabled: false,
     supportImage: true,
+    supportFullscreen: true,
+    showImagePreview: true,
+    fullscreenScope: 'main',
+    expandHeight: 360,
   });
 
   const emits = defineEmits<Emits>();
@@ -115,42 +128,270 @@
 
   const content = ref();
   const editorRef = ref();
-  const imageRef = ref();
+  const editorWrapRef = ref<HTMLElement>();
+  const imageInputRef = ref<HTMLInputElement>();
+  const insertTableDialogRef = ref<InstanceType<typeof InsertTableDialog>>();
   const { t } = useI18n();
   const TiLength = ref(0);
   const editorImages = ref<Array<{url: string}>>([]);
-  const CRRF_TOKEN_KEY = 'bk-wesec_csrftoken';
-  const CSRFToken = Cookie.get(CRRF_TOKEN_KEY);
-  const headers = new Headers({ 'X-CSRFToken': CSRFToken });
-  const attachmentUrl = ref(`${window.PROJECT_CONFIG.AJAX_URL_PREFIX}/api/v1/blob_storage/upload/`);
 
-  // 工具栏
-  const container = [
-    [{ header: 1 }, { header: 2 }, 'bold', 'italic', 'strike', 'underline', { color: [] },  { align: 'center' },  { align: 'right' }],
-    [
-      { list: 'ordered' }, // 有序
-      { list: 'bullet' }, // 无序列表的图标
-    ],
-    ['link', { background: [] }, 'code-block', 'fullscreen'],
-  ];
+  const openInsertTableDialog = () => {
+    insertTableDialogRef.value?.show();
+  };
+
+  // 与「编辑事件调查报告」一致的工具栏，额外保留全屏
+  const mediaTools: Array<string | Record<string, unknown>> = ['link'];
   if (props.supportImage) {
-    container[2].splice(0, 0, 'image');
+    mediaTools.push('image');
   }
+  mediaTools.push('video', 'table');
+  if (props.supportFullscreen) {
+    mediaTools.push('fullscreen');
+  }
+
+  const container = [
+    [{ header: [1, 2, 3, 4, 5, 6, false] }],
+    [{ font: [] }],
+    [{ size: [] }],
+    ['bold', 'italic', 'underline', 'strike'],
+    [{ color: [] }, { background: [] }],
+    [{ script: 'sub' }, { script: 'super' }],
+    [{ header: 1 }, { header: 2 }, 'blockquote', 'code-block'],
+    [{ list: 'ordered' }, { list: 'bullet' }, { indent: '-1' }, { indent: '+1' }],
+    [{ direction: 'rtl' }, { align: [] }],
+    mediaTools,
+    ['clean'],
+  ];
   const isFullscreen = ref(false);
+  const isExpanded = computed(() => isFullscreen.value);
+
+  const PARENT_COLLAPSED_HEIGHT = 180;
+
+  const dockBoostState = inject<{
+    isEditorBoosted: Ref<boolean>;
+    panelHeight: Ref<number>;
+  } | null>('dockBoostState', null);
+
+  const getReservedBottomHeight = (editorWrap: HTMLElement) => {
+    const editorFormItem = editorWrap.closest('.bk-form-item');
+    const awaitDealForm = editorWrap.closest('.risk-await-deal-wrap');
+    let reserved = 24;
+    if (editorFormItem && awaitDealForm) {
+      let sibling = editorFormItem.nextElementSibling;
+      while (sibling) {
+        reserved += (sibling as HTMLElement).getBoundingClientRect().height + 8;
+        sibling = sibling.nextElementSibling;
+      }
+    }
+    return reserved;
+  };
+
+  const getParentExpandHeight = () => {
+    const editorWrap = editorWrapRef.value;
+    if (!editorWrap) {
+      return props.expandHeight;
+    }
+    const dockBody = editorWrap.closest('.risk-handle-dock__body') as HTMLElement | null;
+    if (dockBody) {
+      const bodyRect = dockBody.getBoundingClientRect();
+      const editorRect = editorWrap.getBoundingClientRect();
+      const reservedBottom = getReservedBottomHeight(editorWrap);
+      const availableHeight = bodyRect.bottom - editorRect.top - reservedBottom;
+      return Math.max(280, availableHeight);
+    }
+    return props.expandHeight;
+  };
+
+  const applyParentExpandHeight = () => {
+    const editorWrap = editorWrapRef.value;
+    if (!editorWrap) {
+      return;
+    }
+    const height = getParentExpandHeight();
+    editorWrap.style.setProperty('--editor-expanded-height', `${height}px`);
+    editorWrap.style.setProperty('--editor-collapsed-height', `${PARENT_COLLAPSED_HEIGHT}px`);
+  };
+
+  const scheduleApplyParentExpandHeight = () => {
+    applyParentExpandHeight();
+    requestAnimationFrame(() => {
+      applyParentExpandHeight();
+      requestAnimationFrame(applyParentExpandHeight);
+    });
+    setTimeout(applyParentExpandHeight, 220);
+  };
+
+  const clearParentExpandHeight = () => {
+    const editorWrap = editorWrapRef.value;
+    if (!editorWrap) {
+      return;
+    }
+    editorWrap.style.removeProperty('--editor-expanded-height');
+    editorWrap.style.removeProperty('--editor-collapsed-height');
+  };
+
+  const toggleParentExpand = async () => {
+    if (!isFullscreen.value) {
+      emits('expand-change', true);
+      await nextTick();
+      scheduleApplyParentExpandHeight();
+      isFullscreen.value = true;
+    } else {
+      isFullscreen.value = false;
+      clearParentExpandHeight();
+      emits('expand-change', false);
+    }
+  };
+
+  if (dockBoostState) {
+    watch(
+      () => [dockBoostState.isEditorBoosted.value, dockBoostState.panelHeight.value],
+      () => {
+        if (isFullscreen.value) {
+          scheduleApplyParentExpandHeight();
+        }
+      },
+    );
+  }
+  interface FullscreenBounds {
+    top: number;
+    left: number;
+    width: number;
+    height: number;
+  }
+
+  const getFullscreenContainer = (): HTMLElement | null => {
+    const editorWrap = editorWrapRef.value;
+    if (!editorWrap) {
+      return null;
+    }
+    switch (props.fullscreenScope) {
+    case 'main':
+      return document.querySelector('.audit-navigation-main') as HTMLElement;
+    case 'viewport':
+    default:
+      return null;
+    }
+  };
+
+  const getFullscreenBounds = (): FullscreenBounds => {
+    if (props.fullscreenScope === 'viewport') {
+      return {
+        top: 0,
+        left: 0,
+        width: window.innerWidth,
+        height: window.innerHeight,
+      };
+    }
+    const container = getFullscreenContainer();
+    if (!container) {
+      return {
+        top: 0,
+        left: 0,
+        width: window.innerWidth,
+        height: window.innerHeight,
+      };
+    }
+    const rect = container.getBoundingClientRect();
+    return {
+      top: rect.top,
+      left: rect.left,
+      width: rect.width,
+      height: rect.height,
+    };
+  };
+
+  const applyFullscreenBounds = () => {
+    const editorWrap = editorWrapRef.value;
+    if (!editorWrap || !isFullscreen.value) {
+      return;
+    }
+    const bounds = getFullscreenBounds();
+    editorWrap.style.top = `${bounds.top}px`;
+    editorWrap.style.left = `${bounds.left}px`;
+    editorWrap.style.width = `${bounds.width}px`;
+    editorWrap.style.height = `${bounds.height}px`;
+  };
+
+  const clearFullscreenBounds = () => {
+    const editorWrap = editorWrapRef.value;
+    if (!editorWrap) {
+      return;
+    }
+    editorWrap.style.top = '';
+    editorWrap.style.left = '';
+    editorWrap.style.width = '';
+    editorWrap.style.height = '';
+  };
+
+  const exitFullscreen = () => {
+    const editorWrap = editorWrapRef.value;
+    if (!editorWrap || !isFullscreen.value) {
+      return;
+    }
+    if (props.fullscreenScope === 'parent') {
+      clearParentExpandHeight();
+      isFullscreen.value = false;
+      emits('expand-change', false);
+      return;
+    }
+    editorWrap.classList.remove(
+      'fullscreen-mode',
+      'fullscreen-mode--main',
+      'fullscreen-mode--viewport',
+    );
+    clearFullscreenBounds();
+    if (props.fullscreenScope === 'viewport') {
+      document.body.style.overflow = '';
+    }
+    isFullscreen.value = false;
+    window.removeEventListener('resize', applyFullscreenBounds);
+    window.removeEventListener('scroll', applyFullscreenBounds, true);
+  };
+
+  // 全屏/放大切换
+  const toggleFullscreen = () => {
+    if (props.fullscreenScope === 'parent') {
+      toggleParentExpand();
+      return;
+    }
+    const editorWrap = editorWrapRef.value;
+    if (!editorWrap) return;
+
+    if (!isFullscreen.value) {
+      editorWrap.classList.add('fullscreen-mode');
+      if (props.fullscreenScope === 'viewport') {
+        editorWrap.classList.add('fullscreen-mode--viewport');
+        document.body.style.overflow = 'hidden';
+      } else {
+        editorWrap.classList.add('fullscreen-mode--main');
+      }
+      applyFullscreenBounds();
+      isFullscreen.value = true;
+      window.addEventListener('resize', applyFullscreenBounds);
+      window.addEventListener('scroll', applyFullscreenBounds, true);
+    } else {
+      exitFullscreen();
+    }
+  };
+
   const options = reactive({
     modules: {
       toolbar: {
         container,
         handlers: {
           image() {
-            const html = document.querySelector('.editor-wrap #editor-upload-image .bk-upload-trigger__draggable-upload-link') as HTMLElement;
-            if (html) {
-              html.click();
+            if (!props.supportImage || props.disabled) return;
+            imageInputRef.value?.click();
+          },
+          table: openInsertTableDialog,
+          ...(props.supportFullscreen
+            ? {
+              fullscreen() {
+                toggleFullscreen();
+              },
             }
-          },
-          fullscreen() {
-            toggleFullscreen();
-          },
+            : {}),
         },
       },
       history: {
@@ -161,28 +402,31 @@
     },
   });
 
-  // 全屏切换功能
-  const toggleFullscreen = () => {
-    const editorWrap = document.querySelector('.editor-wrap') as HTMLElement;
-    if (!editorWrap) return;
+  const getQuill = () => editorRef.value?.getQuill?.();
 
-    if (!isFullscreen.value) {
-      // 进入全屏
-      editorWrap.classList.add('fullscreen-mode');
-      document.body.style.overflow = 'hidden';
-      isFullscreen.value = true;
-    } else {
-      // 退出全屏
-      editorWrap.classList.remove('fullscreen-mode');
-      document.body.style.overflow = '';
-      isFullscreen.value = false;
+  const setupTableToolbarButton = () => {
+    const quill = getQuill();
+    if (!quill) return;
+    const toolbar = quill.getModule('toolbar') as { container?: HTMLElement } | undefined;
+    const tableButton = toolbar?.container?.querySelector('.ql-table') as HTMLElement | null;
+    if (tableButton) {
+      tableButton.innerHTML = t('插入表格');
+      tableButton.setAttribute('title', t('插入表格'));
+      tableButton.classList.add('editor-table-btn');
     }
+  };
+
+  const handleInsertTableConfirm = ({ rows, cols }: { rows: number; cols: number }) => {
+    const quill = getQuill();
+    if (!quill) return;
+    insertReportTable(quill, rows, cols);
+    TiLength.value = quill.getLength() - 1;
   };
 
   // 监听ESC键退出全屏
   const handleKeydown = (event: KeyboardEvent) => {
     if (event.key === 'Escape' && isFullscreen.value) {
-      toggleFullscreen();
+      exitFullscreen();
     }
   };
 
@@ -197,14 +441,31 @@
     },
   );
 
+  // 粘贴 HTML 统一消毒，避免 clipboard / 用户输入导致 XSS
+  const PASTE_HTML_SANITIZE_OPTIONS = {
+    USE_PROFILES: { html: true },
+    ADD_ATTR: ['style', 'colspan', 'rowspan', 'target'],
+    // 粘贴流程需短暂保留 data:image，上传后再替换为远端 URL
+    // 将 - 放在字符类末尾，避免 .-: 被解析为过宽字符范围（CodeQL）
+    ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|cid|xmpp|data):|[^a-z]|[a-z+.-]+(?:[^a-z+.:-]|$))/i,
+  };
+
+  const sanitizePastedHtml = (html: string) => {
+    if (!html) {
+      return '';
+    }
+    return DOMPurify.sanitize(html, PASTE_HTML_SANITIZE_OPTIONS);
+  };
+
   // 提取编辑器内容中的图片
   const extractImagesFromContent = (htmlContent: string) => {
+    if (!props.showImagePreview) return;
     if (!htmlContent) {
       editorImages.value = [];
       return;
     }
     const parser = new DOMParser();
-    const doc = parser.parseFromString(htmlContent, 'text/html');
+    const doc = parser.parseFromString(sanitizePastedHtml(htmlContent), 'text/html');
     const imgElements = doc.querySelectorAll('img');
 
     const images = Array.from(imgElements).map(img => ({
@@ -240,47 +501,80 @@
   };
 
   const onEditorReady = () => {
+    const quill = getQuill();
+    if (quill) {
+      registerReportTableMatcher(quill);
+    }
     nextTick(() => {
+      setupTableToolbarButton();
       if (props.default) {
         content.value = props.default;
         // 提取默认内容中的图片
         extractImagesFromContent(props.default);
       }
+      normalizeEditorImages();
       TiLength.value = editorRef.value?.getQuill().getLength() - 1;
     });
-  };
-  const handleRes = (response: any) => {
-    if (response.result) {
-      successData.value = response.data;
-      return true;
-    }
-    return false;
   };
   const onImageLoadSuccess = () => {
     insertImage();
   };
+
+  const normalizeEditorImages = (root?: ParentNode | null, target?: HTMLImageElement) => {
+    const container = root || editorRef.value?.getQuill()?.root;
+    const imageNodes = target
+      ? [target]
+      : Array.from(container?.querySelectorAll('img') ?? []) as HTMLImageElement[];
+    for (let index = 0; index < imageNodes.length; index += 1) {
+      const imageElement = imageNodes[index];
+      imageElement.removeAttribute('width');
+      imageElement.removeAttribute('height');
+      imageElement.style.maxWidth = '100%';
+      imageElement.style.height = 'auto';
+      imageElement.style.verticalAlign = 'bottom';
+    }
+  };
+
   const insertImage = () => {
     const quill = editorRef.value?.getQuill();
-    const length = quill.getSelection().index;
+    if (!quill || !successData.value?.length) return;
+    const range = quill.getSelection(true);
+    const length = range ? range.index : quill.getLength();
+    const imageUrl = successData.value[0].url;
 
-    // 插入图片
-    if (successData.value && successData.value.length) {
-      quill.insertEmbed(length, 'image', successData.value[0].url);
-    }
+    quill.insertEmbed(length, 'image', imageUrl);
 
-    // 设置插入图片的高度为 100%
-    const imageElement = quill.root.querySelector(`.ql-editor img[src="${successData.value?.[0]?.url || ''}"]`);
+    const imageElement = quill.root.querySelector(`img[src="${imageUrl}"]`) as HTMLImageElement | null;
     if (imageElement) {
-      imageElement.setAttribute('width', '30%');
-      imageElement.setAttribute('height', '30%');
+      normalizeEditorImages(undefined, imageElement);
     }
 
-    // 调整光标到最后
     quill.setSelection(length + 1);
     messageSuccess('上传图片成功');
   };
   const onImageLoadError = () => {
     messageError('上传图片失败');
+  };
+
+  const onImageFileChange = (event: Event) => {
+    const input = event.target as HTMLInputElement;
+    const { files } = input;
+    if (!files?.length) return;
+
+    fetchUploadImage(files).then((data) => {
+      if (!data?.data?.length) {
+        onImageLoadError();
+        return;
+      }
+      successData.value = data.data as ResponseData['data'];
+      onImageLoadSuccess();
+    })
+      .catch(() => {
+        onImageLoadError();
+      })
+      .finally(() => {
+        input.value = '';
+      });
   };
 
   const extractUrls = (text: string) => {
@@ -359,60 +653,398 @@
   };
 
 
+  const getActiveReportTableCell = (evt: ClipboardEvent) => {
+    const path = typeof evt.composedPath === 'function' ? evt.composedPath() : [];
+    for (let i = 0; i < path.length; i += 1) {
+      const node = path[i];
+      if (!(node instanceof HTMLElement)) {
+        continue;
+      }
+      const cell = node.closest('td, th');
+      if (cell?.closest('.ql-report-table')) {
+        return cell as HTMLTableCellElement;
+      }
+    }
+    const active = document.activeElement;
+    if (active instanceof HTMLElement && active.closest('.ql-report-table')) {
+      const cell = active.closest('td, th');
+      if (cell) {
+        return cell as HTMLTableCellElement;
+      }
+    }
+    return null;
+  };
+
+  const ensureSelectionInTableCell = (cell: HTMLTableCellElement) => {
+    const selection = window.getSelection();
+    if (!selection) {
+      return;
+    }
+    if (selection.rangeCount > 0) {
+      const range = selection.getRangeAt(0);
+      if (cell.contains(range.commonAncestorContainer)) {
+        return;
+      }
+    }
+    const range = document.createRange();
+    range.selectNodeContents(cell);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+
+  const isTableCellPlaceholderOnly = (cell: HTMLTableCellElement) => {
+    const normalized = cell.innerHTML
+      .replace(/&nbsp;/gi, ' ')
+      .trim()
+      .toLowerCase();
+    return normalized === '' || normalized === '<br>' || normalized === '<br/>';
+  };
+
+  const prepareTableCellForPaste = (targetCell: HTMLTableCellElement) => {
+    if (isTableCellPlaceholderOnly(targetCell)) {
+      targetCell.replaceChildren();
+    }
+  };
+
+  const trimPlainTextForTableCell = (text: string) => text
+    .replace(/\r\n/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .replace(/\n+$/g, '');
+
+  const normalizePastedHtmlForTableCell = (rawHtml: string) => {
+    const safeRawHtml = sanitizePastedHtml(rawHtml);
+    if (!safeRawHtml) {
+      return '';
+    }
+    const parser = new DOMParser();
+    // 先消毒再解析，避免将未信任 HTML 直接拼进模板字符串
+    const doc = parser.parseFromString(safeRawHtml, 'text/html');
+    const root = doc.body;
+    root.querySelectorAll('meta, style, link').forEach(node => node.remove());
+    const blockTags = ['P', 'DIV', 'LI', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6'];
+    root.querySelectorAll(blockTags.join(',')).forEach((block) => {
+      const parent = block.parentElement;
+      if (!parent) {
+        return;
+      }
+      while (block.firstChild) {
+        parent.insertBefore(block.firstChild, block);
+      }
+      block.remove();
+    });
+    let normalizedHtml = root.innerHTML.trim();
+    normalizedHtml = normalizedHtml.replace(/^(\s|<br\s*\/?>)+/gi, '');
+    normalizedHtml = normalizedHtml.replace(/(\s|<br\s*\/?>)+$/gi, '');
+    return sanitizePastedHtml(normalizedHtml);
+  };
+
+  const setTableCellHtmlContent = (targetCell: HTMLTableCellElement, html: string) => {
+    const normalized = normalizePastedHtmlForTableCell(html);
+    const safeHtml = sanitizePastedHtml(normalized);
+    targetCell.replaceChildren();
+    if (safeHtml) {
+      targetCell.insertAdjacentHTML('beforeend', safeHtml);
+    } else {
+      targetCell.append(document.createElement('br'));
+    }
+  };
+
+  const cleanupTableCellTrailingBr = (targetCell: HTMLTableCellElement) => {
+    const hasText = (targetCell.textContent || '').replace(/\u00a0/g, ' ').trim().length > 0;
+    if (!hasText) {
+      if (!targetCell.querySelector('img') && !targetCell.textContent?.trim()) {
+        targetCell.replaceChildren();
+        targetCell.append(document.createElement('br'));
+      }
+      return;
+    }
+    Array.from(targetCell.querySelectorAll('br')).forEach((br) => {
+      let sibling = br.nextSibling;
+      while (sibling && sibling.nodeType === Node.TEXT_NODE && !sibling.textContent?.trim()) {
+        sibling = sibling.nextSibling;
+      }
+      if (!sibling) {
+        br.remove();
+      }
+    });
+    const { firstChild } = targetCell;
+    if (firstChild?.nodeName === 'BR' && targetCell.childNodes.length > 1) {
+      firstChild.remove();
+    }
+  };
+
+  const finishTableCellPaste = (cell: HTMLTableCellElement) => {
+    cleanupTableCellTrailingBr(cell);
+    ensureSelectionInTableCell(cell);
+    notifyEditorContentChange();
+  };
+
+  const insertHtmlIntoTableCell = (html: string) => {
+    const selection = window.getSelection();
+    if (!selection || selection.rangeCount === 0) {
+      return false;
+    }
+    const range = selection.getRangeAt(0);
+    range.deleteContents();
+    const template = document.createElement('template');
+    template.innerHTML = sanitizePastedHtml(html);
+    range.insertNode(template.content);
+    range.collapse(false);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    return true;
+  };
+
+  const pastePlainTextIntoTableCell = (text: string) => {
+    const trimmed = trimPlainTextForTableCell(text);
+    if (!trimmed) {
+      return;
+    }
+    if (document.queryCommandSupported('insertText')) {
+      document.execCommand('insertText', false, trimmed);
+      return;
+    }
+    insertHtmlIntoTableCell(trimmed.replace(/\n/g, '<br>'));
+  };
+
+  const notifyEditorContentChange = () => {
+    nextTick(() => {
+      const quillInstance = editorRef.value?.getQuill();
+      quillInstance?.root.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  };
+
+  const getTableCellPosition = (cell: HTMLTableCellElement) => {
+    const row = cell.parentElement as HTMLTableRowElement | null;
+    const table = cell.closest('table');
+    if (!row || !table) {
+      return null;
+    }
+    const rows = Array.from(table.querySelectorAll('tr'));
+    const rowIndex = rows.indexOf(row);
+    const cells = Array.from(row.querySelectorAll('td, th'));
+    const colIndex = cells.indexOf(cell);
+    if (rowIndex < 0 || colIndex < 0) {
+      return null;
+    }
+    return {
+      rowIndex,
+      colIndex,
+      rows,
+    };
+  };
+
+  const getTableCellAt = (
+    table: HTMLTableElement,
+    rowIndex: number,
+    colIndex: number,
+  ): HTMLTableCellElement | null => {
+    const row = table.querySelectorAll('tr')[rowIndex];
+    if (!row) {
+      return null;
+    }
+    const cells = row.querySelectorAll('td, th');
+    return (cells[colIndex] as HTMLTableCellElement) || null;
+  };
+
+  const pasteGridPlainTextIntoTable = (startCell: HTMLTableCellElement, plainText: string) => {
+    const table = startCell.closest('table');
+    const position = getTableCellPosition(startCell);
+    if (!table || !position) {
+      pastePlainTextIntoTableCell(plainText);
+      return;
+    }
+    const lines = plainText.replace(/\r\n/g, '\n').split('\n');
+    while (lines.length > 0 && lines[lines.length - 1] === '') {
+      lines.pop();
+    }
+    lines.forEach((line, rowOffset) => {
+      const values = line.split('\t');
+      values.forEach((value, colOffset) => {
+        const target = getTableCellAt(
+          table,
+          position.rowIndex + rowOffset,
+          position.colIndex + colOffset,
+        );
+        if (target) {
+          target.textContent = value;
+        }
+      });
+    });
+  };
+
+  const handleTableCellPaste = async (evt: ClipboardEvent, tableCell: HTMLTableCellElement) => {
+    evt.preventDefault();
+    evt.stopPropagation();
+
+    const { clipboardData } = evt;
+    if (!clipboardData) {
+      return;
+    }
+    if (clipboardData.files && clipboardData.files.length > 0) {
+      return;
+    }
+
+    tableCell.focus();
+    prepareTableCellForPaste(tableCell);
+    ensureSelectionInTableCell(tableCell);
+
+    const plainText = trimPlainTextForTableCell(clipboardData.getData('text/plain'));
+    const rawHtml = clipboardData.getData('text/html');
+    const html = rawHtml
+      ? sanitizePastedHtml(rawHtml)
+      : '';
+    const hasBase64Image = Boolean(html && /<img[\s\S]*?src=["']data:image\//i.test(html));
+    const isGridPaste = plainText.includes('\t')
+      || (plainText.includes('\n') && hasTableContent(html || ''));
+
+    try {
+      if (isGridPaste) {
+        pasteGridPlainTextIntoTable(tableCell, plainText);
+        return;
+      }
+
+      if (hasBase64Image && html) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        const imgTags = doc.querySelectorAll('img');
+        const promises: Promise<void>[] = [];
+        imgTags.forEach((imgTag) => {
+          const imageElement = imgTag as HTMLImageElement;
+          imageElement.removeAttribute('width');
+          imageElement.removeAttribute('height');
+          imageElement.style.maxWidth = '100%';
+          imageElement.style.height = 'auto';
+          imageElement.style.verticalAlign = 'bottom';
+          if (imageElement.src.startsWith('data:image/')) {
+            promises.push(uploadImage(imageElement.src).then((url) => {
+              if (url) {
+                imageElement.src = url;
+              }
+            }));
+          }
+        });
+        await Promise.all(promises);
+        const contentHtml = normalizePastedHtmlForTableCell(doc.body.innerHTML);
+        if (isTableCellPlaceholderOnly(tableCell)) {
+          setTableCellHtmlContent(tableCell, contentHtml);
+        } else {
+          insertHtmlIntoTableCell(contentHtml);
+        }
+        nextTick(() => normalizeEditorImages(tableCell));
+        return;
+      }
+
+      if (html && hasTableContent(html)) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        const cells = doc.querySelectorAll('td, th');
+        if (cells.length === 1) {
+          setTableCellHtmlContent(tableCell, cells[0].innerHTML || plainText);
+        } else {
+          pastePlainTextIntoTableCell(plainText);
+        }
+        return;
+      }
+
+      if (html && html.trim()) {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        const contentHtml = normalizePastedHtmlForTableCell(doc.body.innerHTML);
+        if (isTableCellPlaceholderOnly(tableCell) || !tableCell.textContent?.trim()) {
+          setTableCellHtmlContent(tableCell, contentHtml);
+        } else if (!insertHtmlIntoTableCell(contentHtml)) {
+          const safeHtml = sanitizePastedHtml(contentHtml);
+          if (safeHtml) {
+            tableCell.insertAdjacentHTML('beforeend', safeHtml);
+          } else {
+            tableCell.append(document.createElement('br'));
+          }
+        }
+      } else {
+        pastePlainTextIntoTableCell(plainText);
+      }
+    } finally {
+      finishTableCellPaste(tableCell);
+    }
+  };
+
   onMounted(() => {
     document.addEventListener('keydown', handleKeydown);
     const quill = editorRef.value?.getQuill();
     editorRef.value?.setHTML(props.default);
     if (quill) {
+      nextTick(() => normalizeEditorImages(quill.root));
       quill.root.addEventListener(
         'paste',
-        async (evt: any) => {
+        async (evt: ClipboardEvent) => {
           quill.enable(!props?.disabled); // source设置用户通过鼠标或键盘等输入设备进行编辑的能力。当"api"或 时，不会影响 API 调用的功能"silent"。
-          const clipboardData = evt.clipboardData || evt.originalEvent.clipboardData;
-          if (clipboardData) {
-            const html = clipboardData.getData('text/html');
-            if (html) {
-              evt.preventDefault();
-              const parser = new DOMParser();
-              const doc = parser.parseFromString(html, 'text/html');
-              const imgTags = doc.querySelectorAll('img');
-              const promises: Promise<void>[] = [];
+          const clipboardData = evt.clipboardData || (evt as any).originalEvent?.clipboardData;
+          if (!clipboardData) {
+            return;
+          }
 
-              // base64图片拦截处理
-              if (imgTags.length > 0) {
-                imgTags.forEach((imgTag) => {
-                  imgTag.setAttribute('width', '100%');
-                  imgTag.setAttribute('height', '100%');
-                  const base64Image = imgTag.src;
-                  // base64
-                  if (base64Image.startsWith('data:image/')) {
-                    promises.push(uploadImage(base64Image).then((url) => {
-                      // eslint-disable-next-line no-param-reassign
-                      imgTag.src = url; // 替换为上传后的 URL
-                    }));
-                  }
-                });
-                await Promise.all(promises);
-              }
-              quill.focus();
-              if (quill.getSelection()) {
-                quill.clipboard.dangerouslyPasteHTML(quill.getSelection().index, doc.body.innerHTML);
-              }
-            }
+          const tableCell = getActiveReportTableCell(evt);
+          if (tableCell) {
+            await handleTableCellPaste(evt, tableCell);
+            return;
+          }
 
-            // 单个文件检测处理
-            if (clipboardData && clipboardData.files && clipboardData.files.length) {
-              evt.preventDefault();
-              const { files } = clipboardData;
-              fetchUploadImage(files).then((data) => {
-                if (!data) return;
-                successData.value = data.data;
-                insertImage();
-              });
+          const rawHtml = clipboardData.getData('text/html');
+          const html = rawHtml
+            ? sanitizePastedHtml(rawHtml)
+            : '';
+          const hasFiles = clipboardData.files && clipboardData.files.length > 0;
+
+          if (html) {
+            evt.preventDefault();
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, 'text/html');
+            const imgTags = doc.querySelectorAll('img');
+            const promises: Promise<void>[] = [];
+
+            // base64图片拦截处理
+            if (imgTags.length > 0) {
+              for (let index = 0; index < imgTags.length; index += 1) {
+                const imgTag = imgTags[index] as HTMLImageElement;
+                imgTag.removeAttribute('width');
+                imgTag.removeAttribute('height');
+                imgTag.style.maxWidth = '100%';
+                imgTag.style.height = 'auto';
+                imgTag.style.verticalAlign = 'bottom';
+                const base64Image = imgTag.src;
+                // base64
+                if (base64Image.startsWith('data:image/')) {
+                  promises.push(uploadImage(base64Image).then((url) => {
+                    imgTag.src = url; // 替换为上传后的 URL
+                  }));
+                }
+              }
+              await Promise.all(promises);
             }
+            quill.focus();
+            const range = quill.getSelection(true);
+            const pasteIndex = range ? range.index : Math.max(0, quill.getLength() - 1);
+            quill.clipboard.dangerouslyPasteHTML(
+              pasteIndex,
+              sanitizePastedHtml(doc.body.innerHTML),
+            );
+            nextTick(() => normalizeEditorImages(quill.root));
+          }
+
+          // 单个文件检测处理
+          if (hasFiles) {
+            evt.preventDefault();
+            const { files } = clipboardData;
+            fetchUploadImage(files).then((data) => {
+              if (!data) return;
+              successData.value = data.data;
+              insertImage();
+            });
           }
         },
-        false,
+        true,
       );
     }
   });
@@ -420,6 +1052,7 @@
   // 组件卸载时移除事件监听
   onUnmounted(() => {
     document.removeEventListener('keydown', handleKeydown);
+    exitFullscreen();
   });
 </script>
 
@@ -467,21 +1100,53 @@
   padding-bottom: 10px;
 }
 
+/* parent 模式：原地增高，保持在文档流内 */
+.editor-wrap.expanded-mode {
+  display: flex;
+  flex-direction: column;
+  height: var(--editor-expanded-height, 360px);
+
+  .ql-container.ql-snow {
+    height: auto !important;
+    min-height: 0 !important;
+    transition: min-height .2s ease;
+    flex: 1;
+  }
+
+  .ql-editor {
+    flex: 1;
+    min-height: 0 !important;
+  }
+}
+
+.editor-wrap:not(.expanded-mode)[style*='--editor-collapsed-height'] .ql-container.ql-snow,
+.editor-wrap .ql-container.ql-snow {
+  transition: min-height .2s ease;
+}
+
 .ql-editor {
   color: black;
+
+  img {
+    display: inline;
+    height: auto;
+    max-width: 100%;
+    vertical-align: bottom;
+  }
 }
 
 /* 全屏模式样式 */
 .editor-wrap.fullscreen-mode {
   position: fixed;
-  top: 0;
-  left: 0;
   z-index: 9999;
-  width: 100vw !important;
-  height: 100vh !important;
-  padding: 20px;
+  display: flex;
+  padding: 12px 16px;
   margin: 0;
+  overflow: hidden;
   background: #fff;
+  box-shadow: 0 0 16px 0 rgb(0 0 0 / 12%);
+  box-sizing: border-box;
+  flex-direction: column;
 
   .ql-editor {
     color: black;
@@ -489,29 +1154,51 @@
   }
 
   .ql-toolbar {
-    padding: 10px 0 !important;
+    flex-shrink: 0;
+    padding: 8px 0 !important;
     background: #fff !important;
     border-bottom: 1px solid #ccc;
   }
 
   .ql-container.ql-snow {
-    height: calc(100vh - 300px) !important;
-    min-height: auto;
-    font-size: 16px;
+    height: auto !important;
+    min-height: 0;
+    font-size: 14px;
     line-height: 1.6;
     border: none;
+    flex: 1;
   }
 
   .editor-tip-len {
-    position: fixed;
-    right: 30px;
-    bottom: 30px;
-    padding: 5px 10px;
-    font-size: 14px;
-    color: #fff;
-    background: rgb(0 0 0 / 70%);
+    position: absolute;
+    right: 20px;
+    bottom: 16px;
+    padding: 4px 8px;
+    font-size: 12px;
+    color: #63656e;
+    background: rgb(255 255 255 / 90%);
     border-radius: 4px;
   }
+}
+
+.editor-wrap.fullscreen-mode--main {
+  z-index: 2100;
+}
+
+.editor-wrap.expanded-mode .ql-toolbar .ql-fullscreen::before {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  margin-top: 1px;
+  margin-left: -10px;
+  font-size: 16px;
+  line-height: 1;
+  vertical-align: top;
+  background-image: url('/static/images/field-type/zoom_out.svg');
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: contain;
+  content: '';
 }
 
 /* 全屏图标样式 */
@@ -549,5 +1236,50 @@
   background-repeat: no-repeat;
   background-size: contain;
   content: '';
+}
+
+.editor-wrap--report .ql-editor .ql-report-table {
+  margin: 0 0 16px;
+}
+
+.editor-wrap--report .ql-editor table {
+  width: 100%;
+  margin: 0 0 16px;
+  font-size: 14px;
+  border-collapse: collapse;
+  table-layout: auto;
+}
+
+.editor-wrap--report .ql-editor th,
+.editor-wrap--report .ql-editor td {
+  padding: 10px 12px;
+  color: #313238;
+  text-align: left;
+  vertical-align: top;
+  border: 1px solid #dcdee5;
+}
+
+.editor-wrap--report .ql-editor thead th {
+  font-weight: 600;
+  color: #313238;
+  background: #f5f7fa;
+}
+
+.editor-wrap--report .ql-toolbar .editor-table-btn {
+  width: auto !important;
+  padding: 0 8px !important;
+  margin: 0 4px;
+  font-size: 14px !important;
+  line-height: 24px !important;
+  color: #3a84ff !important;
+  cursor: pointer;
+  background: transparent !important;
+  border: none !important;
+  border-radius: 0;
+  box-shadow: none !important;
+}
+
+.editor-wrap--report .ql-toolbar .editor-table-btn:hover {
+  opacity: 80%;
 }
 </style>

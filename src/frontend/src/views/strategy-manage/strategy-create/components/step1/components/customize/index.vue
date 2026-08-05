@@ -42,42 +42,21 @@
             {{ t('数据源') }}
           </span>
           <bk-loading :loading="typeTableLoading">
-            <div
-              class="select-group"
-              :class="formData.configs.config_type === 'EventLog' ? 'select-group-grid' : ''">
+            <div class="select-group">
               <bk-form-item
-                v-if="allConfigTypeTable.length"
                 class="no-label"
                 label-width="0"
                 property="configs.config_type">
-                <bk-cascader
-                  v-slot="{data, node}"
+                <data-source-picker
                   v-model="tableId"
-                  :filter-method="configTypeTableFilter"
-                  filterable
-                  id-key="value"
+                  :decode-type-biz-id="decodeTypeBizId"
                   :list="allConfigTypeTable"
-                  name-key="label"
-                  :placeholder="t('搜索数据名称、别名、数据ID等')"
-                  trigger="hover"
-                  @change="handleChangeTable">
-                  <p
-                    v-bk-tooltips="{
-                      disabled: !data.disabled || !data.leaf,
-                      content: node.pathNames[0] === '资产数据'
-                        ? t('该系统暂未上报资源数据')
-                        : t('审计无权限，请前往BKBase申请授权'),
-                      delay: 400,
-                    }">
-                    {{ node.name }}
-                  </p>
-                </bk-cascader>
+                  :load-children="handlePickerLoadChildren"
+                  :mine-biz-rt-type="MINE_BIZ_RT_TYPE"
+                  :system-ids="formData.configs.data_source.system_ids"
+                  @change="handleChangeTable"
+                  @event-log-commit="handleEventLogCommit" />
               </bk-form-item>
-              <template v-if="formData.configs.config_type === 'EventLog'">
-                <event-log-component
-                  ref="eventLogRef"
-                  @update-system="handleUpdateSystem" />
-              </template>
             </div>
           </bk-loading>
           <!-- 联表详情 -->
@@ -101,7 +80,9 @@
         </bk-form-item>
         <bk-form-item
           label=""
-          label-width="160">
+          label-width="160"
+          property="configs.select"
+          required>
           <template #label>
             <span
               v-bk-tooltips="{
@@ -284,6 +265,8 @@
   import { useRoute } from 'vue-router';
 
   import LinkDataManageService from '@service/link-data-manage';
+  import CollectorManageService from '@service/collector-manage';
+  import MetaManageService from '@service/meta-manage';
   import StrategyManageService from '@service/strategy-manage';
 
   import LinkDataDetailModel from '@model/link-data/link-data-detail';
@@ -291,10 +274,10 @@
   import DatabaseTableFieldModel from '@model/strategy/database-table-field';
 
   import ExpectedResults from './components/expected-results/index.vue';
+  import DataSourcePicker from './components/data-source-picker.vue';
   import LinkDataDetailComponent from './components/link-table-detail/index.vue';
   import OtherTableDetailComponent from './components/other-table-detail/index.vue';
   import RulesComponent from './components/rules/index.vue';
-  import EventLogComponent from './components/scheme-input/event-log.vue';
   import StructurePreviewComponent from './components/structure-preview/index.vue';
 
   import useRequest from '@/hooks/use-request';
@@ -345,9 +328,12 @@
       label: string
       value: string
       version?: number
+      leaf?: boolean
+      disabled?: boolean
       children?: Array<{
         label: string
         value: string
+        leaf?: boolean
       }>
     }>
   }
@@ -355,7 +341,7 @@
     (e: 'updateFormData', value: IFormData): void
   }
   interface Expose {
-    getFields: () => IFormData;
+    getFields: (options?: { forValidate?: boolean }) => IFormData;
     typeTableLoading: boolean;
   }
   interface Props {
@@ -368,7 +354,6 @@
   const route = useRoute();
   const rulesComponentRef = ref();
   const expectedResultsRef = ref();
-  const eventLogRef = ref();
 
   const isEditMode = route.name === 'strategyEdit';
   const isCloneMode = route.name === 'strategyClone';
@@ -376,6 +361,8 @@
   const tableId = ref<Array<string>>([]);
   const previousTableId = ref<Array<string>>([]);
   let isInit = false;
+  // 编辑回显（尤其 MineBizRt 懒加载）可能较慢，用序号作废过期回写，避免覆盖用户新选择
+  let tableIdEchoSeq = 0;
 
   const formData = ref<IFormData>({
     configs: {
@@ -420,6 +407,64 @@
   const originalEditHaving = ref<Where | undefined>(undefined);
   const isWhereModified = ref(false);
   const isWhereSettingUp = ref(false);
+
+  // 仅 MineBizRt：点击第二列业务项后再带 bk_biz_id 懒加载第三列
+  // cascader 按单层 id 展开（getNodeById），跨类型重复的 bizId/rtId 会串选到「其他数据」
+  // 因此二级、三级 value 都绑上 tableType，选择/提交时再还原真实 id
+  const MINE_BIZ_RT_TYPE = 'MineBizRt';
+  const BIZ_ID_SEP = '__';
+  type BizChildNode = { label: string, value: string, leaf: boolean };
+  const bizChildrenCache = ref<Record<string, BizChildNode[]>>({});
+  const bizChildrenPending = new Map<string, Promise<BizChildNode[]>>();
+
+  const encodeTypeBizId = (tableType: string, bizId: string | number) => (
+    `${tableType}${BIZ_ID_SEP}${bizId}`
+  );
+  const decodeTypeBizId = (tableType: string, value: string | number) => {
+    const raw = String(value);
+    const prefix = `${tableType}${BIZ_ID_SEP}`;
+    return raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+  };
+
+  const replaceMineBizRtTree = (
+    bizId: string | number,
+    children: BizChildNode[],
+  ) => {
+    const encodedBizId = encodeTypeBizId(MINE_BIZ_RT_TYPE, bizId);
+    allConfigTypeTable.value = allConfigTypeTable.value.map((typeItem) => {
+      if (typeItem.value !== MINE_BIZ_RT_TYPE) {
+        return typeItem;
+      }
+      return {
+        ...typeItem,
+        children: (typeItem.children || []).map(bizItem => (
+          decodeTypeBizId(MINE_BIZ_RT_TYPE, bizItem.value) === String(bizId)
+            ? {
+              label: bizItem.label,
+              value: encodedBizId,
+              leaf: false,
+              children: children.map(child => ({
+                label: child.label,
+                value: encodeTypeBizId(
+                  MINE_BIZ_RT_TYPE,
+                  decodeTypeBizId(MINE_BIZ_RT_TYPE, child.value),
+                ),
+                leaf: true,
+              })),
+            }
+            : {
+              label: bizItem.label,
+              value: encodeTypeBizId(
+                MINE_BIZ_RT_TYPE,
+                decodeTypeBizId(MINE_BIZ_RT_TYPE, bizItem.value),
+              ),
+              leaf: false,
+              children: undefined,
+            }
+        )),
+      };
+    });
+  };
 
   const showStructure = ref(false);
   const currentViewRtId = ref<string | Array<string>>([]);
@@ -481,6 +526,161 @@
     defaultValue: [],
   });
 
+  const mapLazyLoadBizChildren = (data: Array<Record<string, any>>): ConfigTypeTableItem['children'] => data.map(bizItem => ({
+    label: String(bizItem.label ?? ''),
+    value: encodeTypeBizId(MINE_BIZ_RT_TYPE, bizItem.value),
+    leaf: false,
+  }));
+
+  const mapTableChildren = (
+    data: Array<Record<string, any>>,
+    tableType: string,
+  ): ConfigTypeTableItem['children'] => data.map(tableItem => ({
+    label: String(tableItem.label ?? ''),
+    // 第二/三列 value 加 tableType 前缀，避免 getNodeById 跨类型串选
+    value: tableType === 'EventLog'
+      ? String(tableItem.value)
+      : encodeTypeBizId(tableType, tableItem.value),
+    // 操作日志：点插件后再懒加载系统列表，与我的授权结果表一致
+    leaf: tableType === 'EventLog'
+      ? false
+      : !(tableItem.children && tableItem.children.length),
+    disabled: !(tableItem.children && tableItem.children.length) && tableType !== 'EventLog',
+    children: tableItem.children?.map((child: Record<string, any>) => ({
+      label: String(child.label ?? ''),
+      value: encodeTypeBizId(tableType, child.value),
+      leaf: !(child.children && child.children.length),
+    })),
+  }));
+
+  const getBizChildrenCacheKey = (tableType: string, bizId: string | number) => (
+    `${tableType}_${bizId}`
+  );
+
+  const loadBizTableChildren = (
+    tableType: string,
+    bizId: string | number,
+  ): Promise<BizChildNode[]> => {
+    const cacheKey = getBizChildrenCacheKey(tableType, bizId);
+    const cached = bizChildrenCache.value[cacheKey];
+    if (cached?.length) {
+      return Promise.resolve(cached);
+    }
+    const pending = bizChildrenPending.get(cacheKey);
+    if (pending) {
+      return pending;
+    }
+    const promise = StrategyManageService.fetchScenePermissionTable({
+      table_type: tableType,
+      bk_biz_id: bizId,
+      scene_id: getSceneSystemParams().scope_id,
+    }).then((data) => {
+      // 兼容：带 bk_biz_id 时可能直接返回子表，也可能仍返回业务树
+      let tableList = data as Array<Record<string, any>>;
+      if (tableList?.[0]?.children) {
+        const bizNode = tableList.find(item => String(item.value) === String(bizId));
+        tableList = bizNode?.children || [];
+      }
+      const children = tableList.map(item => ({
+        label: item.label,
+        value: encodeTypeBizId(tableType, item.value),
+        leaf: true,
+      }));
+      bizChildrenCache.value[cacheKey] = children;
+      bizChildrenPending.delete(cacheKey);
+      return children;
+    })
+      .catch((err) => {
+        bizChildrenPending.delete(cacheKey);
+        throw err;
+      });
+    bizChildrenPending.set(cacheKey, promise);
+    return promise;
+  };
+
+  const patchBizChildren = (
+    tableType: string,
+    bizId: string | number,
+    children: Array<{ label: string, value: string, leaf: boolean }>,
+  ) => {
+    const typeItem = allConfigTypeTable.value.find(item => item.value === tableType);
+    const encodedBizId = encodeTypeBizId(tableType, bizId);
+    const bizItem = typeItem?.children?.find(item => (
+      String(item.value) === encodedBizId
+      || decodeTypeBizId(tableType, item.value) === String(bizId)
+    ));
+    if (!bizItem) return;
+    bizItem.value = encodedBizId;
+    bizItem.children = children;
+    bizItem.leaf = false;
+    bizItem.disabled = false;
+  };
+
+  const syncBizChildrenCacheToList = () => {
+    Object.entries(bizChildrenCache.value).forEach(([cacheKey, children]) => {
+      // cacheKey: MineBizRt_47
+      const [tableType, ...bizIdParts] = cacheKey.split('_');
+      const bizId = bizIdParts.join('_');
+      if (!tableType || !bizId) return;
+      patchBizChildren(tableType, bizId, children);
+    });
+  };
+
+  const handlePickerLoadChildren = async (tableType: string, bizId: string) => {
+    if (tableType === 'EventLog') {
+      return loadEventLogSystems();
+    }
+    const children = await loadBizTableChildren(tableType, bizId);
+    patchBizChildren(tableType, bizId, children);
+    return children;
+  };
+
+  // 操作日志：点插件后懒加载系统列表（与 event-log 原逻辑一致）
+  const eventLogSystemCache = ref<BizChildNode[] | null>(null);
+  let eventLogSystemPending: Promise<BizChildNode[]> | null = null;
+
+  const loadEventLogSystems = async (): Promise<BizChildNode[]> => {
+    if (eventLogSystemCache.value?.length) {
+      return eventLogSystemCache.value;
+    }
+    if (eventLogSystemPending) {
+      return eventLogSystemPending;
+    }
+    eventLogSystemPending = (async () => {
+      const systems = await MetaManageService.fetchSystemWithAction({
+        action_ids: 'view_system',
+        scope_id: getSceneSystemParams().scope_id,
+        scope_type: 'scene',
+      });
+      const systemIds = (systems || []).map((item: { id: string }) => item.id).join(',');
+      if (!systemIds) {
+        eventLogSystemCache.value = [];
+        return [];
+      }
+      const statusMap = await CollectorManageService.fetchBatchSystemCollectorStatusList({
+        system_ids: systemIds,
+      });
+      const children = (systems || [])
+        .map((item: { id: string; name: string }) => ({
+          id: item.id,
+          name: item.name,
+          status: statusMap?.[item.id]?.status,
+        }))
+        .filter((item: { status?: string }) => item.status !== 'unset')
+        .map((item: { id: string; name: string }) => ({
+          label: item.name,
+          value: item.id,
+          leaf: true,
+        }));
+      eventLogSystemCache.value = children;
+      return children;
+    })()
+      .finally(() => {
+        eventLogSystemPending = null;
+      });
+    return eventLogSystemPending;
+  };
+
   // 获取联表tableid
   const {
     run: fetchLinkTableAll,
@@ -501,6 +701,7 @@
               label: tableItem.name,
               value: tableItem.uid,
               version: tableItem.version,
+              leaf: true,
             })),
           }];
         };
@@ -512,11 +713,9 @@
         });
         return [{
           ...item,
-          children: data.map(tableItem => ({
-            ...tableItem,
-            leaf: true,
-            disabled: !(tableItem.children && tableItem.children.length) && item.value !== 'EventLog',
-          })),
+          children: item.value === MINE_BIZ_RT_TYPE
+            ? mapLazyLoadBizChildren(data)
+            : mapTableChildren(data, item.value),
         }];
       };
     });
@@ -524,20 +723,10 @@
     Promise.all(requests.map(fn => fn()))
       .then((results) => {
         const flattenedResults = results.reduce((acc, curr) => acc.concat(curr), [] as Array<ConfigTypeTableItem>);
-        allConfigTypeTable.value = flattenedResults.filter(item => item.children && item.children.length > 0);
+        allConfigTypeTable.value = flattenedResults;
+        syncBizChildrenCacheToList();
         typeTableLoading.value = false;
       });
-  };
-
-  // 搜索数据源
-  const configTypeTableFilter = (node: Record<string, any>, key: string) => {
-    // 转换searchKey为小写以支持大小写不敏感的搜索
-    const lowercaseSearchKey = key.toLowerCase();
-    // 只匹配叶子节点
-    const isLeaf = !Array.isArray(node.children) || node.children.length === 0;
-    if (!isLeaf) return false;
-    return node.data.label.toLowerCase().includes(lowercaseSearchKey)
-      || node.data.value.toLowerCase().includes(lowercaseSearchKey);
   };
 
   // 选择tableid后，获取该table的可用调度方式
@@ -757,14 +946,25 @@
       connector: 'and',
       conditions: [],
     };
-    [eventLogRef, rulesComponentRef, expectedResultsRef].forEach(ref => ref.value?.resetFormData?.());
+    [rulesComponentRef, expectedResultsRef].forEach(ref => ref.value?.resetFormData?.());
   };
 
   // 选择tableid和数据源类型
-  const handleChangeTable = (value: Array<string>) => {
-    const handleTableChangeCore = (value: Array<string>) => {
-      const typeAndId = getFirstAndLast(value);
-      const { config_type: configType, rt_id_or_uid: rtIdOrUid  } = typeAndId;
+  const handleChangeTable = (
+    value: Array<string>,
+    options?: { systemIds?: string[] },
+  ) => {
+    // 用户主动选择时作废进行中的编辑回显，防止异步回写覆盖
+    tableIdEchoSeq += 1;
+    const systemIdsBackup = [...(formData.value.configs.data_source.system_ids || [])];
+
+    const handleTableChangeCore = (nextValue: Array<string>) => {
+      const typeAndId = getFirstAndLast(nextValue);
+      const { config_type: configType, rt_id_or_uid: encodedRtIdOrUid  } = typeAndId;
+      // 级联内部 value 带类型前缀，落库/拉字段需还原真实 id
+      const rtIdOrUid = configType && encodedRtIdOrUid
+        ? decodeTypeBizId(configType, encodedRtIdOrUid)
+        : encodedRtIdOrUid;
 
       // 更新数据源类型
       formData.value.configs.config_type = configType || '';
@@ -774,7 +974,7 @@
         resetDataSource();
         tableFields.value = [];
         // 更新前次记录
-        previousTableId.value = value;
+        previousTableId.value = nextValue;
         return;
       }
 
@@ -784,7 +984,20 @@
       }
 
       // 统一处理数据源设置
-      if (configType === 'LinkTable') {
+      if (configType === 'EventLog') {
+        // 路径：[EventLog, pluginId]；系统多选随 options.systemIds 提交
+        const pluginId = nextValue[1] || '';
+        formData.value.configs.data_source.rt_id = pluginId;
+        formData.value.configs.data_source.link_table.uid = '';
+        formData.value.configs.data_source.link_table.version = 0;
+        formData.value.configs.data_source.system_ids = options?.systemIds
+          ? [...options.systemIds]
+          : [];
+        if (pluginId) {
+          fetDatabaseTableFields(pluginId);
+          fetchSourceType({ config_type: configType, rt_id: pluginId });
+        }
+      } else if (configType === 'LinkTable') {
         formData.value.configs.data_source.link_table.uid = rtIdOrUid || '';
         formData.value.configs.data_source.rt_id = '';
         formData.value.configs.data_source.system_ids = [];
@@ -793,6 +1006,7 @@
         formData.value.configs.data_source.rt_id = rtIdOrUid || '';
         formData.value.configs.data_source.link_table.uid = '';
         formData.value.configs.data_source.link_table.version = 0;
+        formData.value.configs.data_source.system_ids = [];
         if (rtIdOrUid) {
           fetDatabaseTableFields(rtIdOrUid);
           fetchSourceType({ config_type: configType, rt_id: rtIdOrUid });
@@ -800,31 +1014,46 @@
       }
 
       // 更新前次记录
-      previousTableId.value = value;
+      previousTableId.value = nextValue;
     };
 
-    // 相同值返回
-    if (previousTableId.value.join(',') === value.join(',')) {
+    const samePath = previousTableId.value.join(',') === value.join(',');
+    if (samePath) {
+      // 操作日志仅变更系统多选
+      if (value[0] === 'EventLog' && options?.systemIds) {
+        formData.value.configs.data_source.system_ids = [...options.systemIds];
+      }
       return;
     }
+
+    const applyChange = () => {
+      tableId.value = [...value];
+      handleTableChangeCore(value);
+    };
 
     // 首次初始化或没有配置数据，直接处理
     if (!formData.value.configs.config_type || !hasData.value) {
-      handleTableChangeCore(value);
+      applyChange();
       return;
     }
-    // 已有配置时弹窗确认
+    // 已有配置时弹窗确认；确认后 onClose 也会触发，需跳过回退
+    let switchConfirmed = false;
     InfoBox(createInfoBoxConfig({
-      onConfirm: () => handleTableChangeCore(value),
+      onConfirm: () => {
+        switchConfirmed = true;
+        applyChange();
+      },
       onClose: () => {
-        tableId.value = previousTableId.value;
+        if (switchConfirmed) return;
+        tableId.value = [...previousTableId.value];
+        formData.value.configs.data_source.system_ids = systemIdsBackup;
       },
     }));
   };
 
-  // 更新系统
-  const handleUpdateSystem = (systemIds: Array<string>) => {
-    formData.value.configs.data_source.system_ids = systemIds;
+  // 操作日志：关闭面板时提交插件 + 系统多选
+  const handleEventLogCommit = (payload: { path: string[]; systemIds: string[] }) => {
+    handleChangeTable(payload.path, { systemIds: payload.systemIds });
   };
 
   // 更新预期数据
@@ -856,26 +1085,69 @@
     };
   };
 
-  const changeTableId = () => {
+  const extractBizIdFromRtId = (rtId: string) => {
+    if (!rtId) return '';
+    return rtId.split('_')[0];
+  };
+
+  const changeTableId = async () => {
+    tableIdEchoSeq += 1;
+    const echoSeq = tableIdEchoSeq;
+    const isEchoValid = () => echoSeq === tableIdEchoSeq;
+
     const tableItem = allConfigTypeTable.value.find(item => item.value === formData.value.configs.config_type);
     if (!tableItem) return;
-    // 联表和日志只有两层，直接拼接
+    // 操作日志：插件路径回显，系统多选走 system_ids
     if (tableItem.value === 'EventLog') {
-      tableId.value = [formData.value.configs.config_type, formData.value.configs.data_source.rt_id as string];
-      previousTableId.value = tableId.value ;
-      nextTick(() => {
-        eventLogRef.value?.setConfigs(formData.value.configs.data_source.system_ids);
-      });
+      if (!isEchoValid()) return;
+      const pluginId = formData.value.configs.data_source.rt_id as string;
+      await loadEventLogSystems();
+      if (!isEchoValid()) return;
+      tableId.value = [formData.value.configs.config_type, pluginId];
+      previousTableId.value = tableId.value;
     } else if (tableItem.value === 'LinkTable') {
+      if (!isEchoValid()) return;
       tableId.value = [formData.value.configs.config_type, formData.value.configs.data_source.link_table.uid];
       previousTableId.value = tableId.value ;
+    } else if (tableItem.value === MINE_BIZ_RT_TYPE) {
+      const rtId = formData.value.configs.data_source.rt_id as string;
+      const bizId = extractBizIdFromRtId(rtId);
+      if (!bizId) return;
+      // 编辑回显：先请求 bk_biz_id 对应子表，拼进完整三级树后再设值
+      const children = await loadBizTableChildren(tableItem.value, bizId);
+      if (!isEchoValid()) return;
+      const matchedChild = children.find((item) => {
+        const realValue = decodeTypeBizId(MINE_BIZ_RT_TYPE, item.value);
+        return realValue === rtId
+          || realValue === `${bizId}_${rtId}`
+          || realValue.endsWith(`_${rtId}`)
+          || item.label === rtId;
+      });
+      const selectedRtId = matchedChild?.value
+        || encodeTypeBizId(MINE_BIZ_RT_TYPE, rtId);
+      // 用接口返回的子表替换进树，确保展开时是「我的授权结果表」完整三级路径
+      replaceMineBizRtTree(bizId, children);
+      const echoPath = [
+        formData.value.configs.config_type,
+        encodeTypeBizId(MINE_BIZ_RT_TYPE, bizId),
+        selectedRtId,
+      ];
+      previousTableId.value = [...echoPath];
+      // 先清空再设值，避免旧路径干扰
+      tableId.value = [];
+      await nextTick();
+      if (!isEchoValid()) return;
+      tableId.value = echoPath;
+      await nextTick();
     } else {
       // 资产和其他数据还需要获取二级父id
       tableItem.children.forEach((item) => {
         if (item.children && item.children.length) {
           item.children.forEach((cItem) => {
-            if (cItem.value === formData.value.configs.data_source.rt_id) {
-              const id = [item.value, formData.value.configs.data_source.rt_id];
+            if (decodeTypeBizId(tableItem.value, cItem.value)
+              === formData.value.configs.data_source.rt_id) {
+              const id = [item.value, cItem.value];
+              if (!isEchoValid()) return;
               tableId.value = [formData.value.configs.config_type, ...id];
               previousTableId.value = tableId.value ;
             }
@@ -886,7 +1158,7 @@
   };
 
   // 编辑
-  const setFormData = (editData: any) => {
+  const setFormData = async (editData: any) => {
     formData.value.configs.config_type = editData.configs.config_type || '';
     formData.value.configs.schedule_config = editData.configs.schedule_config;
     formData.value.configs.select = editData.configs.select;
@@ -912,7 +1184,7 @@
       originSourceType.value = editData.configs.data_source.source_type as 'batch_join_source' |'stream_source' | '';
     }
     // 转换tableid,反显
-    changeTableId();
+    await changeTableId();
     if (formData.value.configs.config_type === 'LinkTable') {
       fetchLinkDataSheetDetail({
         uid: formData.value.configs.data_source.link_table.uid,
@@ -950,7 +1222,7 @@
 
   defineExpose<Expose>({
     // 获取提交参数
-    getFields() {
+    getFields(options?: { forValidate?: boolean }) {
       const params = _.cloneDeep(formData.value);
       const tableIdList = params.configs.data_source.rt_id;
       if (params.configs.config_type !== 'EventLog') {
@@ -961,104 +1233,84 @@
             : tableIdList) as string,
         };
       }
-      // 如果select为空数组，传全部
-      if (params.configs.select && params.configs.select.length === 0) {
-        // 通过一次遍历完成 display_name 的设置和统计
-        const displayNameCount = tableFields.value.reduce<Record<string, number>>(
-          (acc, item) => {
-            const displayName = `${item.display_name}${
-              item.aggregate ? `_${item.aggregate}` : ''
-            }`;
-            acc[displayName] = (acc[displayName] || 0) + 1;
-            return acc;
-          },
-          {},
-        );
-
-        // 更新 params.configs.select，使用统计结果调整 display_name
-        params.configs.select = tableFields.value.map((item) => {
-          const displayName = `${item.display_name}${
-            item.aggregate ? `_${item.aggregate}` : ''
-          }`;
-          return {
-            ...item,
-            aggregate: null,
-            display_name:
-              displayNameCount[displayName] > 1
-                ? `${item.table}.${item.display_name}`
-                : displayName,
+      // 同步display_name
+      params.configs.data_source.display_name = (params.configs.data_source.rt_id?.length > 1
+        ? params.configs.data_source.rt_id
+        : '') as string;
+      // 编辑且风险发现规则未改动：提交时沿用原始 where/having，避免 filter/filters 转换影响老数据
+      // 校验场景（forValidate）保持当前展示结构，避免误报「条件值不能为空」
+      if (!options?.forValidate) {
+        if (isEditMode && !isWhereModified.value) {
+          params.configs.where = _.cloneDeep(originalEditWhere.value as Where);
+          if (originalEditHaving.value) {
+            params.configs.having = _.cloneDeep(originalEditHaving.value);
+          } else {
+            delete params.configs.having;
+          }
+        } else if (params.configs.where) {
+          // 添加having参数
+          // 数据结构和where保持一致，将field的aggregate不为null的添加到having中
+          const having = {
+            connector: params.configs.where.connector,
+            conditions: params.configs.where.conditions
+              .map(group => ({
+                connector: group.connector,
+                index: group.index,
+                conditions: group.conditions.filter(item => typeof item.condition.field !== 'string' && item.condition.field?.aggregate),
+              }))
+              // 过滤掉没有聚合条件的组
+              .filter(group => group.conditions.length > 0),
           };
-        });
-        expectedResultsRef.value.setSelect(params.configs.select);
-      }
-      // 编辑且风险发现规则未改动：直接沿用原始 where/having，避免 filter/filters 转换影响老数据
-      if (isEditMode && !isWhereModified.value) {
-        params.configs.where = _.cloneDeep(originalEditWhere.value as Where);
-        if (originalEditHaving.value) {
-          params.configs.having = _.cloneDeep(originalEditHaving.value);
-        } else {
-          delete params.configs.having;
+          if (having.conditions.length > 0) {
+            params.configs.having = having;
+            // 将where中符合having的条件删除
+            params.configs.where.conditions = params.configs.where.conditions
+              .map(group => ({
+                connector: group.connector,
+                index: group.index,
+                conditions: group.conditions.filter(item => typeof item.condition.field !== 'string' && !item.condition.field?.aggregate),
+              }))
+              // 过滤掉没有聚合条件的组
+              .filter(group => group.conditions.length > 0);
+          } else {
+            delete params.configs.having;
+          }
+        }
+        // 处理 filter/filters 字段：eq 操作符值放 filter，其他操作符值放 filters
+        const transferFilter = (whereData: Where) => {
+          whereData.conditions.forEach((group) => {
+            group.conditions.forEach((_condItem, condIndex) => {
+              const { condition } = group.conditions[condIndex];
+              if (condition.operator === 'eq') {
+                // 等于操作符：将 filters 转移到 filter
+                if (condition.filters?.length) {
+                  condition.filter = Array.isArray(condition.filters)
+                    ? condition.filters.join(',')
+                    : condition.filters;
+                  condition.filters = [];
+                }
+              } else {
+                // 非等于操作符：将 filter 转移到 filters
+                if (condition.filter && !condition.filters?.length) {
+                  condition.filters = [condition.filter];
+                  condition.filter = '';
+                }
+              }
+            });
+          });
+        };
+        if (!(isEditMode && !isWhereModified.value)) {
+          if (params.configs.where) {
+            transferFilter(params.configs.where);
+          }
+          if (params.configs.having) {
+            transferFilter(params.configs.having);
+          }
         }
       } else if (params.configs.where) {
-        // 添加having参数
-        // 数据结构和where保持一致，将field的aggregate不为null的添加到having中
-        const having = {
-          connector: params.configs.where.connector,
-          conditions: params.configs.where.conditions
-            .map(group => ({
-              connector: group.connector,
-              index: group.index,
-              conditions: group.conditions.filter(item => typeof item.condition.field !== 'string' && item.condition.field?.aggregate),
-            }))
-            // 过滤掉没有聚合条件的组
-            .filter(group => group.conditions.length > 0),
-        };
-        if (having.conditions.length > 0) {
-          params.configs.having = having;
-          // 将where中符合having的条件删除
-          params.configs.where.conditions = params.configs.where.conditions
-            .map(group => ({
-              connector: group.connector,
-              index: group.index,
-              conditions: group.conditions.filter(item => typeof item.condition.field !== 'string' && !item.condition.field?.aggregate),
-            }))
-            // 过滤掉没有聚合条件的组
-            .filter(group => group.conditions.length > 0);
-        } else {
-          delete params.configs.having;
-        }
-      }
-      // 同步display_name
-      params.configs.data_source.display_name = (params.configs.data_source.rt_id?.length > 1 ? params.configs.data_source.rt_id : '') as string;
-      // 处理 filter/filters 字段：eq 操作符值放 filter，其他操作符值放 filters
-      const transferFilter = (whereData: Where) => {
-        whereData.conditions.forEach((group) => {
-          group.conditions.forEach((_condItem, condIndex) => {
-            const { condition } = group.conditions[condIndex];
-            if (condition.operator === 'eq') {
-              // 等于操作符：将 filters 转移到 filter
-              if (condition.filters?.length) {
-                condition.filter = Array.isArray(condition.filters)
-                  ? condition.filters.join(',')
-                  : condition.filters;
-                condition.filters = [];
-              }
-            } else {
-              // 非等于操作符：将 filter 转移到 filters
-              if (condition.filter && !condition.filters?.length) {
-                condition.filters = [condition.filter];
-                condition.filter = '';
-              }
-            }
-          });
-        });
-      };
-      if (!(isEditMode && !isWhereModified.value)) {
-        if (params.configs.where) {
-          transferFilter(params.configs.where);
-        }
+        params.configs.where = normalizeWhereForDisplay(params.configs.where) as Where;
         if (params.configs.having) {
-          transferFilter(params.configs.having);
+          params.configs.having = normalizeWhereForDisplay(params.configs.having) as Where;
         }
       }
       return params;
@@ -1095,15 +1347,11 @@
     padding: 16px 32px 24px;
 
     .select-group {
+      width: 100%;
+
       :deep(.bk-form-item) {
         margin-bottom: 0;
       }
-    }
-
-    .select-group-grid {
-      display: grid;
-      grid-template-columns: auto 1fr;
-      gap: 8px;
     }
 
     :deep(.bk-infobox-title) {

@@ -16,7 +16,6 @@
 */
 import type { Ref } from 'vue';
 import { h, resolveComponent, resolveDirective, withDirectives } from 'vue';
-import { useI18n } from 'vue-i18n';
 
 import type RiskManageModel from '@model/risk/risk';
 
@@ -27,6 +26,8 @@ import { RISK_STATUS_TAG_MAP } from '@views/risk-manage/constants';
 import RiskLevel from '@views/risk-manage/list/components/risk-level.vue';
 
 import { formatStrategyNameWithId } from '@utils/format-strategy-name';
+
+export type RiskColumnTranslate = (key: string, ...args: any[]) => string;
 
 export interface RiskColumnDeps {
   levelData: Ref<Record<string, any>>;
@@ -45,30 +46,26 @@ const createTextColumn = (title: string, colKey: string, minWidth = 320) => ({
   cell: (_h: any, { row }: { row: RiskManageModel }) => h(Tooltips, { data: (row as any)[colKey] }),
 });
 
-export const createRiskIdColumn = (routeName: string) => {
-  const { t } = useI18n();
-  return {
-    title: t('风险ID'),
-    colKey: 'risk_id',
-    width: 200,
-    minWidth: 180,
-    fixed: 'left',
-    ellipsis: true,
-    cell: (_h: any, { row }: { row: RiskManageModel }) => {
-      const RouterLink = resolveComponent('router-link');
-      const to = {
-        name: routeName,
-        params: { riskId: row.risk_id },
-      };
-      return h(RouterLink as any, { to }, () => [
-        h(Tooltips, { data: row.risk_id }),
-      ]);
-    },
-  };
-};
+export const createRiskIdColumn = (routeName: string, t: RiskColumnTranslate) => ({
+  title: t('风险ID'),
+  colKey: 'risk_id',
+  width: 200,
+  minWidth: 180,
+  fixed: 'left',
+  ellipsis: true,
+  cell: (_h: any, { row }: { row: RiskManageModel }) => {
+    const RouterLink = resolveComponent('router-link');
+    const to = {
+      name: routeName,
+      params: { riskId: row.risk_id },
+    };
+    return h(RouterLink as any, { to }, () => [
+      h(Tooltips, { data: row.risk_id }),
+    ]);
+  },
+});
 
-export const createBaseRiskColumns = (deps: RiskColumnDeps) => {
-  const { t } = useI18n();
+export const createBaseRiskColumns = (deps: RiskColumnDeps, t: RiskColumnTranslate) => {
   const statusToMap = RISK_STATUS_TAG_MAP;
   const { levelData, strategyTagMap, strategyList, riskStatusCommon, sceneList, handleToDetail } = deps;
 

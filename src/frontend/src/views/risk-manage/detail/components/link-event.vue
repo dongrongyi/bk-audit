@@ -17,574 +17,395 @@
 -->
 <template>
   <div class="risk-manage-detail-linkevent-part">
-    <div
-      v-if="hasLoadedData"
-      class="show-side-condition-btn"
-      :class="{ collapsed: isShowSide }"
-      :style="{ left: isShowSide ? '0px' : '164px' }">
-      <bk-button
-        class="show-more-btn"
-        text
-        :title="isShowSide ? t('展开列表') : t('收起列表')"
-        @click="() => {
-          isShowSide = !isShowSide;
-          isManuallyCollapsed = isShowSide;
-        }">
-        <audit-icon
-          :style="{ transform: isShowSide ? 'rotateZ(90deg)' : 'rotateZ(-90deg)' }"
-          type="angle-double-up" />
-      </bk-button>
-    </div>
-
-    <div class="title">
-      <span> {{ t('关联事件') }}</span>
-      <span
-        v-if="data.status !== 'closed'"
-        class="add-event"
-        @click="handleAddEvent">
-        <audit-icon
-          class="add-fill-event"
-          type="add-fill" />{{ t('新建关联事件') }}</span>
-    </div>
-    <bk-loading :loading="loading">
+    <bk-loading :loading="showListLoading">
       <div
         :key="detailRenderKey"
-        class="body">
+        class="body"
+        :class="{ 'is-section-title-mode': showSectionTitle }">
         <template v-if="hasLoadedData">
-          <div style="display: flex;width: 100%;">
-            <div
-              class="list"
-              :style="isShowSide ? 'width: 0; min-width: 0; max-width: 0;' : 'min-width: 164px;'">
-              <scroll-faker @scroll="handleScroll">
-                <transition name="draw">
-                  <div>
-                    <template v-if="linkEventList.length === 0">
-                      <div
-                        v-if="!isShowSide"
-                        class="list-item"
-                        style=" color: #979ba5;text-align: center;">
-                        {{ t('暂无数据') }}
-                      </div>
-                    </template>
-                    <template v-else>
-                      <div
-                        v-for="(item, index) in linkEventList"
-                        v-show="!isShowSide"
-                        :key="index"
-                        class="list-item"
-                        :class="[
-                          { active: active === index },
-                        ]"
-                        @click="handlerSelect(item, index)">
-                        {{ item?.event_time }}
-                      </div>
-                    </template>
-                  </div>
-                </transition>
-              </scroll-faker>
-            </div>
+          <!-- 无调查报告时（页签头隐藏）展示区块标题；有 Tab「关联事件列表」时不再重复 -->
+          <div
+            v-if="showSectionTitle"
+            class="link-event-section-title">
+            {{ t('关联事件列表') }}
+          </div>
+          <link-event-timeline
+            v-if="linkEventList.length > 0"
+            :active-index="active"
+            :events="linkEventList"
+            :has-more="hasMoreTimelineEvents"
+            :loading-more="isLoadingMore"
+            :show-add="data.status !== 'closed'"
+            @add="handleAddEvent"
+            @load-more="handleTimelineLoadMore"
+            @select="handlerSelectByIndex" />
+          <div
+            v-else-if="data.status !== 'closed'"
+            class="timeline-empty-action">
+            <span
+              class="add-event"
+              @click="handleAddEvent">
+              <audit-icon
+                class="add-fill-event"
+                type="add-fill" />
+              {{ t('新建关联事件') }}
+            </span>
+          </div>
 
-            <!-- detail -->
-            <div style="position: relative; width: 100%;">
-              <div
-                v-if="linkEventList.length === 0"
-                class="list-item-detail">
-                <bk-exception
-                  class="exception-part"
-                  scene="part"
-                  type="empty">
-                  {{ t('暂无数据') }}
-                </bk-exception>
-              </div>
-              <div
-                v-else-if="activeStatus === 'new' && newIndex.includes(active)"
-                class="list-item-detail event-create-detail-loading">
-                <bk-loading
-                  class="event-create-loading"
-                  loading
-                  mode="spin"
-                  size="small"
-                  theme="primary"
-                  :title="t('事件创建中')">
-                  <div class="event-create-loading-box" />
-                </bk-loading>
-              </div>
-              <div
-                v-else
-                class="list-item-detail">
-                <div style=" height: auto;padding-left: 12px;">
-                  <!-- 基本信息 -->
-                  <template v-if="basicInfo.length">
-                    <div class="title mt16">
-                      {{ t('基本信息') }}
-                    </div>
-                    <div class="base-info">
-                      <render-info-block
-                        v-for="(basicArr, basicIndex) in basicInfo"
-                        :key="basicIndex"
-                        class="flex mt16"
-                        style="justify-content: space-between; gap: 24px;">
-                        <render-info-item
-                          v-for="(basicItem, itemIndex) in basicArr"
-                          :key="itemIndex"
-                          :description="basicItem.description"
-                          :label="basicItem.field_name === 'strategy_id' ? t('风险命中策略(ID)') : basicItem.display_name"
-                          :label-width="labelWidth"
-                          :label-width-percent="25"
-                          style="flex-basis: 50%;">
-                          <!-- 策略id -->
-                          <template v-if="basicItem.field_name === 'strategy_id'">
-                            <bk-button
-                              v-if="getStrategyDisplayText(eventItem?.strategy_id)"
-                              text
-                              theme="primary"
-                              @click="handlerStrategy()">
-                              {{ getStrategyDisplayText(eventItem?.strategy_id) }}
-                            </bk-button>
-                            <span v-else> -- </span>
-                            <audit-icon
-                              v-bk-tooltips="t('复制')"
-                              class="copy-btn"
-                              type="copy"
-                              @click.stop="handleCopyValue(getStrategyDisplayText(eventItem?.strategy_id))" />
-                          </template>
-                          <!-- 其他字段 -->
-                          <template v-else>
-                            <!-- 有字段映射或者有证据下探 -->
-                            <bk-popover
-                              v-if="displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.isMappings
-                                || drillMap.get(basicItem.field_name)"
-                              placement="top"
-                              theme="black">
-                              <span
-                                :class="[
-                                  displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.isMappings
-                                    ? 'tips' : ''
-                                ]"
-                                :style="{
-                                  color: drillMap.get(basicItem.field_name) ? '#3a84ff' : '#313238',
-                                  cursor: drillMap.get(basicItem.field_name) ? 'pointer' : 'default',
-                                }"
-                                @click="handleUseTool(
-                                  drillMap.get(basicItem.field_name),
-                                  basicItem.field_name
-                                )">
-                                <span v-if="basicItem.field_name === 'operator'">
-                                  <edit-tag
-                                    :data="handleShowText(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value)"
-                                    :max="99"
-                                    :show-copy="false"
-                                    style="display: inline-block;"
-                                    @click="handleUseTool(
-                                      drillMap.get(basicItem.field_name),
-                                      basicItem.field_name
-                                    )" />
-                                </span>
-                                <span v-else>
-                                  {{ handleShowText(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value ) }}
-                                </span>
-                              </span>
-                              <template #content>
-                                <div>
-                                  <div
-                                    v-if="
-                                      displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.isMappings
-                                    ">
-                                    <span>{{ t('存储值: ') }}</span>
-                                    <span>
-                                      {{
-                                        displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.dict?.key
-                                      }}
-                                    </span>
-                                    <br>
-                                    <span>{{ t('展示文本: ') }}</span>
-                                    <span>
-                                      {{
-                                        displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.dict?.name
-                                      }}
-                                    </span>
-                                  </div>
-                                  <div
-                                    v-if="drillMap.get(basicItem.field_name)"
-                                    :style="{
-                                      // eslint-disable-next-line max-len
-                                      marginTop: displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.isMappings
-                                        ? '8px' : '0'
-                                    }">
-                                    {{ t('点击查看此字段的证据下探') }}
-                                  </div>
-                                </div>
-                              </template>
-                            </bk-popover>
-                            <!-- 没有字段映射或者没有证据下探 -->
-                            <span v-else>
+          <div
+            v-if="linkEventList.length === 0"
+            class="list-item-detail">
+            <bk-exception
+              class="exception-part"
+              scene="part"
+              type="empty">
+              {{ t('暂无数据') }}
+            </bk-exception>
+          </div>
+          <div
+            v-else-if="activeStatus === 'new' && newIndex.includes(active)"
+            class="list-item-detail event-create-detail-loading">
+            <bk-loading
+              class="event-create-loading"
+              loading
+              mode="spin"
+              size="small"
+              theme="primary"
+              :title="t('事件创建中')">
+              <div class="event-create-loading-box" />
+            </bk-loading>
+          </div>
+          <div
+            v-else
+            class="list-item-detail">
+            <div class="detail-content">
+              <!-- 基本信息 -->
+              <template v-if="basicInfo.length">
+                <div class="link-event-block-title">
+                  {{ t('基本信息') }}
+                </div>
+                <div class="base-info info-field-rows">
+                  <div
+                    v-for="(basicArr, basicIndex) in basicInfo"
+                    :key="basicIndex"
+                    class="info-field-row">
+                    <render-info-item
+                      v-for="(basicItem, itemIndex) in basicArr"
+                      :key="basicItem.field_name || itemIndex"
+                      :description="basicItem.description"
+                      :label="basicItem.field_name === 'strategy_id' ? t('风险命中策略(ID)') : basicItem.display_name"
+                      :label-width="labelWidth">
+                      <!-- 策略id -->
+                      <template v-if="basicItem.field_name === 'strategy_id'">
+                        <bk-button
+                          v-if="getStrategyDisplayText(eventItem?.strategy_id)"
+                          text
+                          theme="primary"
+                          @click="handlerStrategy()">
+                          {{ getStrategyDisplayText(eventItem?.strategy_id) }}
+                        </bk-button>
+                        <span v-else> -- </span>
+                        <audit-icon
+                          v-if="getStrategyDisplayText(eventItem?.strategy_id)"
+                          v-bk-tooltips="t('复制')"
+                          class="copy-btn"
+                          type="copy"
+                          @click.stop="handleCopyValue(getStrategyDisplayText(eventItem?.strategy_id))" />
+                      </template>
+                      <!-- 其他字段 -->
+                      <template v-else>
+                        <!-- 有字段映射或者有证据下探 -->
+                        <bk-popover
+                          v-if="displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.isMappings
+                            || drillMap.get(basicItem.field_name)"
+                          placement="top"
+                          theme="black">
+                          <span
+                            :class="[
+                              displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.isMappings
+                                ? 'tips' : ''
+                            ]"
+                            :style="{
+                              color: drillMap.get(basicItem.field_name) ? '#3a84ff' : '#313238',
+                              cursor: drillMap.get(basicItem.field_name) ? 'pointer' : 'default',
+                            }"
+                            @click="handleUseTool(
+                              drillMap.get(basicItem.field_name),
+                              basicItem.field_name
+                            )">
+                            <span v-if="basicItem.field_name === 'operator'">
                               <edit-tag
-                                v-if="basicItem.field_name === 'operator'"
                                 :data="handleShowText(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value)"
                                 :max="99"
-                                style="display: inline-block;" />
-                              <span v-else>
-                                {{ handleShowText(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value ) || '--' }}
-                              </span>
-                              <audit-icon
-                                v-bk-tooltips="t('复制')"
-                                class="copy-btn"
-                                type="copy"
-                                @click.stop="handleCopyValue(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value)" />
-                            </span>
-                          </template>
-                          <!-- 证据下探按钮 -->
-                          <template v-if="drillMap.get(basicItem.field_name)">
-                            <bk-popover
-                              placement="top"
-                              theme="black">
-                              <bk-button
-                                class="ml8"
-                                text
-                                theme="primary"
+                                :show-copy="hasCopyableValue(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value)"
+                                style="display: inline-block;"
                                 @click="handleUseTool(
                                   drillMap.get(basicItem.field_name),
                                   basicItem.field_name
-                                )">
-                                <span
-                                  style="
-                              padding: 2px 10px;
-                              color: #3a84ff;
-                              cursor: pointer;
-                              background-color: #cddffe;
-                              border-radius: 8px;
-                            ">
-                                  {{ drillMap.get(basicItem.field_name).drill_config.length }}
-                                </span>
-                              </bk-button>
-                              <audit-icon
-                                v-bk-tooltips="t('复制')"
-                                class="copy-btn"
-                                type="copy"
-                                @click.stop="handleCopyValue(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value)" />
-                              <template #content>
-                                <div>
-                                  <div
-                                    v-for="config in drillMap.get(basicItem.field_name).drill_config"
-                                    :key="config.tool.uid">
-                                    {{ config.drill_name || getToolNameAndType(config.tool.uid).name }}
-                                    <bk-button
-                                      class="ml8"
-                                      text
-                                      theme="primary"
-                                      @click="(e: any) => {
-                                        e.stopPropagation(); // 阻止事件冒泡
-                                        handleUseTool(drillMap.get(basicItem.field_name),
-                                                      basicItem.field_name, config.tool.uid);
-                                      }">
-                                      {{ t('去查看') }}
-                                      <audit-icon
-                                        class="mr-18"
-                                        type="jump-link" />
-                                    </bk-button>
-                                  </div>
-                                </div>
-                              </template>
-                            </bk-popover>
-                          </template>
-                        </render-info-item>
-                      </render-info-block>
-                    </div>
-                  </template>
-
-                  <!-- 事件数据 -->
-                  <div class="title">
-                    {{ t('事件数据') }}
-                  </div>
-                  <template v-if="eventDataKeyArr.length || eventDataKeyArrNormal.length">
-                    <div
-                      v-if="eventDataKeyArr.length"
-                      class="data-info"
-                      style="background-color: #f5f7fa;">
-                      <render-info-block
-                        v-for="(keyArr, keyIndex) in eventDataKeyArr"
-                        :key="keyIndex"
-                        class="flex mt16"
-                        style="justify-content: space-between; gap: 24px;">
-                        <render-info-item
-                          v-for="(key, index) in keyArr"
-                          :key="index"
-                          :description="strategyInfo.find((item: any) => item.field_name === key)?.description || ''"
-                          :label="strategyInfo.find((item: any) => item.field_name === key)?.display_name || key"
-                          :label-width="labelWidth"
-                          :label-width-percent="25"
-                          style="flex-basis: 50%;">
-                          <!-- 有字段映射或者有证据下探 -->
-                          <bk-popover
-                            v-if="displayValueDict.eventData[key]?.isMappings
-                              || drillMap.get(key)"
-                            placement="top"
-                            theme="black">
-                            <span
-                              :class="[
-                                displayValueDict.eventData[key]?.isMappings
-                                  ? 'tips space' : 'space'
-                              ]"
-                              :style="{
-                                color: drillMap.get(key) ? '#3a84ff' : '#313238',
-                                cursor: drillMap.get(key) ? 'pointer' : 'default',
-                              }"
-                              @click="handleUseTool(
-                                drillMap.get(key),
-                                key
-                              )">
-                              {{ handleShowText(displayValueDict.eventData[key]?.value) }}
-                              <audit-icon
-                                v-bk-tooltips="t('复制')"
-                                class="copy-btn"
-                                type="copy"
-                                @click.stop="handleCopyValue(displayValueDict.eventData[key]?.value)" />
+                                )" />
                             </span>
-                            <template #content>
-                              <div>
-                                <div
-                                  v-if="displayValueDict.eventData[key]?.isMappings">
-                                  <span>{{ t('存储值: ') }}</span>
-                                  <span>
-                                    {{ displayValueDict.eventData[key]?.dict?.key }}
-                                  </span>
-                                  <br>
-                                  <span>{{ t('展示文本: ') }}</span>
-                                  <span class="space">
-                                    {{ handleShowText(displayValueDict.eventData[key]?.dict?.name) }}
-                                  </span>
-                                </div>
-                                <div
-                                  v-if="drillMap.get(key)"
-                                  style="margin-top: 8px;">
-                                  {{ t('点击查看此字段的证据下探') }}
-                                </div>
-                              </div>
-                            </template>
-                          </bk-popover>
-                          <!-- 没有字段映射或者没有证据下探 -->
-                          <span
-                            v-else
-                            class="space">
-                            {{ handleShowText(displayValueDict.eventData[key]?.value) }}
-                            <audit-icon
-                              v-bk-tooltips="t('复制')"
-                              class="copy-btn"
-                              type="copy"
-                              @click.stop="handleCopyValue(displayValueDict.eventData[key]?.value)" />
-                          </span>
-                          <!-- 证据下探按钮 -->
-                          <template v-if="drillMap.get(key)">
-                            <bk-popover
-                              placement="top"
-                              theme="black">
-                              <bk-button
-                                class="ml8"
-                                text
-                                theme="primary"
-                                @click="handleUseTool(
-                                  drillMap.get(key),
-                                  key
-                                )">
-                                <span
-                                  style="
-                              padding: 2px 10px;
-                              color: #3a84ff;
-                              cursor: pointer;
-                              background-color: #cddffe;
-                              border-radius: 8px;
-                            ">
-                                  {{ drillMap.get(key).drill_config.length }}
-                                </span>
-                              </bk-button>
-                              <audit-icon
-                                v-bk-tooltips="t('复制')"
-                                class="copy-btn"
-                                type="copy"
-                                @click.stop="handleCopyValue(displayValueDict.eventData[key]?.value)" />
-                              <template #content>
-                                <div>
-                                  <div
-                                    v-for="config in drillMap.get(key).drill_config"
-                                    :key="config.tool.uid">
-                                    {{ config.drill_name || getToolNameAndType(config.tool.uid).name }}
-                                    <bk-button
-                                      class="ml8"
-                                      text
-                                      theme="primary"
-                                      @click="(e: any) => {
-                                        e.stopPropagation(); // 阻止事件冒泡
-                                        handleUseTool(drillMap.get(key), key, config.tool.uid);
-                                      }">
-                                      {{ t('去查看') }}
-                                      <audit-icon
-                                        class="mr-18"
-                                        type="jump-link" />
-                                    </bk-button>
-                                  </div>
-                                </div>
-                              </template>
-                            </bk-popover>
-                          </template>
-                        </render-info-item>
-                      </render-info-block>
-                    </div>
-                    <div
-                      v-if="(eventDataKeyArrNormal.length && isShowMore) || !eventDataKeyArr.length"
-                      class="data-info"
-                      style="margin-top: 0;">
-                      <render-info-block
-                        v-for="(keyArr, keyIndex) in eventDataKeyArrNormal"
-                        :key="keyIndex"
-                        class="flex mt16">
-                        <render-info-item
-                          v-for="(key, index) in keyArr"
-                          :key="index"
-                          :description="strategyInfo.find((item: any) => item.field_name === key)?.description || ''"
-                          :label="strategyInfo.find((item: any) => item.field_name === key)?.display_name || key"
-                          :label-width="labelWidth"
-                          :label-width-percent="25"
-                          style="width: 50%;">
-                          <!-- 有字段映射或者有证据下探 -->
-                          <bk-popover
-                            v-if="displayValueDict.eventData[key]?.isMappings
-                              || drillMap.get(key)"
-                            placement="top"
-                            theme="black">
-                            <span
-                              :class="[
-                                displayValueDict.eventData[key]?.isMappings
-                                  ? 'tips space' : 'space'
-                              ]"
-                              :style="{
-                                color: drillMap.get(key) ? '#3a84ff' : '#313238',
-                                cursor: drillMap.get(key) ? 'pointer' : 'default',
-                              }"
-                              @click="handleUseTool(
-                                drillMap.get(key),
-                                key
-                              )">
-                              {{ handleShowText(displayValueDict.eventData[key]?.value) }}
-                              <audit-icon
-                                v-bk-tooltips="t('复制')"
-                                class="copy-btn"
-                                type="copy"
-                                @click.stop="handleCopyValue(displayValueDict.eventData[key]?.value)" />
+                            <span v-else>
+                              {{ handleShowText(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value ) }}
                             </span>
-                            <template #content>
-                              <div>
-                                <div
-                                  v-if="displayValueDict.eventData[key]?.isMappings">
-                                  <span>{{ t('存储值: ') }}</span>
-                                  <span>
-                                    {{ displayValueDict.eventData[key]?.dict?.key }}
-                                  </span>
-                                  <br>
-                                  <span>{{ t('展示文本: ') }}</span>
-                                  <span class="space">
-                                    {{ displayValueDict.eventData[key]?.dict?.name }}
-                                  </span>
-                                </div>
-                                <div
-                                  v-if="drillMap.get(key)"
-                                  style="margin-top: 8px;">
-                                  {{ t('点击查看此字段的证据下探') }}
-                                </div>
-                              </div>
-                            </template>
-                          </bk-popover>
-                          <!-- 没有字段映射或者没有证据下探 -->
-                          <span
-                            v-else
-                            class="space">
-                            {{ handleShowText(displayValueDict.eventData[key]?.value) }}
-                            <audit-icon
-                              v-bk-tooltips="t('复制')"
-                              class="copy-btn"
-                              type="copy"
-                              @click.stop="handleCopyValue(displayValueDict.eventData[key]?.value)" />
                           </span>
-                          <!-- 证据下探按钮 -->
-                          <template v-if="drillMap.get(key)">
-                            <bk-popover
-                              placement="top"
-                              theme="black">
-                              <bk-button
-                                class="ml8"
-                                text
-                                theme="primary"
-                                @click="handleUseTool(
-                                  drillMap.get(key),
-                                  key
-                                )">
-                                <span
-                                  style="
+                          <template #content>
+                            <div>
+                              <div
+                                v-if="
+                                  displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.isMappings
+                                ">
+                                <span>{{ t('存储值: ') }}</span>
+                                <span>
+                                  {{
+                                    displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.dict?.key
+                                  }}
+                                </span>
+                                <br>
+                                <span>{{ t('展示文本: ') }}</span>
+                                <span>
+                                  {{
+                                    displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.dict?.name
+                                  }}
+                                </span>
+                              </div>
+                              <div
+                                v-if="drillMap.get(basicItem.field_name)"
+                                :style="{
+                                  // eslint-disable-next-line max-len
+                                  marginTop: displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.isMappings
+                                    ? '8px' : '0'
+                                }">
+                                {{ t('点击查看此字段的证据下探') }}
+                              </div>
+                            </div>
+                          </template>
+                        </bk-popover>
+                        <!-- 没有字段映射或者没有证据下探 -->
+                        <span v-else>
+                          <edit-tag
+                            v-if="basicItem.field_name === 'operator'"
+                            :data="handleShowText(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value)"
+                            :max="99"
+                            :show-copy="hasCopyableValue(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value)"
+                            style="display: inline-block;" />
+                          <span v-else>
+                            {{ handleShowText(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value ) || '--' }}
+                          </span>
+                          <audit-icon
+                            v-if="basicItem.field_name !== 'operator'
+                              && hasCopyableValue(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value)"
+                            v-bk-tooltips="t('复制')"
+                            class="copy-btn"
+                            type="copy"
+                            @click.stop="handleCopyValue(displayValueDict[basicItem.field_name as DisplayValueKeysWithoutEventData]?.value)" />
+                        </span>
+                      </template>
+                      <!-- 证据下探按钮 -->
+                      <template v-if="drillMap.get(basicItem.field_name)">
+                        <bk-popover
+                          placement="top"
+                          theme="black">
+                          <bk-button
+                            class="ml8"
+                            text
+                            theme="primary"
+                            @click="handleUseTool(
+                              drillMap.get(basicItem.field_name),
+                              basicItem.field_name
+                            )">
+                            <span
+                              style="
                               padding: 2px 10px;
                               color: #3a84ff;
                               cursor: pointer;
                               background-color: #cddffe;
                               border-radius: 8px;
                             ">
-                                  {{ drillMap.get(key).drill_config.length }}
-                                </span>
-                                <audit-icon
-                                  v-bk-tooltips="t('复制')"
-                                  class="copy-btn"
-                                  type="copy"
-                                  @click.stop="handleCopyValue(displayValueDict.eventData[key]?.value)" />
-                              </bk-button>
-                              <template #content>
-                                <div>
-                                  <div
-                                    v-for="config in drillMap.get(key).drill_config"
-                                    :key="config.tool.uid">
-                                    {{ config.drill_name || getToolNameAndType(config.tool.uid).name }}
-                                    <bk-button
-                                      class="ml8"
-                                      text
-                                      theme="primary"
-                                      @click="(e: any) => {
-                                        e.stopPropagation(); // 阻止事件冒泡
-                                        handleUseTool(drillMap.get(key), key, config.tool.uid);
-                                      }">
-                                      {{ t('去查看') }}
-                                      <audit-icon
-                                        class="mr-18"
-                                        type="jump-link" />
-                                    </bk-button>
-                                  </div>
-                                </div>
-                              </template>
-                            </bk-popover>
+                              {{ drillMap.get(basicItem.field_name).drill_config.length }}
+                            </span>
+                          </bk-button>
+                          <template #content>
+                            <div>
+                              <div
+                                v-for="config in drillMap.get(basicItem.field_name).drill_config"
+                                :key="config.tool.uid">
+                                {{ config.drill_name || getToolNameAndType(config.tool.uid).name }}
+                                <bk-button
+                                  class="ml8"
+                                  text
+                                  theme="primary"
+                                  @click="(e: any) => {
+                                    e.stopPropagation(); // 阻止事件冒泡
+                                    handleUseTool(drillMap.get(basicItem.field_name),
+                                                  basicItem.field_name, config.tool.uid);
+                                  }">
+                                  {{ t('去查看') }}
+                                  <audit-icon
+                                    class="mr-18"
+                                    type="jump-link" />
+                                </bk-button>
+                              </div>
+                            </div>
                           </template>
-                        </render-info-item>
-                      </render-info-block>
-                    </div>
-                    <div
-                      v-if="eventDataKeyArr.length && eventDataKeyArrNormal.length"
-                      style="height: 20px; margin-top: 10px;">
-                      <bk-button
-                        style="float: right;"
-                        text
-                        theme="primary"
-                        @click="handleToggleShowMore">
+                        </bk-popover>
                         <audit-icon
-                          :class="{ active: isShowMore }"
-                          style=" margin-right: 5px;"
-                          type="angle-double-down" />
-                        {{ isShowMore ? t('收起字段') : t('展开更多字段') }}
-                      </bk-button>
-                    </div>
-                  </template>
-                  <bk-exception
-                    v-else
-                    class="exception-part"
-                    scene="part"
-                    type="empty">
-                    {{ t('暂无数据') }}
-                  </bk-exception>
+                          v-bk-tooltips="t('复制')"
+                          class="copy-btn"
+                          type="copy"
+                          @click.stop="handleCopyDrillTitles(basicItem.field_name)" />
+                      </template>
+                    </render-info-item>
+                  </div>
                 </div>
+              </template>
+
+              <div
+                v-if="basicInfo.length"
+                class="section-divider" />
+
+              <!-- 事件详情 -->
+              <div class="link-event-block-title">
+                {{ t('事件详情') }}
               </div>
+              <template v-if="eventDataKeyArr.length || eventDataKeyArrNormal.length">
+                <div
+                  v-if="visibleEventDetailRows.length"
+                  class="data-info info-field-rows">
+                  <div
+                    v-for="(keyArr, keyIndex) in visibleEventDetailRows"
+                    :key="keyIndex"
+                    class="info-field-row">
+                    <render-info-item
+                      v-for="key in keyArr"
+                      :key="key"
+                      :description="strategyInfo.find((item: any) => item.field_name === key)?.description || ''"
+                      :label="strategyInfo.find((item: any) => item.field_name === key)?.display_name || key"
+                      :label-width="labelWidth">
+                      <!-- 有字段映射或者有证据下探 -->
+                      <bk-popover
+                        v-if="displayValueDict.eventData[key]?.isMappings
+                          || drillMap.get(key)"
+                        placement="top"
+                        theme="black">
+                        <span
+                          :class="[
+                            displayValueDict.eventData[key]?.isMappings
+                              ? 'tips space' : 'space'
+                          ]"
+                          :style="{
+                            color: drillMap.get(key) ? '#3a84ff' : '#313238',
+                            cursor: drillMap.get(key) ? 'pointer' : 'default',
+                          }"
+                          @click="handleUseTool(
+                            drillMap.get(key),
+                            key
+                          )">
+                          {{ handleShowText(displayValueDict.eventData[key]?.value) }}
+                          <audit-icon
+                            v-if="hasCopyableValue(displayValueDict.eventData[key]?.value)"
+                            v-bk-tooltips="t('复制')"
+                            class="copy-btn"
+                            type="copy"
+                            @click.stop="handleCopyValue(displayValueDict.eventData[key]?.value)" />
+                        </span>
+                        <template #content>
+                          <div>
+                            <div
+                              v-if="displayValueDict.eventData[key]?.isMappings">
+                              <span>{{ t('存储值: ') }}</span>
+                              <span>
+                                {{ displayValueDict.eventData[key]?.dict?.key }}
+                              </span>
+                              <br>
+                              <span>{{ t('展示文本: ') }}</span>
+                              <span class="space">
+                                {{ handleShowText(displayValueDict.eventData[key]?.dict?.name) }}
+                              </span>
+                            </div>
+                            <div
+                              v-if="drillMap.get(key)"
+                              style="margin-top: 8px;">
+                              {{ t('点击查看此字段的证据下探') }}
+                            </div>
+                          </div>
+                        </template>
+                      </bk-popover>
+                      <!-- 没有字段映射或者没有证据下探 -->
+                      <span
+                        v-else
+                        class="space">
+                        {{ handleShowText(displayValueDict.eventData[key]?.value) }}
+                        <audit-icon
+                          v-if="hasCopyableValue(displayValueDict.eventData[key]?.value)"
+                          v-bk-tooltips="t('复制')"
+                          class="copy-btn"
+                          type="copy"
+                          @click.stop="handleCopyValue(displayValueDict.eventData[key]?.value)" />
+                      </span>
+                      <!-- 证据下探按钮 -->
+                      <template v-if="drillMap.get(key)">
+                        <bk-popover
+                          placement="top"
+                          theme="black">
+                          <bk-button
+                            class="ml8"
+                            text
+                            theme="primary"
+                            @click="handleUseTool(
+                              drillMap.get(key),
+                              key
+                            )">
+                            <span
+                              style="
+                              padding: 2px 10px;
+                              color: #3a84ff;
+                              cursor: pointer;
+                              background-color: #cddffe;
+                              border-radius: 8px;
+                            ">
+                              {{ drillMap.get(key).drill_config.length }}
+                            </span>
+                          </bk-button>
+                          <template #content>
+                            <div>
+                              <div
+                                v-for="config in drillMap.get(key).drill_config"
+                                :key="config.tool.uid">
+                                {{ config.drill_name || getToolNameAndType(config.tool.uid).name }}
+                                <bk-button
+                                  class="ml8"
+                                  text
+                                  theme="primary"
+                                  @click="(e: any) => {
+                                    e.stopPropagation(); // 阻止事件冒泡
+                                    handleUseTool(drillMap.get(key), key, config.tool.uid);
+                                  }">
+                                  {{ t('去查看') }}
+                                  <audit-icon
+                                    class="mr-18"
+                                    type="jump-link" />
+                                </bk-button>
+                              </div>
+                            </div>
+                          </template>
+                        </bk-popover>
+                        <audit-icon
+                          v-bk-tooltips="t('复制')"
+                          class="copy-btn"
+                          type="copy"
+                          @click.stop="handleCopyDrillTitles(key)" />
+                      </template>
+                    </render-info-item>
+                  </div>
+                </div>
+              </template>
+              <bk-exception
+                v-else
+                class="exception-part"
+                scene="part"
+                type="empty">
+                {{ t('暂无数据') }}
+              </bk-exception>
             </div>
           </div>
         </template>
@@ -597,6 +418,20 @@
         </bk-exception>
       </div>
     </bk-loading>
+    <div
+      v-if="showMoreFieldsBtn"
+      class="show-more-condition-btn">
+      <bk-button
+        class="show-more-btn"
+        text
+        @click="handleToggleShowMore">
+        {{ isShowMore ? t('收起字段') : t('展开更多字段') }}
+        <audit-icon
+          class="show-more-icon"
+          :class="{ active: isShowMore }"
+          type="angle-double-down" />
+      </bk-button>
+    </div>
   </div>
   <!-- 循环所有工具 -->
   <div
@@ -642,7 +477,6 @@
   import EditTag from '@components/edit-box/tag.vue';
 
   // import Tooltips from '@components/show-tooltips-text/index.vue';
-  import RenderInfoBlock from '@views/strategy-manage/list/components/render-info-block.vue';
   import DialogVue from '@views/tools/tools-square/components/dialog/dialog.vue';
 
   import { execCopy } from '@utils/assist';
@@ -650,6 +484,7 @@
 
   import addEvent from '../add-event/index.vue';
 
+  import LinkEventTimeline from './link-event-timeline.vue';
   import RenderInfoItem from './render-info-item.vue';
 
   import useRequest from '@/hooks/use-request';
@@ -693,7 +528,9 @@
       label: string,
       value: number
     }>,
-    data: RiskManageModel & StrategyInfo
+    data: RiskManageModel & StrategyInfo,
+    /** 是否展示内容区「关联事件列表」标题（有 Tab 页签时传 false，避免与页签文案重复） */
+    showSectionTitle?: boolean,
   }
 
   interface DisplayValue {
@@ -716,7 +553,9 @@
   type DisplayValueKeys = keyof typeof displayValueDict.value;
 
   type DisplayValueKeysWithoutEventData = Exclude<DisplayValueKeys, 'eventData'>;
-  const props = defineProps<Props>();
+  const props = withDefaults(defineProps<Props>(), {
+    showSectionTitle: true,
+  });
   const emits = defineEmits<Emits>();
 
   const getStrategyDisplayText = (strategyId?: string | number | null) => {
@@ -728,12 +567,12 @@
     return formatStrategyNameWithId(label, strategyId);
   };
 
-  const isShowSide = ref(false);
-  const isManuallyCollapsed = ref(false); // 标记是否手动收起
   let timeout: number| undefined = undefined;
 
   const activeStatus = ref('');
   const loading = ref(false);
+  // 仅列表尚未加载出内容时展示 loading，后台静默刷新不再转圈
+  const showListLoading = computed(() => loading.value && !hasLoadedData.value);
   const newIndex = ref<number[]>([]);
   const addEventRef = ref();
   const router = useRouter();
@@ -859,6 +698,27 @@
     return group(eventInfoKeys);
   });
 
+  const showEventDataNormal = computed(() => (
+    (eventDataKeyArrNormal.value.length && isShowMore.value) || !eventDataKeyArr.value.length
+  ));
+
+  const visibleEventDetailRows = computed(() => {
+    const rows: Array<string[]> = [...eventDataKeyArr.value];
+    if (showEventDataNormal.value) {
+      rows.push(...eventDataKeyArrNormal.value);
+    }
+    return rows;
+  });
+
+  const showMoreFieldsBtn = computed(() => (
+    hasLoadedData.value
+    && linkEventList.value.length > 0
+    // 有重点字段时非重点字段才会被收起；两者都有才需要展开组件
+    && eventDataKeyArr.value.length > 0
+    && eventDataKeyArrNormal.value.length > 0
+    && !(activeStatus.value === 'new' && newIndex.value.includes(active.value))
+  ));
+
   // 去重字段
   const distinctEventDataKeyArr = computed(() => {
     const eventInfo = [
@@ -894,12 +754,28 @@
     return value;
   };
 
-  const handleCopyValue = (value: any) => {
+  const hasCopyableValue = (value: any) => {
     const text = handleShowText(value);
-    if (text === undefined || text === null || text === '' || text === '--') {
+    return text !== undefined && text !== null && text !== '' && text !== '--';
+  };
+
+  const handleCopyValue = (value: any) => {
+    if (!hasCopyableValue(value)) {
       return;
     }
-    execCopy(String(text), t('复制成功'));
+    execCopy(String(handleShowText(value)), t('复制成功'));
+  };
+
+  // 复制证据下探的全部标题
+  const handleCopyDrillTitles = (fieldName: string) => {
+    const drillItem = drillMap.value.get(fieldName);
+    const titles = (drillItem?.drill_config || [])
+      .map((config: any) => config.drill_name || getToolNameAndType(config.tool.uid).name)
+      .filter((name: string) => !!name);
+    if (!titles.length) {
+      return;
+    }
+    execCopy(titles.join('\n'), t('复制成功'));
   };
 
   // 将各种类型转换为字符串，模拟 Vue 模板的显示效果
@@ -973,6 +849,58 @@
       type: '',
     };
   };
+  const getLinkEventKey = (item: EventModel & { manual_event_id?: string | number }) => {
+    if (item.event_id) {
+      return `event:${item.event_id}`;
+    }
+    if (item.manual_event_id !== undefined && item.manual_event_id !== null && item.manual_event_id !== '') {
+      return `manual:${item.manual_event_id}`;
+    }
+    return `raw:${item.raw_event_id || ''}_${item.event_time || ''}`;
+  };
+
+  const mergeLinkEvents = (existing: EventModel[], incoming: EventModel[]) => {
+    const seen = new Set(existing.map(item => getLinkEventKey(item)));
+    const merged = [...existing];
+    incoming.forEach((item) => {
+      const key = getLinkEventKey(item);
+      if (!seen.has(key)) {
+        merged.push(item);
+        seen.add(key);
+      }
+    });
+    return merged;
+  };
+
+  // 未同步事件前置合并（按 event_id / manual_event_id 去重，避免轮询重复堆叠）
+  const mergeUnsyncedEvents = (unsynced: EventModel[], existing: EventModel[]) => {
+    const seen = new Set(existing.map(item => getLinkEventKey(item)));
+    const uniqueUnsynced = unsynced.filter((item) => {
+      const key = getLinkEventKey(item);
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    });
+    return uniqueUnsynced.concat(existing);
+  };
+
+  const clearRefreshTimeout = () => {
+    if (timeout) {
+      clearTimeout(timeout);
+      timeout = undefined;
+    }
+  };
+
+  const scheduleNewEventPoll = () => {
+    clearRefreshTimeout();
+    timeout = window.setTimeout(() => {
+      timeout = undefined;
+      timeoutRefresh();
+    }, 5000);
+  };
+
   const {
     data: addEventData,
     run: getAddEventList,
@@ -1002,23 +930,23 @@
         loading.value = false;
         isLoadingMore.value = false;
 
-        // 如果是第一页，清空列表；否则追加数据
+        // 如果是第一页，重置新事件索引；保留当前列表避免弹层闪闭
         if (currentPage.value === 1) {
-          linkEventList.value = [];
           newIndex.value = [];
         }
 
         nextTick(() => {
+          const wasPollingNewEvents = Boolean(timeout) || activeStatus.value === 'new';
+
           if (linkEventData.value.results.length) {
             activeStatus.value = '';
             // 触底加载时追加数据，首次加载时替换数据
-            const allEvents = currentPage.value === 1
+            let allEvents = currentPage.value === 1
               ? linkEventData.value.results
-              : [...linkEventList.value, ...linkEventData.value.results];
-            linkEventList.value = allEvents;
+              : mergeLinkEvents(linkEventList.value, linkEventData.value.results);
             if (distinctEventDataKeyArr.value.length) {
               // 根据指定字段组合进行去重（包含关系）
-              linkEventList.value =  allEvents.filter((event, index, self) => {
+              allEvents = allEvents.filter((event, index, self) => {
                 // 根据 distinctEventDataKeyArr 中的字段生成当前事件的字段值数组
                 const currentValues = distinctEventDataKeyArr.value.map(key => event[key as keyof EventModel] || event.event_data?.[key] || '');
 
@@ -1038,9 +966,13 @@
                 return index === firstIndex;
               });
             }
+            linkEventList.value = allEvents;
           }
-          if (addEventData.value.unsynced_events.length > 0) {
-            linkEventList.value = addEventData.value.unsynced_events.concat(linkEventList.value);
+          if (addEventData.value.unsynced_events?.length > 0) {
+            linkEventList.value = mergeUnsyncedEvents(
+              addEventData.value.unsynced_events,
+              linkEventList.value,
+            );
             activeStatus.value = linkEventList.value[0]?.status || '';
           }
 
@@ -1052,73 +984,109 @@
           }).filter(item => item !== -1);
 
           if (linkEventList.value.some(item => item.status === 'new')) {
-            // 执行定时器刷新列表
+            // 仍有未同步事件，继续轮询（先清旧定时器，避免叠加）
             activeStatus.value = 'new';
-            timeout = setTimeout(() => {
-              timeoutRefresh();
-            }, 5000);
+            scheduleNewEventPoll();
           } else {
-            // 消除定时器 慢5秒确保最新数据
-            if (timeout) {
-              activeStatus.value = 'new';
-              setTimeout(() => {
-                activeStatus.value = '';
-                emits('updatedData');
-                timeoutRefresh();
-                clearTimeout(timeout);
-                timeout = undefined;
-              }, 5000);
+            // 同步完成，停止轮询；仅在此前处于轮询态时通知父组件刷新一次
+            clearRefreshTimeout();
+            activeStatus.value = '';
+            if (wasPollingNewEvents) {
+              emits('updatedData');
             }
           }
           // 默认获取第一个
           [eventItem.value] = linkEventList.value;
-          // 只有在未手动收起的情况下，才根据列表长度自动设置收起状态
-          if (!isManuallyCollapsed.value) {
-            isShowSide.value = !(linkEventList.value.length > 1);
-          }
-          // 标记已加载过数据，防止收起时列表消失
+          // 标记已加载过数据
           hasLoadedData.value = true;
         });
       });
     },
   });
-  // 执行定时器刷新列表
-  const timeoutRefresh = () => {
-    getAddEventList({
-      id: props.data.risk_id,
-    }).then((data) => {
-      currentPage.value = 1; // 重置页码
-      fetchLinkEvent({
-        start_time: data.event_time,
-        end_time: data.event_end_time,
-        risk_id: data.risk_id,
-        page: currentPage.value,
-        page_size: 50,
-        scope_id: props.data.scene_id,
-        scope_type: 'scene',
-      });
-    });
-  };
-  const handleScroll = (event: Event) => {
-    const target = event.target as HTMLDivElement;
-    // 下拉触底没有加载完时，继续获取列表
-    const { scrollTop, clientHeight, scrollHeight } = target;
-    // 使用 >= 判断，允许一定的误差，当距离底部小于等于5px时触发
-    const isNearBottom = scrollTop + clientHeight >= scrollHeight - 5;
-    const hasMoreData = linkEventList.value.length < linkEventData.value.total;
 
-    if (isNearBottom && hasMoreData && !isLoadingMore.value) {
-      isLoadingMore.value = true;
-      currentPage.value += 1;
-      fetchLinkEvent({
-        start_time: props.data.event_time,
-        end_time: props.data.event_end_time,
-        risk_id: props.data.risk_id,
-        page: currentPage.value,
-        page_size: 50,
-        scope_id: props.data.scene_id,
-        scope_type: 'scene',
+  const hasMoreTimelineEvents = computed(() => {
+    const { total, num_pages: numPages } = linkEventData.value;
+    if (!total) {
+      return false;
+    }
+    if (linkEventList.value.length >= total) {
+      return false;
+    }
+    if (numPages && currentPage.value >= numPages) {
+      return false;
+    }
+    return true;
+  });
+
+  // 执行定时器刷新列表
+  const buildLinkEventFetchParams = (page = 1) => ({
+    start_time: props.data.event_time,
+    end_time: props.data.event_end_time,
+    risk_id: props.data.risk_id,
+    page,
+    page_size: 50,
+    scope_id: props.data.scene_id,
+    scope_type: 'scene',
+  });
+
+  const applyUnsyncedEvents = () => {
+    if (!(addEventData.value.unsynced_events?.length > 0)) {
+      return;
+    }
+    linkEventList.value = mergeUnsyncedEvents(
+      addEventData.value.unsynced_events,
+      linkEventList.value,
+    );
+    activeStatus.value = linkEventList.value[0]?.status || '';
+    [eventItem.value] = linkEventList.value;
+    hasLoadedData.value = true;
+    newIndex.value = linkEventList.value.map((item, index) => {
+      if (item.status === 'new') {
+        return index;
+      }
+      return -1;
+    }).filter(item => item !== -1);
+    if (linkEventList.value.some(item => item.status === 'new')) {
+      activeStatus.value = 'new';
+      scheduleNewEventPoll();
+    }
+  };
+
+  /** 刷新关联事件列表（添加事件 / 创建报告后由父组件或内部成功回调调用） */
+  const refreshLinkEvents = async () => {
+    if (!props.data.risk_id) {
+      return;
+    }
+    currentPage.value = 1;
+    active.value = 0;
+    // 不开关外层 bk-loading：父级详情刷新时常并发，避免出现双 loading
+    try {
+      await getAddEventList({
+        id: props.data.risk_id,
       });
+      applyUnsyncedEvents();
+      await fetchLinkEvent(buildLinkEventFetchParams(1));
+    } finally {
+      hasLoadedData.value = true;
+    }
+  };
+
+  const timeoutRefresh = () => {
+    refreshLinkEvents();
+  };
+  const handleTimelineLoadMore = () => {
+    if (!hasMoreTimelineEvents.value || isLoadingMore.value) {
+      return;
+    }
+    isLoadingMore.value = true;
+    currentPage.value += 1;
+    fetchLinkEvent(buildLinkEventFetchParams(currentPage.value));
+  };
+
+  const handlerSelectByIndex = (index: number) => {
+    const item = linkEventList.value[index];
+    if (item) {
+      handlerSelect(item, index);
     }
   };
 
@@ -1208,46 +1176,16 @@
   // 添加事件成功
   const handleAddSuccess = () => {
     active.value = 0;
-    linkEventList.value = [];
-    // 立即触发父组件刷新数据，更新 report_generating 状态
-    emits('updatedData');
-    // 先立即获取未同步的事件，让新添加的事件立即显示
-    getAddEventList({
-      id: props.data.risk_id,
-    }).then(() => {
-      // 如果有未同步的事件，立即显示在列表中
-      if (addEventData.value.unsynced_events.length > 0) {
-        linkEventList.value = addEventData.value.unsynced_events;
-        activeStatus.value = linkEventList.value[0]?.status || '';
-        [eventItem.value] = linkEventList.value;
-        hasLoadedData.value = true;
-        // 标记新添加的事件索引
-        newIndex.value = linkEventList.value.map((item, index) => {
-          if (item.status === 'new') {
-            return index;
-          }
-          return -1;
-        }).filter(item => item !== -1);
-        // 如果有新事件，启动定时器刷新
-        if (linkEventList.value.some(item => item.status === 'new')) {
-          activeStatus.value = 'new';
-          timeout = setTimeout(() => {
-            timeoutRefresh();
-          }, 5000);
-        }
+    // 先本地刷新列表；父级 updatedData 会再拉风险详情（不要在子级再开 loading，避免双转圈）
+    refreshLinkEvents().then(() => {
+      if (
+        linkEventList.value.length === 0
+        || linkEventList.value.some(item => item.status === 'new')
+      ) {
+        scheduleNewEventPoll();
       }
-      // 然后刷新完整的事件列表
-      currentPage.value = 1; // 重置页码
-      fetchLinkEvent({
-        start_time: props.data.event_time,
-        end_time: props.data.event_end_time,
-        risk_id: props.data.risk_id,
-        page: currentPage.value,
-        page_size: 50,
-        scope_id: props.data.scene_id,
-        scope_type: 'scene',
-      });
     });
+    emits('updatedData');
   };
   // 防抖处理
   let fetchTimeout: number | undefined;
@@ -1298,273 +1236,273 @@
   });
   onMounted(() => {
     loading.value = true;
-    const observer = new MutationObserver(() => {
-      const detail = document.querySelector('.list-item-detail');
-      const list = document.querySelector('.list') as HTMLDivElement;
-      if (detail && list) {
-        // 设置左边list的高度和右边详情一样高
-        list.style.height = `${detail.scrollHeight}px`;
-      }
-    });
-    observer.observe(document.querySelector('.body') as Node, {
-      subtree: true,
-      childList: true,
-      characterData: true,
-      attributes: true,
-    });
+  });
 
-    onBeforeUnmount(() => {
-      observer.takeRecords();
-      observer.disconnect();
-      // 清理定时器
-      if (fetchTimeout) {
-        clearTimeout(fetchTimeout);
-      }
-    });
+  onBeforeUnmount(() => {
+    if (fetchTimeout) {
+      clearTimeout(fetchTimeout);
+    }
+    clearRefreshTimeout();
+  });
+
+  defineExpose({
+    refreshLinkEvents,
   });
 </script>
 <style lang="postcss" scoped>
 .risk-manage-detail-linkevent-part {
   position: relative;
 
-  .show-side-condition-btn {
+  .show-more-condition-btn {
     position: absolute;
-    top: 50%;
-    z-index: 10;
-    overflow: hidden;
-    border-radius: 0 5px 5px 0;
-    transform: translateY(-50%);
-    box-shadow: 0 2px 4px 0 #1919290d;
-
-    &.collapsed {
-      left: 0 !important;
-      border-radius: 0 5px 5px 0;
-    }
+    bottom: calc(-11px - var(--link-event-wrap-padding-bottom, 10px));
+    left: 50%;
+    z-index: 2;
+    transform: translateX(-50%);
 
     .show-more-btn {
-      display: flex;
+      display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 14px;
-      height: 65px;
-      padding: 0;
-      line-height: 5px;
+      width: 120px;
+      height: 22px;
       color: #63656e;
-      background: #eaecef;
+      background: #f0f1f5;
+      border: 1px solid #dcdee5;
+      border-radius: 12px;
 
       &:hover {
-        background-color: #c4c6cc;
+        color: #63656e;
+        background: #e1e3e9;
       }
+    }
+
+    .show-more-icon {
+      margin-left: 4px;
+    }
+
+    .active {
+      transform: rotateZ(-180deg);
+      transition: all .15s;
     }
   }
 
-  .title {
-    font-size: 14px;
-    font-weight: 700;
-    line-height: 22px;
-    color: #313238;
+  .timeline-empty-action {
+    display: flex;
+    justify-content: flex-end;
+    padding: 8px 0 16px;
+  }
 
-    .add-event {
-      margin-left: 20px;
-      font-size: 12px;
-      font-weight: 400;
-      line-height: 20px;
-      letter-spacing: 0;
-      color: #3a84ff;
-      cursor: pointer;
+  .add-event {
+    font-size: 12px;
+    line-height: 20px;
+    color: #3a84ff;
+    cursor: pointer;
 
-      .add-fill-event {
-        margin-right: 3px;
-      }
+    .add-fill-event {
+      margin-right: 4px;
     }
   }
 
   .body {
     display: flex;
-    margin-top: 14px;
+    flex-direction: column;
+    width: 100%;
 
-    .list {
-      display: inline-block;
-      min-height: 50vh;
+    /* 有 Tab 时，页签到内容 24px（设计稿）；底部与容器留 16px */
+    padding: 24px 16px 16px;
+    box-sizing: border-box;
 
-      /* height: 500px; */
-      overflow: hidden;
-      text-align: center;
-      background: #f5f7fa;
-      border-radius: 4px;
+    /* 无调查报告仅展示区块标题时，标题上下为 16px */
+    &.is-section-title-mode {
+      padding-top: 16px;
+    }
+  }
 
-      .list-item {
-        height: 32px;
-        line-height: 32px;
-        cursor: pointer;
+  .link-event-section-title,
+  .link-event-block-title {
+    padding-left: 0;
+    margin-left: 0;
+    text-align: left;
+  }
 
-        &:hover {
-          background-color: #eaebf0;
-        }
+  .link-event-section-title {
+    margin-bottom: 16px;
+    font-family: 'Microsoft YaHei', '微软雅黑', sans-serif;
+    font-size: 14px;
+    font-style: normal;
+    font-weight: 700;
+    line-height: 22px;
+    letter-spacing: 0;
+    color: #313238;
+  }
+
+  .link-event-block-title {
+    margin-bottom: 16px;
+    font-family: 'Microsoft YaHei', '微软雅黑', sans-serif;
+    font-size: 12px;
+    font-style: normal;
+    font-weight: 700;
+    line-height: 20px;
+    letter-spacing: 0;
+    color: #4d4f56;
+  }
+
+  .list-item-detail {
+    width: 100%;
+    padding: 0;
+    margin: 0;
+    box-sizing: border-box;
+
+    .detail-content {
+      width: 100%;
+      height: auto;
+
+      /* 时间轴到首个区块标题（基本信息/事件详情）24px */
+      > .link-event-block-title:first-child {
+        margin-top: 24px;
+      }
+    }
+
+    .section-divider {
+      height: 1px;
+
+      /* 「基本信息」内容与「事件详情」之间上下各 24px */
+      margin: 24px 0;
+      background: #dcdee5;
+    }
+
+    .exception-part {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 300px;
+    }
+
+    .important-information {
+      padding: 12px 0;
+      margin-bottom: 24px;
+      background-color: #fafbfd;
+
+      .title {
+        padding-left: 8px;
+        border-left: 3px solid #3a84ff;
       }
 
-      .active {
-        color: #3a84ff !important;
-        background: #e1ecff;
-        border-left: 2px solid #3a84ff;
+      .render-info-item {
+        width: 50%;
+        align-items: flex-start;
 
-        &:hover {
-          background: #e1ecff !important;
+        .info-value {
+          word-break: break-all;
+
+          &:hover {
+            .copy-btn {
+              opacity: 100%;
+            }
+          }
         }
       }
     }
 
-    .list-item-detail {
-      padding-left: 12px;
-
-      .exception-part {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        min-height: 300px;
+    .base-info {
+      .render-info-item .info-value:hover .copy-btn {
+        opacity: 100%;
       }
+    }
 
-      .important-information {
-        padding: 12px 0;
-        margin-bottom: 24px;
-        background-color: #fafbfd;
+    .data-info {
+      /* border: 1px solid #ecedf1; */
 
-        .title {
-          padding-left: 8px;
-          border-left: 3px solid #3a84ff;
-        }
-
-        .render-info-item {
-          width: 50%;
-          align-items: flex-start;
-
-          .info-value {
-            word-break: break-all;
-
-            &:hover {
-              .copy-btn {
-                opacity: 100%;
-              }
-            }
-          }
+      .data-info-row:last-child {
+        .data-info-item-key,
+        .data-info-item-value {
+          border-bottom: 0;
         }
       }
 
-      .base-info {
-        margin-bottom: 24px;
-
-        .render-info-item {
-          width: 50%;
-          align-items: flex-start;
-
-          .info-value {
-            word-break: break-all;
-
-            &:hover {
-              .copy-btn {
-                opacity: 100%;
-              }
-            }
-          }
+      .data-info-item:last-child {
+        .data-info-item-value {
+          border-right: 0;
         }
       }
 
-      .data-info {
-        padding: 10px 0;
-        margin-top: 16px;
+      .data-info-item {
+        width: 50%;
 
-        /* border: 1px solid #ecedf1; */
-
-        .data-info-row:last-child {
-          .data-info-item-key,
-          .data-info-item-value {
-            border-bottom: 0;
-          }
-        }
-
-        .data-info-item:last-child {
-          .data-info-item-value {
-            border-right: 0;
-          }
-        }
-
-        .data-info-item {
-          width: 50%;
-
-          .data-info-item-key,
-          .data-info-item-value {
-            display: flex;
-            align-items: center;
-            padding: 6px 12px;
-            border-right: 1px solid #ecedf1;
-            border-bottom: 1px solid #ecedf1;
-          }
-
-          .data-info-item-key {
-            width: 160px;
-            background-color: #fafbfd;
-            justify-self: flex-end;
-
-            &>span {
-              display: inline-block;
-              width: 100%;
-              text-align: right;
-            }
-          }
-
-          .data-info-item-value {
-            flex: 1;
-            word-break: break-all;
-          }
-        }
-      }
-
-      .evidence-info {
-        display: flex;
-        max-width: 1000px;
-        border-top: 1px solid #ecedf1;
-        border-left: 1px solid #ecedf1;
-
-        .evidence-info-value-wrap {
+        .data-info-item-key,
+        .data-info-item-value {
           display: flex;
-          flex-wrap: nowrap;
+          align-items: center;
+          padding: 6px 12px;
+          border-right: 1px solid #ecedf1;
+          border-bottom: 1px solid #ecedf1;
         }
 
-        .evidence-info-key,
-        .evidence-info-value {
-          display: inline-block;
-          width: 168px;
-          flex: 1;
+        .data-info-item-key {
+          width: 160px;
+          background-color: #fafbfd;
+          justify-self: flex-end;
 
-          & > div {
-            height: 32px;
-            padding: 0 12px;
-            line-height: 32px;
-            border-right: 1px solid #ecedf1;
-            border-bottom: 1px solid #ecedf1;
-
-            .evidence-info-item-text {
-              width: 100%;
-              height: 100%;
-              overflow: hidden;
-              text-overflow: ellipsis;
-              word-break: break-all;
-              white-space: nowrap;
-            }
+          &>span {
+            display: inline-block;
+            width: 100%;
+            text-align: right;
           }
         }
 
-        .evidence-info-key {
-          width: 160px;
-          text-align: right;
-          background-color: #fafbfd;
+        .data-info-item-value {
+          flex: 1;
+          word-break: break-all;
+        }
+      }
+    }
+
+    .evidence-info {
+      display: flex;
+      max-width: 1000px;
+      border-top: 1px solid #ecedf1;
+      border-left: 1px solid #ecedf1;
+
+      .evidence-info-value-wrap {
+        display: flex;
+        flex-wrap: nowrap;
+      }
+
+      .evidence-info-key,
+      .evidence-info-value {
+        display: inline-block;
+        width: 168px;
+        flex: 1;
+
+        & > div {
+          height: 32px;
+          padding: 0 12px;
+          line-height: 32px;
+          border-right: 1px solid #ecedf1;
+          border-bottom: 1px solid #ecedf1;
+
+          .evidence-info-item-text {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            word-break: break-all;
+            white-space: nowrap;
+          }
         }
       }
 
-      .active {
-        transform: rotateZ(-180deg);
-        transition: all .15s;
+      .evidence-info-key {
+        width: 160px;
+        text-align: right;
+        background-color: #fafbfd;
       }
+    }
+
+    .active {
+      transform: rotateZ(-180deg);
+      transition: all .15s;
     }
   }
 }

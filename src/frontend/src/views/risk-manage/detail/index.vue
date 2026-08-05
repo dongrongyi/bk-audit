@@ -15,75 +15,49 @@
   to the current version of the project delivered to anyone in the future.
 -->
 <template>
-  <bk-loading :loading="loading || strategyLoading || statusLoading">
+  <bk-loading :loading="pageLoading">
     <div class="risk-manage-detail-wrap mb12">
-      <div
-        class="left"
-        :style="{
-          width: route.name === 'attentionManageDetail' ? '100%' : (
-            isShowSide ? 'calc(100% - 368px)' : '100%'
-          )
-        }">
+      <div class="left">
         <!-- {{ detailData }} -->
         <base-info
           :data="detailData"
           :risk-status-common="riskStatusCommon"
           :strategy-list="strategyList"
           @updated-data="handleUpdatedData" />
-        <!-- 关联事件 -->
-        <div
-          v-if="!detailData.has_report"
-          class="link-event-wrap">
-          <link-event
-            :data="detailData"
-            :strategy-list="strategyList"
-            @get-event-data="handleGetEventData"
-            @updated-data="handleUpdatedData" />
-        </div>
+        <!-- 关联事件列表 / 事件调查报告 -->
         <bk-tab
-          v-else
+          :key="detailData.has_report ? 'risk-detail-with-report' : 'risk-detail-link-only'"
           v-model:active="active"
-          style="margin-top: 16px;"
+          class="risk-detail-tab"
+          :class="{ 'risk-detail-tab--hide-panel-header': !detailData.has_report }"
           type="card-grid">
           <bk-tab-panel
-            v-for="item in panels"
+            v-for="item in visiblePanels"
             :key="item.name"
             :label="item.label"
             :name="item.name">
-            <scroll-faker>
-              <component
-                :is="comMap[item.name]"
-                ref="renderComRef"
-                :data="detailData"
-                :strategy-list="strategyList"
-                @get-event-data="handleGetEventData"
-                @updated-data="handleUpdatedData" />
-            </scroll-faker>
+            <component
+              :is="comMap[item.name]"
+              ref="renderComRef"
+              :data="detailData"
+              :show-section-title="!detailData.has_report"
+              :strategy-list="strategyList"
+              @get-event-data="handleGetEventData"
+              @updated-data="handleUpdatedData" />
           </bk-tab-panel>
         </bk-tab>
       </div>
-      <!-- 事件处理 -->
-      <scroll-faker
+      <risk-handle-dock
         v-if="route.name !== 'attentionManageDetail'"
-        :style="isShowSide ? 'width: 368px; height: auto; min-height: 85vh;' : 'width: 0px; height: 0px;' ">
-        <div class="right">
-          <div
-            class="open-right"
-            @click="handleOpenRight">
-            <audit-icon
-              class="angle-double-up"
-              :style="{ transform: isShowSide ? 'rotateZ(90deg)' : 'rotateZ(-90deg)' }"
-              type="angle-double-up" />
-            <span>{{ isShowSide ? t('收起工单处理') : t('展开工单处理') }}</span>
-          </div>
-          <risk-handle
-            v-if="isShowSide"
-            :data="riskData"
-            :event-data-list="eventDataList"
-            :risk-id="riskData.risk_id"
-            @update="handleUpdate" />
-        </div>
-      </scroll-faker>
+        :current-stage-name="currentStageName"
+        :default-expanded="shouldExpandHandleDock">
+        <risk-handle
+          :data="riskData"
+          embedded
+          :event-data-list="eventDataList"
+          :risk-id="riskData.risk_id"
+          @update="handleUpdate" />
+      </risk-handle-dock>
     </div>
   </bk-loading>
   <teleport
@@ -156,22 +130,26 @@
   import EditEventReport from './components/event-report/edit-event-report.vue';
   import EventReport from './components/event-report/index.vue';
   import LinkEvent from './components/link-event.vue';
+  import RiskHandleDock from './components/risk-handle-dock.vue';
   import RiskHandle from './components/risk-handle/index.vue';
 
   const router = useRouter();
   const route = useRoute();
   const { t } = useI18n();
   const eventDataList = ref();
-  const isShowSide = ref(true);
   const isShowEditEventReport = ref(false);
   const renderComRef = ref();
   const hasAutoOpenedReport = ref(false);
   const { isActive: isHeaderSlotActive, isPageActive, claim: claimHeaderSlot } = usePageHeaderSlot();
 
-  let timeout: undefined | number = undefined;
-  let reportGeneratingTimer: undefined | number = undefined;
-  const handleOpenRight = () => {
-    isShowSide.value = !isShowSide.value;
+  const stageNameMap: Record<string, string> = {
+    await_deal: t('人工处理'),
+    processing: t('人工处理'),
+    for_approve: t('执行处理套餐'),
+    auto_process: t('执行处理套餐'),
+    closed: t('风险单关闭'),
+    new: t('风险单产生'),
+    stand_by: t('风险创建中'),
   };
 
   const comMap: Record<string, any> = {
@@ -185,6 +163,10 @@
   ];
 
   const active = ref<keyof typeof comMap>('eventReport');
+
+  let timeout: undefined | number = undefined;
+  let reportGeneratingTimer: undefined | number = undefined;
+  let syncedActiveTabRiskId: string | undefined;
 
   const {
     loading: strategyLoading,
@@ -213,6 +195,13 @@
     },
     manual: true,
     onSuccess(data) {
+      const riskIdKey = String(data.risk_id ?? route.params.riskId);
+      if (syncedActiveTabRiskId !== riskIdKey) {
+        syncedActiveTabRiskId = riskIdKey;
+        nextTick(() => {
+          active.value = data.has_report ? 'eventReport' : 'linkEvent';
+        });
+      }
       // 如果正在生成报告，启动快速轮询（每3秒）
       if (data.report_generating) {
         startReportGeneratingPolling();
@@ -239,9 +228,34 @@
     manual: true,
   });
 
+  const currentStageName = computed(() => stageNameMap[riskData.value.status] || t('人工处理'));
+
+  // 列表「处理」入口带 tab=handleRisk，进入详情时默认展开工单处理
+  const shouldExpandHandleDock = computed(() => route.query.tab === 'handleRisk');
+
+  // 仅首次进入详情展示全页 loading；后续刷新（添加事件/报告）不再盖一层，避免与子模块 loading 叠两层
+  const pageLoading = computed(() => (
+    (!riskData.value.risk_id && loading.value)
+    || strategyLoading.value
+    || statusLoading.value
+  ));
+
+  const refreshLinkEventList = () => {
+    nextTick(() => {
+      const refs = renderComRef.value;
+      const list = Array.isArray(refs) ? refs : [refs];
+      list.forEach((item: any) => {
+        item?.refreshLinkEvents?.();
+      });
+    });
+  };
+
   const handleUpdate = () => {
     fetchRiskList({
       id: route.params.riskId,
+    }).then(() => {
+      // 添加事件 / 创建调查报告后同步刷新关联事件列表
+      refreshLinkEventList();
     });
   };
   // 轮训查询详情（原有逻辑，60秒一次）
@@ -281,13 +295,46 @@
     isShowEditEventReport.value = true;
   };
 
-  let layoutObserver: MutationObserver | null = null;
-
   // 合并数据（包含事件信息配置）
   const detailData = computed(() => ({
     ...riskData.value,
     ...strategyInfoData.value,
   }));
+
+  // 无调查报告时仅挂载「关联事件列表」panel，并隐藏页签头（由内容区展示区块标题）
+  const visiblePanels = computed(() => (
+    detailData.value.has_report
+      ? panels
+      : panels.filter(item => item.name === 'linkEvent')
+  ));
+
+  watch(
+    () => route.params.riskId,
+    () => {
+      syncedActiveTabRiskId = undefined;
+    },
+  );
+
+  // 新建调查报告后自动切到报告 Tab；轮询刷新不打扰用户当前选中的 Tab
+  watch(
+    () => riskData.value.has_report,
+    (hasReport, hadReport) => {
+      if (hasReport && hadReport === false) {
+        nextTick(() => {
+          active.value = 'eventReport';
+          // tab key 变化会重建子组件，稍后再拉一次关联事件，避免列表停在旧状态
+          nextTick(() => {
+            refreshLinkEventList();
+          });
+        });
+      } else if (!hasReport && hadReport === true) {
+        active.value = 'linkEvent';
+        nextTick(() => {
+          refreshLinkEventList();
+        });
+      }
+    },
+  );
 
   const canGenerateReport = computed(() => (
     !!detailData.value.permission?.edit_risk_v2
@@ -362,19 +409,6 @@
         handleGenerateReport();
       }
     });
-    layoutObserver = new MutationObserver(() => {
-      const left = document.querySelector('.left');
-      const right = document.querySelector('.right') as HTMLDivElement;
-      if (left && right) {
-        right.style.height = `${left.scrollHeight}px`;
-      }
-    });
-    layoutObserver.observe(document.querySelector('.left') as Node, {
-      subtree: true,
-      childList: true,
-      characterData: true,
-      attributes: true,
-    });
   });
 
   onBeforeUnmount(() => {
@@ -382,47 +416,48 @@
       clearTimeout(timeout);
     }
     stopReportGeneratingPolling();
-    layoutObserver?.disconnect();
-    layoutObserver = null;
   });
 </script>
 <style scoped lang="postcss">
 .risk-manage-detail-wrap {
-  display: flex;
-
   .left {
-    width: calc(100% - 368px);
-    padding-right: 16px;
+    width: 100%;
+    padding-right: 0;
 
-    .link-event-wrap {
-      padding: 10px 16px;
+    .risk-detail-tab {
       margin-top: 16px;
-      background: #fff;
-      border-radius: 2px;
-      box-shadow: 0 2px 4px 0 #1919290d;
-    }
-  }
+      overflow: visible;
 
-  .right {
-    .open-right {
-      position: absolute;
-      top: 120px;
-      left: -10px;
-      z-index: 1000;
-      width: 30px;
-      padding: 10px;
-      color: #fff;
-      cursor: pointer;
-      background: #cbccd2;
-      border-radius: 8px;
-      box-shadow: 0 2px 4px 0 #1919290d;
-
-      &:hover {
-        background: #c4c6cc;
+      :deep(.bk-tab-header),
+      :deep(.bk-tab-label),
+      :deep(.bk-tab-header .bk-tab-header-item) {
+        font-family: 'Microsoft YaHei', '微软雅黑', sans-serif;
+        font-size: 14px;
+        font-style: normal;
+        font-weight: 400;
+        line-height: 22px;
+        letter-spacing: 0;
       }
 
-      .angle-double-up {
-        display: inline-block;
+      :deep(.bk-tab-content) {
+        height: auto;
+        min-height: 0;
+        padding: 0;
+        overflow: visible;
+      }
+
+      /* 无调查报告时隐藏 bk-tab-panel 页签头，避免与内容区「关联事件列表」标题重复 */
+      &.risk-detail-tab--hide-panel-header {
+        /* 与上方基本信息区间距 16px；内部顶距由 link-event .body padding-top 提供 */
+        margin-top: 16px;
+
+        :deep(.bk-tab-header) {
+          display: none;
+        }
+
+        :deep(.bk-tab-content) {
+          padding: 0;
+        }
       }
     }
   }
