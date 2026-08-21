@@ -27,6 +27,7 @@ from bk_resource import resource
 from blueapps.utils.logger import logger
 from django.conf import settings
 from django.core.cache import cache
+from django.db import transaction
 from django.db.models import Q, QuerySet
 from django.utils import timezone
 from django.utils.translation import gettext
@@ -213,6 +214,7 @@ class RiskHandler:
             strategy.risk_title if strategy else None
         )
         create_params["title"] = self.render_risk_title(create_params)
+        create_params.pop("_title_template", None)
         return create_params
 
     def create_risk(
@@ -290,7 +292,21 @@ class RiskHandler:
         if manual:
             create_params["manual_synced"] = False
             create_params["display_status"] = RiskDisplayStatus.STAND_BY
-        risk: Risk = Risk.objects.create(**create_params)
+        # 获取分派条件命中结果
+        dispatch_result = self._match_dispatch(event, create_params)
+        # 建单 + 分派信息固化 + 场景绑定需保持原子：中途失败整体回滚
+        with transaction.atomic():
+            risk: Risk = Risk.objects.create(**create_params)
+            if dispatch_result is not None:
+                # 将分派结果（dispatch_rule/confirmer）固化到风险单，后续分派规则编辑不影响已产生单据
+                self._apply_dispatch(risk, dispatch_result)
+                if dispatch_result.dispatch_mode == DispatchMode.DIRECT:
+                    # direct：建单时即建 RISK 场景绑定（after_confirm 延迟到确认时建，仅绑定时机不同）
+                    BindingMetadataHelper.create_risk_scene_binding(risk.risk_id, dispatch_result.target_scene_id)
+            else:
+                # 场景策略
+                scene_id = self._get_strategy_scene_id(event["strategy_id"])
+                BindingMetadataHelper.create_risk_scene_binding(risk.risk_id, scene_id)
         logger.info("[CreateRisk] Risk created. risk_id=%s", risk.risk_id)
 
         # 将风险分派按规则到场景

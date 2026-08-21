@@ -55,6 +55,7 @@ from services.web.risk.constants import (
     RiskStatus,
     TicketNodeStatus,
 )
+from services.web.risk.converter.queryset import RiskPathEqDjangoQuerySetConverter
 from services.web.strategy_v2.models import (
     DispatchRule,
     Strategy,

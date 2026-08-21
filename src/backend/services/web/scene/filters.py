@@ -52,6 +52,7 @@
 
 from typing import Any, Iterable, Sequence
 
+from blueapps.utils.logger import logger
 from django.db.models import Count, QuerySet
 
 from services.web.scene.binding_validation import assert_binding_relation_integrity

@@ -22,7 +22,7 @@ import json
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import cached_property
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from bk_resource import CacheResource, api, resource
 from bk_resource.base import Empty
@@ -47,7 +47,7 @@ from apps.audit.resources import AuditMixinResource
 from apps.feature.constants import FeatureTypeChoices
 from apps.feature.handlers import FeatureHandler
 from apps.meta.constants import NO_TAG_ID, NO_TAG_NAME
-from apps.meta.models import DataMap, EnumMappingRelatedType, Tag
+from apps.meta.models import DataMap, EnumMappingRelatedType, System, Tag
 from apps.meta.serializers import EnumMappingSerializer
 from apps.meta.utils.fields import (
     ACTION_ID,
@@ -472,6 +472,63 @@ class StrategyV2Base(AuditMixinResource, abc.ABC):
             )
 
     @staticmethod
+    def attach_binding_visibility(strategies: List[Strategy]) -> None:
+        """
+        将策略的ResourceBinding信息读取并存入属性visibility中，并将该属性绑定到strategy实例上
+        供列表/详情响应序列化器输出
+        """
+        strategy_ids = [str(s.strategy_id) for s in strategies]
+        if not strategy_ids:
+            return
+        bindings = ResourceBinding.objects.filter(
+            resource_type=ResourceVisibilityType.STRATEGY,
+            resource_id__in=strategy_ids,
+        )
+        scene_rows = ResourceBindingScene.objects.filter(
+            binding__in=bindings, scene__is_deleted=False
+        ).values_list("binding_id", "scene_id")
+        system_rows = ResourceBindingSystem.objects.filter(binding__in=bindings).values_list(
+            "binding_id", "system_id"
+        )
+        binding_scene_map: Dict[str, List[int]] = {}
+        for binding_id, scene_id in scene_rows:
+            binding_scene_map.setdefault(str(binding_id), []).append(scene_id)
+        binding_system_map: Dict[str, List[str]] = {}
+        for binding_id, system_id in system_rows:
+            binding_system_map.setdefault(str(binding_id), []).append(system_id)
+        binding_map = {str(b.resource_id): b for b in bindings}
+        for strategy in strategies:
+            binding = binding_map.get(str(strategy.strategy_id))
+            if binding is None:
+                setattr(strategy, "visibility", None)
+                continue
+            setattr(
+                strategy,
+                "visibility",
+                {
+                    "binding_type": binding.binding_type,
+                    "visibility_type": binding.visibility_type,
+                    "scene_ids": binding_scene_map.get(str(binding.id), []),
+                    "system_ids": binding_system_map.get(str(binding.id), []),
+                },
+            )
+
+    @staticmethod
+    def apply_platform_visibility(binding: ResourceBinding, visibility_data: Optional[dict]) -> None:
+        """
+        应用全局策略可见范围配置（visibility_type + 指定场景/系统关联）
+        """
+        visibility_data = visibility_data or {}
+        binding.visibility_type = visibility_data.get("visibility_type") or VisibilityScope.ALL_VISIBLE
+        binding.save(update_fields=["visibility_type"])
+        binding.binding_scenes.all().delete()
+        binding.binding_systems.all().delete()
+        for scene_id in visibility_data.get("scene_ids", []):
+            ResourceBindingScene.objects.create(binding=binding, scene_id=scene_id)
+        for system_id in visibility_data.get("system_ids", []):
+            ResourceBindingSystem.objects.create(binding=binding, system_id=system_id)
+
+    @staticmethod
     def ensure_active_scene_binding_or_404(strategy_id: int) -> None:
         has_scene_binding = ResourceBindingScene.objects.filter(
             scene__is_deleted=False,
@@ -756,6 +813,9 @@ class DeleteStrategy(StrategyV2Base):
         # delete tags
         StrategyTag.objects.filter(strategy_id=validated_request_data["strategy_id"]).delete()
         StrategyTool.objects.filter(strategy=strategy).delete()
+        # 级联软删规则子表（重命名释放唯一约束），避免残留孤儿规则
+        self._soft_delete_rules(list(strategy.rules.filter(is_deleted=False)))
+        self._soft_delete_rules(list(strategy.dispatch_rules.filter(is_deleted=False)))
         # delete
         try:
             call_controller(
@@ -786,8 +846,14 @@ class ListStrategy(StrategyV2Base):
     audit_action = ActionEnum.LIST_STRATEGY
 
     def perform_request(self, validated_request_data):
-        # 场景过滤
+        # 场景/系统过滤
         scene_id = validated_request_data.pop("scene_id", None)
+        system_id = validated_request_data.pop("system_id", None)
+        # 绑定类型筛选（platform_binding=平台视角仅全局策略；scene_binding=仅场景策略；不传+scene_id=并集）
+        binding_type = validated_request_data.pop("binding_type", None) or None
+        # 校验：binding_type=scene_binding 时必须传 scene_id
+        if binding_type == BindingType.SCENE_BINDING and not scene_id:
+            raise serializers.ValidationError(gettext("binding_type=scene_binding 时必须传 scene_id 参数"))
         # 排序字段
         order_field = validated_request_data.get("order_field") or "-strategy_id"
         # init queryset
@@ -867,6 +933,8 @@ class ListStrategy(StrategyV2Base):
                 to_attr='prefetched_tags',
             )
         )
+        # 批量回填绑定与可见范围（全局策略展示 binding/visibility）
+        self.attach_binding_visibility(list(queryset))
 
         # response
         return queryset
@@ -875,6 +943,58 @@ class ListStrategy(StrategyV2Base):
 class ListStrategyAll(StrategyV2Base):
     name = gettext_lazy("List All Strategy")
     RequestSerializer = ListStrategyAllRequestSerializer
+
+    @staticmethod
+    def filter_queryset_by_scope_relation(queryset, validated_request_data: dict):
+        """
+        按 scope 关联关系过滤策略
+
+            - 都不传：默认平台视角（仅全局策略），与 ListToolAll 默认行为一致
+            - scope_type + scope_id：scene/cross_scene 展开为 scene_id 列表，system/cross_system 展开为 system_id 列表
+            - 无 scope + binding_type：按 binding_type 过滤（scene_binding 单独传 = 全部场景策略）
+        """
+        from services.web.common.constants import ScopeType
+
+        scope_type = validated_request_data.get("scope_type")
+        binding_type = validated_request_data.get("binding_type") or None
+        scope_id = validated_request_data.get("scope_id")
+        # 校验：scope_type=scene 时必须传 scope_id
+        if scope_type == ScopeType.SCENE and not scope_id:
+            raise serializers.ValidationError(gettext("scope_type=scene 时必须传 scope_id 参数"))
+        if not scope_type:
+            # 无 scope 时按 binding_type 过滤；不传默认平台视角（仅全局策略）
+            binding_filter = binding_type or BindingType.PLATFORM_BINDING
+            strategy_ids = ResourceBinding.objects.filter(
+                resource_type=ResourceVisibilityType.STRATEGY,
+                binding_type=binding_filter,
+            ).values_list("resource_id", flat=True)
+            if binding_filter == BindingType.SCENE_BINDING:
+                # 场景级绑定需排除已软删场景的关联
+                strategy_ids = ResourceBindingScene.objects.filter(
+                    binding__resource_type=ResourceVisibilityType.STRATEGY,
+                    binding__binding_type=BindingType.SCENE_BINDING,
+                    scene__is_deleted=False,
+                ).values_list("binding__resource_id", flat=True)
+            return queryset.filter(strategy_id__in=strategy_ids)
+        # scope 视角：展开为 scene/system ID 列表后走组合过滤
+        scene_ids: List[int] = []
+        system_ids: List[str] = []
+        if scope_type == ScopeType.SCENE:
+            scene_ids = [int(scope_id)]
+        elif scope_type == ScopeType.CROSS_SCENE:
+            scene_ids = list(Scene.objects.filter(is_deleted=False).values_list("scene_id", flat=True))
+        elif scope_type == ScopeType.SYSTEM:
+            system_ids = [str(scope_id)]
+        elif scope_type == ScopeType.CROSS_SYSTEM:
+            system_ids = list(System.objects.values_list("system_id", flat=True))
+        return CompositeScopeFilter.filter_queryset(
+            queryset=queryset,
+            binding_type=binding_type,
+            scene_id=scene_ids,
+            system_id=system_ids,
+            resource_type=ResourceVisibilityType.STRATEGY,
+            pk_field="strategy_id",
+        )
 
     def perform_request(self, validated_request_data):
         strategies: QuerySet[Strategy] = Strategy.objects.exclude(source=StrategySource.SYSTEM)
@@ -1122,7 +1242,9 @@ class ListStrategyTags(StrategyV2Base):
         scene_id = validated_request_data["scene_id"]
         strategies = CompositeScopeFilter.filter_queryset(
             queryset=Strategy.objects.exclude(source=StrategySource.SYSTEM),
+            binding_type=binding_type,
             scene_id=scene_id,
+            system_id=system_id,
             resource_type=ResourceVisibilityType.STRATEGY,
             pk_field="strategy_id",
         )
@@ -2132,6 +2254,8 @@ class RetrieveStrategy(StrategyV2Base):
     def perform_request(self, validated_request_data):
         strategy_id = validated_request_data["strategy_id"]
         strategy = get_object_or_404(Strategy, strategy_id=strategy_id)
+        # 回填绑定与可见范围
+        self.attach_binding_visibility([strategy])
         return strategy
 
 

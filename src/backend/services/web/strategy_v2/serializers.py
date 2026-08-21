@@ -45,6 +45,7 @@ from services.web.analyze.constants import (
 from services.web.analyze.exceptions import ControlNotExist
 from services.web.analyze.models import Control, ControlVersion
 from services.web.common.caller_permission import CALLER_RESOURCE_TYPE_CHOICES
+from services.web.common.constants import ScopeType
 from services.web.risk.constants import EVENT_BASIC_MAP_FIELDS
 from services.web.risk.report_config import ReportConfig
 from services.web.scene.constants import BindingType, ResourceVisibilityType
@@ -978,15 +979,21 @@ class CreateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
     risk_meta_field_config = serializers.ListField(
         label=gettext_lazy("Risk Meta Field Config"), child=EventBasicFieldSerializer(), default=list, allow_empty=True
     )
-    risk_level = serializers.ChoiceField(label=gettext_lazy("Risk Level"), choices=RiskLevel.choices)
-    risk_title = serializers.CharField(label=gettext_lazy("Risk Title"))
+    risk_level = serializers.ChoiceField(
+        label=gettext_lazy("Risk Level"), choices=RiskLevel.choices, required=False, allow_null=True
+    )
+    risk_title = serializers.CharField(
+        label=gettext_lazy("Risk Title"), required=False, allow_null=True, allow_blank=True
+    )
     source = serializers.ChoiceField(
         label=gettext_lazy("Strategy Source"), choices=StrategySource.choices, default=StrategySource.USER
     )
     processor_groups = serializers.ListField(
         label=gettext_lazy("Processor Groups"),
         child=serializers.IntegerField(label=gettext_lazy("Processor Group")),
-        allow_empty=False,
+        required=False,
+        allow_empty=True,
+        default=list,
     )
     report_config = ReportConfigSerializer(required=False, allow_null=True)
     rules = StrategyRuleSerializer(many=True, required=False, default=list)
@@ -1101,16 +1108,22 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
     risk_meta_field_config = serializers.ListField(
         label=gettext_lazy("Risk Meta Field Config"), child=EventBasicFieldSerializer(), default=list, allow_empty=True
     )
-    risk_title = serializers.CharField(label=gettext_lazy("Risk Title"))
+    risk_title = serializers.CharField(
+        label=gettext_lazy("Risk Title"), required=False, allow_null=True, allow_blank=True
+    )
     source = serializers.ChoiceField(
         label=gettext_lazy("Strategy Source"), choices=StrategySource.choices, default=StrategySource.USER
     )
     processor_groups = serializers.ListField(
         label=gettext_lazy("Processor Groups"),
         child=serializers.IntegerField(label=gettext_lazy("Processor Group")),
-        allow_empty=False,
+        required=False,
+        allow_empty=True,
+        default=list,
     )
-    risk_level = serializers.ChoiceField(label=gettext_lazy("Risk Level"), choices=RiskLevel.choices)
+    risk_level = serializers.ChoiceField(
+        label=gettext_lazy("Risk Level"), choices=RiskLevel.choices, required=False, allow_null=True
+    )
     report_config = ReportConfigSerializer(required=False, allow_null=True)
     rules = StrategyRuleSerializer(many=True, required=False, default=list)
     dispatch_rules = DispatchRuleSerializer(many=True, required=False, default=list)
@@ -1201,7 +1214,27 @@ class ListStrategyRequestSerializer(serializers.Serializer):
     """
 
     namespace = serializers.CharField(label=gettext_lazy("Namespace"))
-    scene_id = serializers.IntegerField(label=gettext_lazy("场景ID"), required=True, help_text="按场景过滤策略")
+    scene_id = serializers.IntegerField(
+        label=gettext_lazy("场景ID"),
+        required=False,
+        allow_null=True,
+        help_text=gettext_lazy("按场景过滤策略,可见范围为指定场景/全场景的全局策略"),
+    )
+    system_id = serializers.CharField(
+        label=gettext_lazy("系统ID"),
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        help_text=gettext_lazy("按系统过滤策略，可见范围为指定系统/全系统的全局策略"),
+    )
+    binding_type = serializers.ChoiceField(
+        label=gettext_lazy("绑定类型"),
+        choices=BindingType.choices,
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        help_text=gettext_lazy("筛选策略绑定类型（scene_binding=场景策略 / platform_binding=全局策略）"),
+    )
     strategy_id = serializers.CharField(label=gettext_lazy("Strategy ID"), required=False)
     strategy_name = serializers.CharField(label=gettext_lazy("Strategy Name"), required=False)
     tag = serializers.CharField(label=gettext_lazy("Tag"), required=False)
@@ -1235,7 +1268,7 @@ class ListStrategyRequestSerializer(serializers.Serializer):
         data = super().validate(attrs)
         # split into array
         for key, val in data.items():
-            if key in ["namespace", "order_field", "order_type", "scene_id", "system_id"]:
+            if key in ["namespace", "order_field", "order_type", "scene_id", "system_id", "binding_type"]:
                 continue
             data[key] = [i for i in val.split(",") if i] if val else []
         # order
@@ -1250,9 +1283,43 @@ class ListStrategyRequestSerializer(serializers.Serializer):
 
 
 class ListStrategyAllRequestSerializer(serializers.Serializer):
-    """策略 all 接口请求参数（可选按场景过滤）"""
+    """策略 all 接口请求参数（根据scope_type和scope_id过滤）"""
 
-    scene_id = serializers.IntegerField(label=gettext_lazy("场景ID"), required=False, allow_null=True)
+    binding_type = serializers.ChoiceField(
+        label=gettext_lazy("绑定类型"),
+        choices=BindingType.choices,
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        help_text=gettext_lazy("可选：platform_binding=平台级，scene_binding=场景级；不传时默认平台级"),
+    )
+    scope_type = serializers.ChoiceField(
+        label=gettext_lazy("范围类型"),
+        choices=ScopeType.choices,
+        required=False,
+        allow_null=True,
+        help_text=gettext_lazy("可选：scene=场景，cross_scene=跨场景，system=系统，cross_system=跨系统"),
+    )
+    scope_id = serializers.CharField(
+        label=gettext_lazy("范围ID"),
+        required=False,
+        allow_blank=True,
+        allow_null=True,
+        help_text=gettext_lazy("scope_type=scene/system 时必填，对应场景ID/系统ID"),
+    )
+
+    def validate(self, attrs: dict) -> dict:
+        from services.web.common.constants import ScopeType
+
+        scope_type = attrs.get("scope_type")
+        scope_id = attrs.get("scope_id")
+        if not scope_type:
+            attrs.pop("scope_type", None)
+            attrs.pop("scope_id", None)
+            return attrs
+        if not scope_id and scope_type in {ScopeType.SCENE, ScopeType.SYSTEM}:
+            raise serializers.ValidationError({"scope_id": gettext("scope_type 为 scene/system 时必须携带 scope_id")})
+        return attrs
 
 
 class StrategyToolSerializer(serializers.ModelSerializer):
@@ -1266,6 +1333,23 @@ class StrategyToolSerializer(serializers.ModelSerializer):
         ]
 
 
+class StrategyVisibilitySerializer(serializers.Serializer):
+    """策略绑定可见范围回显"""
+
+    binding_type = serializers.ChoiceField(
+        choices=BindingType.choices, required=False, allow_null=True, label=gettext_lazy("绑定类型")
+    )
+    visibility_type = serializers.ChoiceField(
+        choices=VisibilityScope.choices, required=False, allow_null=True, label=gettext_lazy("可见范围类型")
+    )
+    scene_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, label=gettext_lazy("可见场景ID列表")
+    )
+    system_ids = serializers.ListField(
+        child=serializers.CharField(), required=False, label=gettext_lazy("可见系统ID列表")
+    )
+
+
 class ListStrategyResponseSerializer(serializers.ModelSerializer):
     """
     List Strategy
@@ -1277,6 +1361,7 @@ class ListStrategyResponseSerializer(serializers.ModelSerializer):
     report_status = serializers.SerializerMethodField(
         label=gettext_lazy("事件调查报告状态"),
     )
+    visibility = StrategyVisibilitySerializer(required=False, allow_null=True, label=gettext_lazy("可见范围"))
 
     def get_tags(self, obj):
         """
@@ -1481,7 +1566,24 @@ class ListStrategyTagsResponseSerializer(serializers.Serializer):
 class ListStrategyTagsRequestSerializer(serializers.Serializer):
     """List Strategy Tags Request"""
 
-    scene_id = serializers.IntegerField(label=gettext_lazy("场景ID"), required=True, help_text="按场景过滤策略标签")
+    scene_id = serializers.IntegerField(
+        label=gettext_lazy("场景ID"), required=False, allow_null=True, help_text=gettext_lazy("按场景过滤策略标签；平台视角不传")
+    )
+    system_id = serializers.CharField(
+        label=gettext_lazy("系统ID"),
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        help_text=gettext_lazy("按系统过滤策略标签（系统视角）"),
+    )
+    binding_type = serializers.ChoiceField(
+        label=gettext_lazy("绑定类型"),
+        choices=BindingType.choices,
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        help_text=gettext_lazy("筛选策略绑定类型（scene_binding=场景策略 / platform_binding=全局策略）"),
+    )
 
 
 class StrategyTagResourceSerializer(serializers.Serializer):
