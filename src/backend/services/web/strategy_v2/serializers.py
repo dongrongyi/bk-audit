@@ -721,8 +721,7 @@ class StrategyRuleSerializer(serializers.Serializer):
     )
     conditions = serializers.DictField(
         label=gettext_lazy("Conditions"),
-        required=False,
-        allow_null=True,
+        required=True,
         help_text=gettext_lazy('{"where": {...}, "having": {...}}'),
     )
     risk_title = serializers.CharField(label=gettext_lazy("Risk Title"), required=False, allow_null=True, allow_blank=True, max_length=255)
@@ -736,14 +735,14 @@ class StrategyRuleSerializer(serializers.Serializer):
         child=serializers.IntegerField(label=gettext_lazy("Processor Group")),
         required=False,
         default=list,
-        help_text=gettext_lazy("处理人通知组 ID 列表s"),
+        help_text=gettext_lazy("处理人通知组 ID 列表（场景策略使用）"),
     )
     follower = serializers.ListField(
         label=gettext_lazy("Follower"),
         child=serializers.IntegerField(label=gettext_lazy("Follower Group")),
         required=False,
         default=list,
-        help_text=gettext_lazy("关注人通知组 ID 列表"),
+        help_text=gettext_lazy("关注人通知组 ID 列表（场景策略使用）"),
     )
 
 
@@ -766,22 +765,19 @@ class DispatchRuleSerializer(serializers.Serializer):
     processor = serializers.ListField(
         label=gettext_lazy("Processor"),
         child=serializers.IntegerField(label=gettext_lazy("Processor Group")),
-        required=False,
-        default=list,
+        required=True,
         help_text=gettext_lazy("处理人通知组 ID 列表（通知组须属于目标场景）"),
     )
     follower = serializers.ListField(
         label=gettext_lazy("Follower"),
         child=serializers.IntegerField(label=gettext_lazy("Follower Group")),
-        required=False,
-        default=list,
+        required=True,
         help_text=gettext_lazy("关注人通知组 ID 列表（通知组须属于目标场景）"),
     )
     confirmer = serializers.ListField(
         label=gettext_lazy("Confirmer"),
         child=serializers.IntegerField(label=gettext_lazy("Confirmer Group")),
-        required=False,
-        default=list,
+        required=True,
         help_text=gettext_lazy("确认人通知组 ID 列表"),
     )
     dispatch_mode = serializers.ChoiceField(
@@ -826,12 +822,17 @@ class MultiRuleValidateMixin:
     def _check_rules(self, attrs: dict) -> dict:
         """校验发现规则集（attrs["rules"]）；由 Create/Update 序列化器在 validate() 中显式调用"""
         rules = attrs.get("rules") or []
-        if not rules:
+        strategy_type = attrs.get("strategy_type")
+
+        # 模型策略不允许有发现规则
+        if strategy_type != StrategyType.RULE.value:
+            if rules:
+                raise serializers.ValidationError(gettext("发现规则仅支持规则审计策略（rule），模型策略无发现规则"))
             return attrs
-        if attrs.get("strategy_type") != StrategyType.RULE.value:
-            raise serializers.ValidationError(gettext("发现规则仅支持规则审计策略（rule），模型策略无发现规则"))
+
+        # 规则策略必须至少有一条发现规则
         if not rules:
-            raise serializers.ValidationError(gettext("规则审计策略至少需要一条发现规则"))
+            raise serializers.ValidationError(gettext("规则审计策略（strategy_type=rule）必须至少配置一条发现规则"))
 
         # rule_name 策略内唯一
         names = [r.get("rule_name") for r in rules]
@@ -978,15 +979,21 @@ class CreateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
     risk_meta_field_config = serializers.ListField(
         label=gettext_lazy("Risk Meta Field Config"), child=EventBasicFieldSerializer(), default=list, allow_empty=True
     )
-    risk_level = serializers.ChoiceField(label=gettext_lazy("Risk Level"), choices=RiskLevel.choices)
-    risk_title = serializers.CharField(label=gettext_lazy("Risk Title"))
+    risk_level = serializers.ChoiceField(
+        label=gettext_lazy("Risk Level"), choices=RiskLevel.choices, required=False, allow_null=True
+    )
+    risk_title = serializers.CharField(
+        label=gettext_lazy("Risk Title"), required=False, allow_null=True, allow_blank=True
+    )
     source = serializers.ChoiceField(
         label=gettext_lazy("Strategy Source"), choices=StrategySource.choices, default=StrategySource.USER
     )
     processor_groups = serializers.ListField(
         label=gettext_lazy("Processor Groups"),
         child=serializers.IntegerField(label=gettext_lazy("Processor Group")),
-        allow_empty=False,
+        required=False,
+        allow_empty=True,
+        default=list,
     )
     report_config = ReportConfigSerializer(required=False, allow_null=True)
     rules = StrategyRuleSerializer(many=True, required=False, default=list)
@@ -1035,6 +1042,11 @@ class CreateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
         if binding_type == BindingType.PLATFORM_BINDING and data.get("scene_id"):
             raise serializers.ValidationError(gettext("全局策略（binding_type=platform_binding）不允许携带 scene_id"))
         data["binding_type"] = binding_type
+        # processor_groups 条件必填：模型策略必须配置
+        strategy_type = data.get("strategy_type")
+        processor_groups = data.get("processor_groups")
+        if strategy_type == StrategyType.MODEL.value and not processor_groups:
+            raise serializers.ValidationError(gettext("模型策略（strategy_type=model）必须配置 processor_groups"))
         # check name
         if Strategy.objects.filter(strategy_name=attrs["strategy_name"]).exists():
             raise serializers.ValidationError(gettext("Strategy Name Duplicate"))
@@ -1101,16 +1113,22 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
     risk_meta_field_config = serializers.ListField(
         label=gettext_lazy("Risk Meta Field Config"), child=EventBasicFieldSerializer(), default=list, allow_empty=True
     )
-    risk_title = serializers.CharField(label=gettext_lazy("Risk Title"))
+    risk_title = serializers.CharField(
+        label=gettext_lazy("Risk Title"), required=False, allow_null=True, allow_blank=True
+    )
     source = serializers.ChoiceField(
         label=gettext_lazy("Strategy Source"), choices=StrategySource.choices, default=StrategySource.USER
     )
     processor_groups = serializers.ListField(
         label=gettext_lazy("Processor Groups"),
         child=serializers.IntegerField(label=gettext_lazy("Processor Group")),
-        allow_empty=False,
+        required=False,
+        allow_empty=True,
+        default=list,
     )
-    risk_level = serializers.ChoiceField(label=gettext_lazy("Risk Level"), choices=RiskLevel.choices)
+    risk_level = serializers.ChoiceField(
+        label=gettext_lazy("Risk Level"), choices=RiskLevel.choices, required=False, allow_null=True
+    )
     report_config = ReportConfigSerializer(required=False, allow_null=True)
     rules = StrategyRuleSerializer(many=True, required=False, default=list)
     dispatch_rules = DispatchRuleSerializer(many=True, required=False, default=list)
@@ -1162,6 +1180,18 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
                 raise serializers.ValidationError(gettext("场景策略（binding_type=scene_binding）必须携带 scene_id"))
             if binding_type == BindingType.PLATFORM_BINDING and data.get("scene_id"):
                 raise serializers.ValidationError(gettext("全局策略（binding_type=platform_binding）不允许携带 scene_id"))
+        # processor_groups 条件必填：模型策略必须配置
+        strategy_type = data.get("strategy_type")
+        processor_groups = data.get("processor_groups")
+        if strategy_type == StrategyType.MODEL.value and not processor_groups:
+            # 更新时如果没传 processor_groups，检查数据库中是否已有值
+            strategy_id = data.get("strategy_id")
+            if strategy_id:
+                existing_strategy = Strategy.objects.filter(strategy_id=strategy_id).first()
+                if existing_strategy and not existing_strategy.processor_groups:
+                    raise serializers.ValidationError(gettext("模型策略（strategy_type=model）必须配置 processor_groups"))
+            else:
+                raise serializers.ValidationError(gettext("模型策略（strategy_type=model）必须配置 processor_groups"))
         # check name
         if (
             Strategy.objects.filter(strategy_name=attrs["strategy_name"])

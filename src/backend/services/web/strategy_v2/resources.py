@@ -22,7 +22,7 @@ import json
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import cached_property
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from bk_resource import CacheResource, api, resource
 from bk_resource.base import Empty
@@ -314,14 +314,27 @@ class StrategyV2Base(AuditMixinResource, abc.ABC):
         return get_md5(json.dumps(digest_items, sort_keys=True, ensure_ascii=False))
 
     @staticmethod
+    def _soft_delete_rules(rules: List[Any]) -> None:
+        """
+        软删规则并重命名：释放 (strategy, rule_name) 唯一约束，避免软删后同名重建触发 unique_together
+        """
+        for rule in rules:
+            max_length = rule._meta.get_field("rule_name").max_length
+            suffix = f"__deleted_{rule.rule_id}"
+            rule.rule_name = f"{rule.rule_name[: max_length - len(suffix)]}{suffix}"
+            rule.is_deleted = True
+            # 走 Model.save 保留 updated_at/updated_by 审计字段
+            rule.save(update_fields=["rule_name", "is_deleted"])
+
+    @staticmethod
     def _sync_strategy_rules(strategy: Strategy, rules_data: Optional[List[dict]]) -> None:
         """
         同步发现规则子表（软删缺失规则、更新/新建传入规则）
 
         - 请求中有 rule_id → 保留并更新
         - 请求中无 rule_id → 新建
-        - 数据库有但请求中没有 → 软删
-        rule_order按请求顺序重建
+        - 数据库有但请求中没有 → 软删（重命名释放唯一约束）
+        - rule_order 严格按请求顺序重建（新建规则按请求位置插入，而非 DB 自增 ID 序）
         """
         from services.web.strategy_v2.models import StrategyRule
 
@@ -331,7 +344,8 @@ class StrategyV2Base(AuditMixinResource, abc.ABC):
         existing_ids = set(strategy.rules.filter(is_deleted=False).values_list("rule_id", flat=True))
         keep_ids = [r.get("rule_id") for r in rules_data if r.get("rule_id")]
         # 软删未出现在请求中的规则（仅限本策略范围内）
-        strategy.rules.exclude(rule_id__in=keep_ids).filter(is_deleted=False).update(is_deleted=True)
+        StrategyV2Base._soft_delete_rules(list(strategy.rules.exclude(rule_id__in=keep_ids).filter(is_deleted=False)))
+        ordered_ids: List[int] = []
         for rule_data in rules_data:
             rule_id = rule_data.get("rule_id")
             # 越权校验：传入的 rule_id 必须属于本策略，避免误操作系统其他策略的规则
@@ -349,19 +363,24 @@ class StrategyV2Base(AuditMixinResource, abc.ABC):
                 "processor": rule_data.get("processor") or [],
                 "follower": rule_data.get("follower") or [],
             }
-            if rule_data.get("rule_id"):
-                strategy.rules.filter(rule_id=rule_data["rule_id"], is_deleted=False).update(**fields)
+            if rule_id:
+                rule = strategy.rules.filter(rule_id=rule_id, is_deleted=False).first()
+                if rule is None:
+                    raise serializers.ValidationError(
+                        gettext("发现规则[rule_id=%s]不属于当前策略，无法更新") % rule_id
+                    )
+                for key, val in fields.items():
+                    setattr(rule, key, val)
+                # 走 Model.save 保留 updated_at/updated_by 审计字段
+                rule.save(update_fields=list(fields.keys()))
             else:
-                StrategyRule.objects.create(strategy=strategy, **fields)
-        # 重建 rule_order：按请求顺序排列
-        active_rules = {r.rule_id: r for r in strategy.rules.filter(is_deleted=False)}
-        ordered_ids = []
-        for rule_data in rules_data:
-            rid = rule_data.get("rule_id")
-            if rid and rid in active_rules:
-                ordered_ids.append(rid)
-        # 请求未含 rule_id 的新建规则追加到末尾
-        ordered_ids.extend(rid for rid in active_rules if rid not in ordered_ids)
+                rule = StrategyRule.objects.create(strategy=strategy, **fields)
+                rule_id = rule.rule_id
+            if rule_id not in ordered_ids:
+                ordered_ids.append(rule_id)
+        # 防御：请求之外的存量活跃规则（正常不应存在）追加到末尾
+        active_ids = set(strategy.rules.filter(is_deleted=False).values_list("rule_id", flat=True))
+        ordered_ids.extend(rid for rid in active_ids if rid not in ordered_ids)
         strategy.rule_order = ordered_ids
         strategy.save(update_fields=["rule_order"])
 
@@ -372,8 +391,8 @@ class StrategyV2Base(AuditMixinResource, abc.ABC):
 
         - 请求中有 rule_id → 保留并更新
         - 请求中无 rule_id → 新建
-        - 数据库有但请求中没有 → 软删
-        dispatch_rule_order 按请求顺序重建
+        - 数据库有但请求中没有 → 软删（重命名释放唯一约束）
+        - dispatch_rule_order 严格按请求顺序重建（新建规则按请求位置插入，而非 DB 自增 ID 序）
         """
         from services.web.strategy_v2.models import DispatchRule
 
@@ -382,7 +401,10 @@ class StrategyV2Base(AuditMixinResource, abc.ABC):
         # 本策略已有的（未软删）规则 id 集合，用于归属校验与 order 重建
         existing_ids = set(strategy.dispatch_rules.filter(is_deleted=False).values_list("rule_id", flat=True))
         keep_ids = [r.get("rule_id") for r in dispatch_rules_data if r.get("rule_id")]
-        strategy.dispatch_rules.exclude(rule_id__in=keep_ids).filter(is_deleted=False).update(is_deleted=True)
+        StrategyV2Base._soft_delete_rules(
+            list(strategy.dispatch_rules.exclude(rule_id__in=keep_ids).filter(is_deleted=False))
+        )
+        ordered_ids: List[int] = []
         for rule_data in dispatch_rules_data:
             rule_id = rule_data.get("rule_id")
             # 越权校验：传入的 rule_id 必须属于本策略，避免误操作系统其他策略的规则
@@ -400,14 +422,24 @@ class StrategyV2Base(AuditMixinResource, abc.ABC):
                 "dispatch_mode": rule_data.get("dispatch_mode"),
                 "is_default": bool(rule_data.get("is_default")),
             }
-            if rule_data.get("rule_id"):
-                strategy.dispatch_rules.filter(rule_id=rule_data["rule_id"], is_deleted=False).update(**fields)
+            if rule_id:
+                rule = strategy.dispatch_rules.filter(rule_id=rule_id, is_deleted=False).first()
+                if rule is None:
+                    raise serializers.ValidationError(
+                        gettext("分派规则[rule_id=%s]不属于当前策略，无法更新") % rule_id
+                    )
+                for key, val in fields.items():
+                    setattr(rule, key, val)
+                # 走 Model.save 保留 updated_at/updated_by 审计字段
+                rule.save(update_fields=list(fields.keys()))
             else:
-                DispatchRule.objects.create(strategy=strategy, **fields)
-        # 重建 dispatch_rule_order：按请求顺序（校验层已保证默认规则唯一）
-        active_rules = {r.rule_id for r in strategy.dispatch_rules.filter(is_deleted=False)}
-        ordered_ids = [r.get("rule_id") for r in dispatch_rules_data if r.get("rule_id") in active_rules]
-        ordered_ids.extend(rid for rid in active_rules if rid not in ordered_ids)
+                rule = DispatchRule.objects.create(strategy=strategy, **fields)
+                rule_id = rule.rule_id
+            if rule_id not in ordered_ids:
+                ordered_ids.append(rule_id)
+        # 防御：请求之外的存量活跃规则（正常不应存在）追加到末尾
+        active_ids = set(strategy.dispatch_rules.filter(is_deleted=False).values_list("rule_id", flat=True))
+        ordered_ids.extend(rid for rid in active_ids if rid not in ordered_ids)
         strategy.dispatch_rule_order = ordered_ids
         strategy.save(update_fields=["dispatch_rule_order"])
 
@@ -756,6 +788,9 @@ class DeleteStrategy(StrategyV2Base):
         # delete tags
         StrategyTag.objects.filter(strategy_id=validated_request_data["strategy_id"]).delete()
         StrategyTool.objects.filter(strategy=strategy).delete()
+        # 级联软删规则子表（重命名释放唯一约束），避免残留孤儿规则
+        self._soft_delete_rules(list(strategy.rules.filter(is_deleted=False)))
+        self._soft_delete_rules(list(strategy.dispatch_rules.filter(is_deleted=False)))
         # delete
         try:
             call_controller(

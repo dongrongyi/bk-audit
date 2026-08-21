@@ -52,6 +52,7 @@
 
 from typing import Any, Iterable, Sequence
 
+from blueapps.utils.logger import logger
 from django.db.models import Count, QuerySet
 
 from services.web.scene.binding_validation import assert_binding_relation_integrity
@@ -253,6 +254,14 @@ class BindingMetadataHelper:
         from services.web.scene.constants import ResourceVisibilityType
 
         if not scene_id:
+            return
+        # 目标场景不存在或已软删时不建绑定（避免风险挂到已删场景形成脏数据），记录日志供排查
+        if not Scene.objects.filter(scene_id=scene_id, is_deleted=False).exists():
+            logger.warning(
+                "[CreateRiskSceneBinding] scene %s not exists or deleted, skip binding. risk_id=%s",
+                scene_id,
+                risk_id,
+            )
             return
         resource_id = str(risk_id)
         binding = ResourceBinding.objects.filter(
