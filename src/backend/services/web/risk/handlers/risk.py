@@ -192,7 +192,9 @@ class RiskHandler:
         strategy_rule_id = event.get("strategy_rule_id")
         rule: Optional[StrategyRule] = None
         if strategy_rule_id:
-            rule = StrategyRule.objects.filter(rule_id=strategy_rule_id, is_deleted=False).first()
+            # strategy_rule_id 为 SQL 固化输出，规则可能已被软删（flow 重建窗口期），绕过软删过滤读取，
+            # 保留规则血缘（strategy_rule_id/规则级元信息），否则去重键断裂导致窗口期重复出单
+            rule = StrategyRule._base_manager.filter(rule_id=strategy_rule_id).first()
             if rule is not None and rule.strategy_id != event["strategy_id"]:
                 # 事件的规则归属与策略不一致（异常事件），按无规则处理走策略级回退
                 logger.warning(
@@ -292,13 +294,14 @@ class RiskHandler:
         if manual:
             create_params["manual_synced"] = False
             create_params["display_status"] = RiskDisplayStatus.STAND_BY
-        # 获取分派条件命中结果
+        # 全局策略：建单前先做分派匹配（未命中即数据异常，失败于建单前，避免产生无场景归属的孤儿单）
         dispatch_result = self._match_dispatch(event, create_params)
-        # 建单 + 分派信息固化 + 场景绑定需保持原子：中途失败整体回滚
+        # 建单 + 分派固化 + 场景绑定需保持原子：中途失败整体回滚，避免产生无归属/未固化的半成品单
         with transaction.atomic():
             risk: Risk = Risk.objects.create(**create_params)
             if dispatch_result is not None:
-                # 将分派结果（dispatch_rule/confirmer）固化到风险单，后续分派规则编辑不影响已产生单据
+                # 全局策略：二次确认为必经环节，两种分派方式均进入 PENDING_CONFIRM，确认后流转；
+                # 分派结果（dispatch_rule/confirmer）固化到风险单，后续分派规则编辑不影响已产生单据
                 self._apply_dispatch(risk, dispatch_result)
                 if dispatch_result.dispatch_mode == DispatchMode.DIRECT:
                     # direct：建单时即建 RISK 场景绑定（after_confirm 延迟到确认时建，仅绑定时机不同）
@@ -309,29 +312,18 @@ class RiskHandler:
                 BindingMetadataHelper.create_risk_scene_binding(risk.risk_id, scene_id)
         logger.info("[CreateRisk] Risk created. risk_id=%s", risk.risk_id)
 
-        # 将风险分派按规则到场景
-        # 分派结果（dispatch_rule/confirmer）固化到风险单，后续分派规则编辑不影响已产生单据
-        dispatch_result = self._dispatch_risk(risk, event, create_params)
-        if dispatch_result is not None and dispatch_result.dispatch_mode == DispatchMode.AFTER_CONFIRM:
-            # 全局策略：确认后分派：进入 PENDING_CONFIRM，等待 confirmer 确认（确认接口负责建绑定 + NewRisk 分流）
-            # 不渲染报告、不通知关注人/处理人（确认后再触发），仅通知确认人
-            self._send_confirm_notice(risk, dispatch_result.confirmer)
-            return False, risk
-
-        # 全局策略：direct 分派：建 RISK 场景绑定
         if dispatch_result is not None:
-            BindingMetadataHelper.create_risk_scene_binding(risk.risk_id, dispatch_result.target_scene_id)
-        else:
-            # 场景策略
-            scene_id = self._get_strategy_scene_id(event["strategy_id"])
-            BindingMetadataHelper.create_risk_scene_binding(risk.risk_id, scene_id)
+            # 全局策略：待确认阶段不渲染报告、不通知关注人/处理人、不自动流转（确认后触发），
+            # 仅通知确认人；事务提交后发送，保证接收人收到通知时数据已落库
+            self._send_confirm_notice(risk, risk.confirmer)
+            return False, risk
         return True, risk
 
-    def _dispatch_risk(self, risk: Risk, event: dict, create_params: dict):
+    def _match_dispatch(self, event: dict, create_params: dict):
         """
-        全局策略分派：按 dispatch_rule_order 首匹配分派规则，固化 dispatch_rule/confirmer。
+        全局策略分派匹配：按 dispatch_rule_order 首匹配分派规则
 
-        :return: DispatchResult（matched=False 或非全局策略时返回 None，调用方按场景策略处理）
+        :return: DispatchResult；非全局策略时返回 None，调用方按场景策略处理；
         """
         from services.web.strategy_v2.handlers.dispatch import match_dispatch_rule
 
@@ -358,21 +350,27 @@ class RiskHandler:
         }
         dispatch_result = match_dispatch_rule(ctx, strategy=strategy)
         if not dispatch_result.matched:
-            logger.warning(
-                "[DispatchRisk] no dispatch rule matched. risk_id=%s, strategy_id=%s",
-                risk.risk_id,
+            logger.error(
+                "[DispatchRisk] no dispatch rule matched. strategy_id=%s, raw_event_id=%s",
                 event["strategy_id"],
+                event.get("raw_event_id"),
             )
-            return None
-        risk.dispatch_rule_id = dispatch_result.rule.rule_id
-        risk.confirmer = dispatch_result.confirmer
-        if dispatch_result.dispatch_mode == DispatchMode.AFTER_CONFIRM:
-            # 确认后分派：进入待确认状态（display_status 同步，否则列表页展示为空；
-            # 周期任务 process_one_risk 的 match 无该分支会跳过，由确认/驳回接口驱动流转）
-            risk.status = RiskStatus.PENDING_CONFIRM
-            risk.display_status = RiskDisplayStatus.PENDING_CONFIRM
-        risk.save(update_fields=["dispatch_rule", "confirmer", "status", "display_status"])
+            raise ValueError(
+                gettext("全局策略[%s]分派规则未命中且无默认兜底规则，请检查策略分派规则配置") % event["strategy_id"]
+            )
         return dispatch_result
+
+    def _apply_dispatch(self, risk: Risk, dispatch_result) -> None:
+        """
+        将分派结果固化到风险单（dispatch_rule/confirmer/待确认状态）
+        """
+        risk.dispatch_rule_id = dispatch_result.rule.rule_id
+        notice_groups = list(NoticeGroup.objects.filter(group_id__in=dispatch_result.confirmer))
+        risk.confirmer = RiskNoticeParser(risk=risk).parse_groups(notice_groups)
+        # display_status 同步，否则列表页展示为空；周期任务 process_one_risk 的 match 无该分支会跳过，
+        risk.status = RiskStatus.PENDING_CONFIRM
+        risk.display_status = RiskDisplayStatus.PENDING_CONFIRM
+        risk.save(update_fields=["dispatch_rule", "confirmer", "status", "display_status"])
 
     def _get_strategy_scene_id(self, strategy_id) -> Optional[int]:
         """策略绑定的场景 ID（场景策略）"""
@@ -386,18 +384,13 @@ class RiskHandler:
             .first()
         )
 
-    def _send_confirm_notice(self, risk: Risk, confirmer: List[int]) -> None:
+    def _send_confirm_notice(self, risk: Risk, confirmer: List[str]) -> None:
         """
         PENDING_CONFIRM 阶段通知确认人，复用 notice 模块的默认配置；确认人接收后经确认接口流转。
 
-        confirmer 为通知组 ID 列表（分派规则固化快照），发送时解析为组内成员用户名。
+        confirmer 为用户名列表
         """
         if not confirmer:
-            return
-        notice_groups = list(NoticeGroup.objects.filter(group_id__in=confirmer))
-        receivers = RiskNoticeParser(risk=risk).parse_groups(notice_groups)
-        if not receivers:
-            logger.warning("[SendConfirmNotice] empty receivers. risk_id=%s, confirmer=%s", risk.risk_id, confirmer)
             return
         try:
             resource.notice.send_notice(
@@ -405,7 +398,7 @@ class RiskHandler:
                 relate_id=risk.pk,
                 agg_key=f"risk_confirm:{risk.risk_id}",
                 msg_type=["mail"],
-                receivers=receivers,
+                receivers=confirmer,
                 title=gettext("风险单待确认"),
                 content=gettext("风险单[%s]等待您的确认") % risk.risk_id,
             )
@@ -479,19 +472,19 @@ class RiskHandler:
         if not strategy:
             return
 
-        # 1. 全局策略风险：分派规则的关注组
+        # 1. 全局策略风险：分派规则的关注组（dispatch_rule_id 为分派时固化引用，绕过软删过滤读取）
         if getattr(risk, "dispatch_rule_id", None):
             from services.web.strategy_v2.models import DispatchRule
 
-            dispatch_rule = DispatchRule.objects.filter(rule_id=risk.dispatch_rule_id).first()
+            dispatch_rule = DispatchRule._base_manager.filter(rule_id=risk.dispatch_rule_id).first()
             follower_group_ids = (dispatch_rule.follower if dispatch_rule else None) or []
         else:
-            # 2. 场景策略风险：发现规则的关注组
+            # 2. 场景策略风险：发现规则的关注组（strategy_rule_id 为建单时固化引用，绕过软删过滤读取）
             follower_group_ids = strategy.notice_groups or []
             if getattr(risk, "strategy_rule_id", None):
                 from services.web.strategy_v2.models import StrategyRule
 
-                rule = StrategyRule.objects.filter(rule_id=risk.strategy_rule_id, is_deleted=False).first()
+                rule = StrategyRule._base_manager.filter(rule_id=risk.strategy_rule_id).first()
                 if rule and rule.follower:
                     follower_group_ids = rule.follower
 
