@@ -103,7 +103,7 @@ from services.web.scene.filters import (
     CompositeScopeFilter,
     SceneScopeFilter,
 )
-from services.web.scene.models import ResourceBinding, ResourceBindingScene
+from services.web.scene.models import ResourceBinding, ResourceBindingScene, ResourceBindingSystem
 from services.web.strategy_v2.constants import (
     EVENT_BASIC_CONFIG_FIELD,
     EVENT_BASIC_CONFIG_REMOTE_FIELDS,
@@ -504,6 +504,63 @@ class StrategyV2Base(AuditMixinResource, abc.ABC):
             )
 
     @staticmethod
+    def attach_binding_visibility(strategies: List[Strategy]) -> None:
+        """
+        批量回填策略绑定与可见范围（binding_type/visibility_type/scene_ids/system_ids），
+        供列表/详情响应序列化器输出（参照工具 attach_visibility_metadata 模式）
+        """
+        strategy_ids = [str(s.strategy_id) for s in strategies]
+        if not strategy_ids:
+            return
+        bindings = ResourceBinding.objects.filter(
+            resource_type=ResourceVisibilityType.STRATEGY,
+            resource_id__in=strategy_ids,
+        )
+        scene_rows = ResourceBindingScene.objects.filter(
+            binding__in=bindings, scene__is_deleted=False
+        ).values_list("binding_id", "scene_id")
+        system_rows = ResourceBindingSystem.objects.filter(binding__in=bindings).values_list(
+            "binding_id", "system_id"
+        )
+        binding_scene_map: Dict[str, List[int]] = {}
+        for binding_id, scene_id in scene_rows:
+            binding_scene_map.setdefault(str(binding_id), []).append(scene_id)
+        binding_system_map: Dict[str, List[str]] = {}
+        for binding_id, system_id in system_rows:
+            binding_system_map.setdefault(str(binding_id), []).append(system_id)
+        binding_map = {str(b.resource_id): b for b in bindings}
+        for strategy in strategies:
+            binding = binding_map.get(str(strategy.strategy_id))
+            if binding is None:
+                setattr(strategy, "visibility", None)
+                continue
+            setattr(
+                strategy,
+                "visibility",
+                {
+                    "binding_type": binding.binding_type,
+                    "visibility_type": binding.visibility_type,
+                    "scene_ids": binding_scene_map.get(str(binding.id), []),
+                    "system_ids": binding_system_map.get(str(binding.id), []),
+                },
+            )
+
+    @staticmethod
+    def apply_platform_visibility(binding: ResourceBinding, visibility_data: Optional[dict]) -> None:
+        """
+        应用全局策略可见范围配置（visibility_type + 指定场景/系统关联，全量替换）
+        """
+        visibility_data = visibility_data or {}
+        binding.visibility_type = visibility_data.get("visibility_type") or VisibilityScope.ALL_VISIBLE
+        binding.save(update_fields=["visibility_type"])
+        binding.binding_scenes.all().delete()
+        binding.binding_systems.all().delete()
+        for scene_id in visibility_data.get("scene_ids", []):
+            ResourceBindingScene.objects.create(binding=binding, scene_id=scene_id)
+        for system_id in visibility_data.get("system_ids", []):
+            ResourceBindingSystem.objects.create(binding=binding, system_id=system_id)
+
+    @staticmethod
     def ensure_active_scene_binding_or_404(strategy_id: int) -> None:
         has_scene_binding = ResourceBindingScene.objects.filter(
             scene__is_deleted=False,
@@ -562,17 +619,21 @@ class CreateStrategy(StrategyV2Base):
             # 取出规则数据
             rules_data = validated_request_data.pop("rules", None)
             dispatch_rules_data = validated_request_data.pop("dispatch_rules", None)
+            # 可见范围配置（仅全局策略有效，序列化层已校验；须 pop 避免误传入模型 create）
+            visibility_data = validated_request_data.pop("visibility", None)
             # save strategy
             strategy: Strategy = Strategy.objects.create(**validated_request_data)
             # 创建 ResourceBinding 关联：按 binding_type 区分全局/场景策略
             if binding_type == BindingType.PLATFORM_BINDING:
-                # 全局策略：平台级绑定，默认全可见
+                # 全局策略：平台级绑定，可见范围由请求 visibility 决定（不传默认全可见）
                 binding = ResourceBinding.objects.create(
                     resource_type=ResourceVisibilityType.STRATEGY,
                     resource_id=str(strategy.strategy_id),
                     binding_type=BindingType.PLATFORM_BINDING,
                     visibility_type=VisibilityScope.ALL_VISIBLE,
                 )
+                if visibility_data:
+                    self.apply_platform_visibility(binding, visibility_data)
                 assert_binding_relation_integrity(binding)
             else:
                 # 场景策略：与场景绑定
@@ -712,6 +773,8 @@ class UpdateStrategy(StrategyV2Base):
         tag_names = validated_request_data.pop("tags", [])
         rules_data = validated_request_data.pop("rules", None)
         dispatch_rules_data = validated_request_data.pop("dispatch_rules", None)
+        # 可见范围配置（仅全局策略有效，序列化层已校验绑定类型；须 pop 避免误 setattr 到模型字段）
+        visibility_data = validated_request_data.pop("visibility", None)
         # 计算更新前摘要
         origin_rules_digest = self.calc_rules_digest(strategy)
         # check control
@@ -737,6 +800,16 @@ class UpdateStrategy(StrategyV2Base):
         # 同步分派规则子表
         if dispatch_rules_data is not None:
             self._sync_dispatch_rules(strategy, dispatch_rules_data)
+        # 更新全局策略可见范围（传入才更新，全量替换；序列化层已校验为平台绑定）
+        if visibility_data is not None:
+            binding = ResourceBinding.objects.filter(
+                resource_type=ResourceVisibilityType.STRATEGY,
+                resource_id=str(strategy.strategy_id),
+                binding_type=BindingType.PLATFORM_BINDING,
+            ).first()
+            if binding is not None:
+                self.apply_platform_visibility(binding, visibility_data)
+                assert_binding_relation_integrity(binding)
         # save strategy tag
         self._save_tags(strategy_id=strategy.strategy_id, tag_names=tag_names)
         self._save_strategy_tools(strategy, validated_request_data)
@@ -823,6 +896,8 @@ class ListStrategy(StrategyV2Base):
     def perform_request(self, validated_request_data):
         # 场景过滤
         scene_id = validated_request_data.pop("scene_id", None)
+        # 绑定类型筛选（platform_binding=平台视角仅全局策略；scene_binding=仅场景策略；不传+scene_id=并集）
+        binding_type = validated_request_data.pop("binding_type", None) or None
         # 排序字段
         order_field = validated_request_data.get("order_field") or "-strategy_id"
         # init queryset
@@ -844,9 +919,12 @@ class ListStrategy(StrategyV2Base):
             .prefetch_related("tools")
         )
         queryset = queryset.exclude(source=StrategySource.SYSTEM)
-        # 按场景过滤（CompositeScopeFilter：场景级 + 对该场景可见的全局级策略并集）
+        # 按场景/绑定类型过滤（CompositeScopeFilter：
+        # scene_id + binding_type 组合——platform_binding 无 scene_id = 平台视角全部全局策略；
+        # scene_id 无 binding_type = 场景级 + 对该场景可见的全局级并集）
         queryset = CompositeScopeFilter.filter_queryset(
             queryset=queryset,
+            binding_type=binding_type,
             scene_id=scene_id,
             resource_type=ResourceVisibilityType.STRATEGY,
             pk_field="strategy_id",
@@ -902,6 +980,10 @@ class ListStrategy(StrategyV2Base):
                 to_attr='prefetched_tags',
             )
         )
+        # 批量回填绑定与可见范围（全局策略展示 binding/visibility）：
+        # 先求值缓存（_result_cache 填充同一批实例），attach 后仍返回 queryset，
+        # 框架分页行为不变，序列化的即带 visibility 属性的实例
+        self.attach_binding_visibility(list(queryset))
 
         # response
         return queryset
@@ -2167,6 +2249,8 @@ class RetrieveStrategy(StrategyV2Base):
     def perform_request(self, validated_request_data):
         strategy_id = validated_request_data["strategy_id"]
         strategy = get_object_or_404(Strategy, strategy_id=strategy_id)
+        # 回填绑定与可见范围（编辑页回填 visibility）
+        self.attach_binding_visibility([strategy])
         return strategy
 
 
