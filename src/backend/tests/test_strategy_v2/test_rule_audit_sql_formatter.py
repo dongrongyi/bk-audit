@@ -196,6 +196,81 @@ class TestRuleAuditSQLFormatter(TestCase):
         )
         self._build_and_assert_sql(strategy, expected_sql)
 
+    def test_single_table_rule_where_with_zero_int_filter(self):
+        """
+        回归：规则 where 的 filter=0（数值零值）必须生成 =0 而非 =NULL
+        truthiness 判断会把 0 误转 None，导致 WHERE t.n=NULL 永不命中、零值规则漏报
+        """
+        config_json = {
+            "config_type": RuleAuditConfigType.EVENT_LOG,
+            "data_source": {"rt_id": "zero_rt"},
+            "select": [
+                {
+                    "table": "zero_rt",
+                    "raw_name": "action",
+                    "display_name": "操作",
+                    "field_type": "string",
+                    "aggregate": None,
+                }
+            ],
+            "where": None,
+        }
+        strategy = Strategy(strategy_id=201, configs=config_json, event_basic_field_configs=[])
+        # 规则条件：失败次数 = 0（int 零值）
+        rule = StrategyRule.objects.create(
+            strategy_id=strategy.strategy_id,
+            rule_name="zero_rule",
+            conditions={
+                "where": {
+                    "condition": {
+                        "field": {
+                            "table": "zero_rt",
+                            "raw_name": "fail_count",
+                            "display_name": "失败次数",
+                            "field_type": "long",
+                        },
+                        "operator": "eq",
+                        "filter": 0,
+                        "filters": [],
+                    }
+                },
+                "having": None,
+            },
+        )
+        self._rule_cache[strategy.strategy_id] = rule
+        formatter = RuleAuditSQLBuilder(strategy)
+        actual_sql = formatter.build_sql()
+        self.assertIn(
+            "`fail_count`=0",
+            actual_sql.replace(" ", "").replace("`zero_rt`.`fail_count`=0", "`fail_count`=0") or actual_sql,
+        )
+        # 直接断言关键片段：守卫列条件为 =0，且不出现 =NULL
+        self.assertIn("0 END `wguard__r1`", actual_sql)
+        guard = [seg for seg in actual_sql.split("CASE WHEN ") if "fail_count" in seg]
+        self.assertTrue(guard, f"未找到 fail_count 条件片段: {actual_sql}")
+        self.assertIn("=`zero_rt`.`fail_count`=0".replace("=`zero_rt`.`fail_count`", "") or "fail_count`=0", guard[0])
+        self.assertNotIn("`fail_count`=NULL", actual_sql)
+        self.assertNotIn("fail_count` IS NULL", actual_sql)
+
+    def test_single_table_rule_where_with_zero_int_filter_and_filters_fallback(self):
+        """
+        回归：filter=0 且 filters 同时有值时，operate 兜底不得用 truthiness 用 filters[0] 覆盖 0
+        """
+        from pypika import Field
+
+        from core.sql.builder.utils import operate as sql_operate
+        from core.sql.constants import Operator
+
+        # filter=0, filters=[5]：value 应保持 0（显式判空不覆盖零值）
+        criterion = sql_operate(Operator.EQ.value, Field("n"), 0, [5])
+        self.assertEqual(str(criterion).split("=")[-1].strip(), "0")
+        # filter=""（空串）, filters=[5]：兜底取 filters[0]
+        criterion2 = sql_operate(Operator.EQ.value, Field("n"), "", [5])
+        self.assertEqual(str(criterion2).split("=")[-1].strip(), "5")
+        # filter=None, filters=[5]：兜底取 filters[0]
+        criterion3 = sql_operate(Operator.EQ.value, Field("n"), None, [5])
+        self.assertEqual(str(criterion3).split("=")[-1].strip(), "5")
+
     def test_single_table_with_field_mapping(self):
         """
         单表+field_mapping, 测试 target_value / source_field。

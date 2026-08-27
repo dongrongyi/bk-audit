@@ -156,14 +156,24 @@ def forwards(apps, schema_editor):
 
 def backwards(apps, schema_editor):
     """
-    回滚：删除所有 RISK 类型的 ResourceBinding。
-    """
-    ResourceBinding = apps.get_model("scene", "ResourceBinding")
+    回滚：noop（声明为不可逆）。
 
-    print("[backwards] 警告：将删除所有 resource_type=risk 的 ResourceBinding 记录", flush=True)
-    # ResourceBindingScene / ResourceBindingSystem 均通过 CASCADE 级联清理
-    deleted, _ = ResourceBinding.objects.filter(resource_type=RESOURCE_TYPE_RISK).delete()
-    print(f"[backwards] 已删除 {deleted} 条 RISK binding 相关记录（含级联）", flush=True)
+    本迁移为存量 Risk 回填 ResourceBinding(resource_type=risk)，但创建时未打任何
+    可区分标记；0060 上线后业务运行时（场景策略 create_risk、全局策略 direct /
+    after_confirm 确认后）也会持续写入同类型 binding，两者无法可靠区分。
+
+    因此若在此执行全量删除会误删 0060 之后业务新建的有效绑定，并级联清空
+    ResourceBindingScene / ResourceBindingSystem，导致线上回滚后全量 Risk 丢失
+    场景归属。
+
+    改为 noop：回滚不删除任何 RISK binding。保留的数据对回退后的老代码无害——
+    老代码通过 strategy_id -> ResourceBinding(STRATEGY) -> ResourceBindingScene
+    反查场景归属，并不依赖 resource_type=risk 的 binding。
+    """
+    print(
+        "[backwards] 0060 为存量和运行时混合绑定，无法精准识别本迁移创建记录，" "回滚不删除任何 RISK binding（不可逆）。如需回滚请走数据恢复流程。",
+        flush=True,
+    )
 
 
 class Migration(migrations.Migration):

@@ -653,6 +653,93 @@ class RiskCreateWithDispatchModeTest(TicketTest):
         finally:
             scene.delete()
 
+    def test_direct_dispatch_keeps_new_and_is_create(self):
+        """
+        测试 DIRECT 分派模式：direct = 直接分派
+        关键验证：状态保持 NEW（不进待确认）、is_create=True（不阻塞正常流转）、
+        场景绑定建单即建、不发确认通知
+        """
+        import datetime
+
+        from services.web.risk.handlers.risk import RiskHandler
+        from services.web.scene.constants import BindingType, ResourceVisibilityType
+
+        # 构造全局策略 + direct 分派规则
+        from services.web.strategy_v2.constants import (
+            StrategyStatusChoices,
+            StrategyType,
+        )
+        from services.web.strategy_v2.models import DispatchRule, Strategy, StrategyRule
+
+        scene = Scene.objects.create(name=f"direct_scene_{uuid.uuid1().hex}", description="test")
+        strategy = Strategy.objects.create(
+            namespace="default",
+            strategy_name=f"direct_global_{uuid.uuid1().hex[:8]}",
+            strategy_type=StrategyType.RULE,
+            status=StrategyStatusChoices.RUNNING.value,
+        )
+        StrategyRule.objects.create(
+            strategy=strategy,
+            rule_name="r1",
+            conditions={"where": None, "having": None},
+            risk_level="high",
+        )
+        dispatch_rule = DispatchRule.objects.create(
+            strategy=strategy,
+            rule_name="dispatch-direct",
+            conditions={},
+            target_scene=scene,
+            processor=[],
+            follower=[],
+            confirmer=[],
+            dispatch_mode="direct",
+            is_default=True,
+        )
+        from services.web.scene.models import ResourceBinding
+
+        ResourceBinding.objects.create(
+            resource_type=ResourceVisibilityType.STRATEGY,
+            resource_id=str(strategy.strategy_id),
+            binding_type=BindingType.PLATFORM_BINDING,
+        )
+
+        now_ms = int(datetime.datetime.now().timestamp() * 1000)
+        event = {
+            "strategy_id": strategy.strategy_id,
+            "raw_event_id": f"direct-{uuid.uuid1().hex[:8]}",
+            "event_time": now_ms,
+            "event_data": {},
+            "event_evidence": "[]",
+        }
+        try:
+            handler = RiskHandler()
+            with mock.patch.object(RiskHandler, "_send_confirm_notice") as mock_notice:
+                is_create, risk = handler.create_risk(event, {strategy.strategy_id})
+            # direct：状态 NEW、不进待确认
+            self.assertEqual(risk.status, RiskStatus.NEW)
+            self.assertEqual(risk.display_status, RiskDisplayStatus.NEW)
+            # direct：不阻塞正常流转
+            self.assertTrue(is_create)
+            # direct：分派快照已固化
+            self.assertEqual(risk.dispatch_rule_id, dispatch_rule.rule_id)
+            # direct：不发确认通知
+            mock_notice.assert_not_called()
+            # direct：建单即建场景绑定
+            from services.web.scene.models import ResourceBindingScene
+
+            self.assertTrue(
+                ResourceBindingScene.objects.filter(
+                    scene_id=scene.scene_id,
+                    binding__resource_type=ResourceVisibilityType.RISK,
+                    binding__resource_id=risk.risk_id,
+                ).exists()
+            )
+        finally:
+            Risk.objects.filter(strategy_id=strategy.strategy_id).delete()
+            dispatch_rule.delete()
+            strategy.delete()
+            scene.delete()
+
 
 class RiskStatusPreCheckTest(TicketTest):
     """测试风险状态预检查"""

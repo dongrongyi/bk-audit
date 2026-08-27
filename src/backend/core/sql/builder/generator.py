@@ -387,7 +387,8 @@ class SQLGenerator:
             return operate(
                 operator,
                 field,
-                filter_type(condition.filter) if condition.filter else None,
+                # 显式判空：filter=0（数值零值）是合法筛选值，truthiness 会误转为 None 生成 =NULL 导致漏报
+                filter_type(condition.filter) if condition.filter not in (None, "") else None,
                 [filter_type(f) for f in condition.filters],
             )
         except ValueError:

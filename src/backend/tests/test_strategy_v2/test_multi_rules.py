@@ -271,6 +271,50 @@ class CheckRulesTest(TestCase):
         result = self.mixin._check_rules(attrs)
         self.assertEqual(result, attrs)
 
+    def test_manual_sql_with_multi_rules_rejected(self):
+        """手写SQL + 多条发现规则：拒绝（多规则SQL必须由系统生成，手写SQL不保证输出strategy_rule_id）"""
+        attrs = {
+            "strategy_type": StrategyType.RULE.value,
+            "configs": self.valid_configs,
+            "sql": "SELECT 1 AS event_data, 1 AS strategy_id",
+            "rules": [
+                {"rule_name": "r1", "conditions": {"where": self.valid_where}, "risk_level": "high"},
+                {"rule_name": "r2", "conditions": {"where": self.valid_where}, "risk_level": "low"},
+            ],
+        }
+        with self.assertRaises(serializers.ValidationError) as cm:
+            self.mixin._check_rules(attrs)
+        self.assertIn("手写SQL", str(cm.exception))
+
+    def test_manual_sql_with_single_rule_allowed(self):
+        """手写SQL + 单条发现规则：放行（legacy 兼容路径，归因兜底到唯一规则语义正确）"""
+        attrs = {
+            "strategy_type": StrategyType.RULE.value,
+            "configs": self.valid_configs,
+            "sql": "SELECT 1 AS event_data, 1 AS strategy_id",
+            "rules": [
+                {"rule_name": "r1", "conditions": {"where": self.valid_where}, "risk_level": "high"},
+            ],
+        }
+        result = self.mixin._check_rules(attrs)
+        self.assertEqual(result, attrs)
+
+    def test_empty_sql_with_multi_rules_allowed(self):
+        """空/缺省 sql + 多条发现规则：放行（正常走 SQL 生成）"""
+        for sql_value in (None, "", "MISSING"):
+            attrs = {
+                "strategy_type": StrategyType.RULE.value,
+                "configs": self.valid_configs,
+                "rules": [
+                    {"rule_name": "r1", "conditions": {"where": self.valid_where}, "risk_level": "high"},
+                    {"rule_name": "r2", "conditions": {"where": self.valid_where}, "risk_level": "low"},
+                ],
+            }
+            if sql_value != "MISSING":
+                attrs["sql"] = sql_value
+            with self.subTest(sql=sql_value):
+                self.mixin._check_rules(attrs)
+
 
 class CheckDispatchRulesTest(TestCase):
     """_check_dispatch_rules: 分派规则校验测试"""
@@ -330,7 +374,7 @@ class CheckDispatchRulesTest(TestCase):
             "dispatch_rules": [
                 {
                     "rule_name": "same_name",
-                    "conditions": {"condition": {"field": "f", "operator": "eq", "filters": ["v"]}},
+                    "conditions": {"condition": {"field": "risk_level", "operator": "eq", "filters": ["HIGH"]}},
                     "target_scene_id": self.scene.scene_id,
                     "processor": [self.notice_group.group_id],
                     "follower": [self.notice_group.group_id],
@@ -358,7 +402,7 @@ class CheckDispatchRulesTest(TestCase):
             "dispatch_rules": [
                 {
                     "rule_name": "r1",
-                    "conditions": {"condition": {"field": "f", "operator": "eq", "filters": ["v"]}},
+                    "conditions": {"condition": {"field": "risk_level", "operator": "eq", "filters": ["HIGH"]}},
                     "target_scene_id": self.scene.scene_id,
                     "processor": [self.notice_group.group_id],
                     "follower": [self.notice_group.group_id],
@@ -495,6 +539,65 @@ class CheckDispatchRulesTest(TestCase):
         # 验证 is_default 被自动设置
         self.assertFalse(result["dispatch_rules"][0]["is_default"])
         self.assertTrue(result["dispatch_rules"][1]["is_default"])
+
+    def test_dispatch_condition_field_whitelist(self):
+        """分派条件字段必须在白名单内（event_data.<select字段> + risk_level），越界字段拒绝"""
+        base_rule = {
+            "rule_name": "r1",
+            "target_scene_id": self.scene.scene_id,
+            "processor": [self.notice_group.group_id],
+            "follower": [self.notice_group.group_id],
+            "confirmer": [self.notice_group.group_id],
+        }
+        default_rule = {**base_rule, "rule_name": "default", "conditions": {}}
+        # 策略 select 输出字段 → 合法词表 event_data.field1 / event_data.field2
+        configs = {
+            "select": [
+                {"table": "t", "raw_name": "field1", "display_name": "field1"},
+                {"table": "t", "raw_name": "field2", "display_name": "field2", "aggregate": "count"},
+            ]
+        }
+        # 1. 标准事件字段/风险属性字段/未知字段 → 拒绝
+        for invalid_field in (
+            "strategy_id",
+            "operator",
+            "event_time",
+            "risk_hazard",
+            "risk_guidance",
+            "event_data.not_in_select",
+            "",
+        ):
+            attrs = {
+                "binding_type": BindingType.PLATFORM_BINDING,
+                "configs": configs,
+                "dispatch_rules": [
+                    {
+                        **base_rule,
+                        "conditions": {"condition": {"field": invalid_field, "operator": "eq", "filters": ["v"]}},
+                    },
+                    default_rule,
+                ],
+            }
+            with self.subTest(field=invalid_field):
+                with self.assertRaises(serializers.ValidationError) as cm:
+                    self.mixin._check_dispatch_rules(attrs)
+                self.assertIn("白名单", str(cm.exception))
+        # 2. event_data.<select字段> 与 risk_level → 通过
+        for valid_field in ("event_data.field1", "event_data.field2", "risk_level"):
+            attrs = {
+                "binding_type": BindingType.PLATFORM_BINDING,
+                "configs": configs,
+                "dispatch_rules": [
+                    {
+                        **base_rule,
+                        "conditions": {"condition": {"field": valid_field, "operator": "eq", "filters": ["v"]}},
+                    },
+                    default_rule,
+                ],
+            }
+            with self.subTest(field=valid_field):
+                result = self.mixin._check_dispatch_rules(attrs)
+                self.assertFalse(result["dispatch_rules"][0]["is_default"])
 
 
 class PlatformVsSceneBindingTest(TestCase):

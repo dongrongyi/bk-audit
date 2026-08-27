@@ -851,6 +851,12 @@ class MultiRuleValidateMixin:
         if len(names) != len(set(names)):
             raise serializers.ValidationError(gettext("发现规则名称在策略内必须唯一"))
 
+        # 手写 SQL 仅兼容 legacy 单规则（不保证输出 strategy_rule_id，多规则事件会全部归因到首规则，
+        # 破坏 first-match 与规则快照语义）；多规则必须走 RuleAuditSQLBuilder 生成 SQL
+        sql_value = attrs.get("sql")
+        if sql_value not in (None, "") and len(rules) > 1:
+            raise serializers.ValidationError(gettext("手写SQL（sql）与多条发现规则（rules）不能同时配置：多规则策略的SQL必须由系统按规则生成"))
+
         # 策略级 select 的聚合字段集合（having 列引用的合法域）
         configs = attrs.get("configs")
         if not configs:
@@ -913,6 +919,13 @@ class MultiRuleValidateMixin:
             if len(names) != len(set(names)):
                 raise serializers.ValidationError(gettext("分派规则名称在策略内必须唯一"))
 
+            # 分派条件字段白名单：事件输出字段（event_data.<select字段>）+ 命中规则实例化的 risk_level。
+            # 分派依据只允许是发现阶段的输出结果；strategy_id/operator/event_time 等标准事件字段
+            # 与 risk_hazard/risk_guidance 等自由文本不允许作为分派条件（无意义且易误配）
+            configs = attrs.get("configs") or {}
+            select_fields = configs.get("select") or []
+            valid_fields = {f"event_data.{f.get('display_name')}" for f in select_fields} | {"risk_level"}
+
             default_count = 0
             for rule in dispatch_rules:
                 # is_default 由 conditions 推导同步
@@ -920,6 +933,14 @@ class MultiRuleValidateMixin:
                 rule["is_default"] = is_default
                 if is_default:
                     default_count += 1
+                # 条件叶子字段必须在白名单内（默认规则条件为空，无叶子可跳过）
+                for leaf in self._walk_tree_leaves(rule.get("conditions")):
+                    field_name = (leaf or {}).get("field") or ""
+                    if field_name not in valid_fields:
+                        raise serializers.ValidationError(
+                            gettext("分派规则[%s]的条件字段[%s]不在分派字段白名单内（仅支持 event_data.<输出字段> 与 risk_level）")
+                            % (rule.get("rule_name"), field_name)
+                        )
                 # 处理人/关注人/确认人均必填
                 for list_field in ("processor", "follower", "confirmer"):
                     if not rule.get(list_field):

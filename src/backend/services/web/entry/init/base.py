@@ -381,6 +381,7 @@ class SystemInitHandler:
             "control_version",
             "strategy_type",
             "sql",
+            "rules",
             "configs",
             "tags",
             "notice_groups",

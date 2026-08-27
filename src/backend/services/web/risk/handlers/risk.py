@@ -188,26 +188,31 @@ class RiskHandler:
             "event_source": event.get("event_source"),
             "operator": self.parse_operator(event.get("operator")),
         }
+        # 解析命中的发现规则：
+        # 1. 事件携带 strategy_rule_id（新 SQL 产出）：必须命中当前策略下的活动规则；
+        # 2. 未携带（旧 SQL 未重建窗口期的存量事件）：按 rule_order 归因到首条活动规则，
         strategy_rule_id = event.get("strategy_rule_id")
         rule: Optional[StrategyRule] = None
         if strategy_rule_id:
-            # _base_manager避免规则已经被软删除
-            rule = StrategyRule._base_manager.filter(rule_id=strategy_rule_id).first()
-            if rule is not None and rule.strategy_id != event["strategy_id"]:
-                # 事件的规则归属与策略不一致
+            rule = StrategyRule.objects.filter(
+                rule_id=strategy_rule_id,
+                strategy_id=event["strategy_id"],
+                is_deleted=False,
+            ).first()
+            if rule is None:
                 logger.warning(
-                    "[CreateRisk] rule %s not belong to strategy %s, fallback to strategy meta",
+                    "[CreateRisk] strategy_rule %s inactive or not belong to strategy %s, drop event. raw_event_id=%s",
                     strategy_rule_id,
                     event["strategy_id"],
+                    event.get("raw_event_id"),
                 )
-                rule = None
-        # 存量事件strategy_rule_id为空，需要从本地DB去查rule
-        if rule is None:
+                return None
+        else:
             rule_order = (
                 Strategy.objects.filter(strategy_id=event["strategy_id"]).values_list("rule_order", flat=True).first()
             )
             if rule_order:
-                rule = StrategyRule._base_manager.filter(rule_id=rule_order[0]).first()
+                rule = StrategyRule.objects.filter(rule_id=rule_order[0], is_deleted=False).first()
         # 规则级元信息（优先级：规则 > 策略；策略级回退覆盖模型策略与窗口期事件）
         strategy = Strategy.objects.filter(strategy_id=event["strategy_id"]).first()
         create_params["strategy_rule_id"] = rule.rule_id if rule else None
@@ -252,6 +257,8 @@ class RiskHandler:
         # 构建建单参数（含发现规则归因），查重键与建单参数共用同一 strategy_rule_id，
         # 避免旧 SQL 未重建窗口期事件因规则 ID 为空导致去重错位、重复建单
         create_params = self.gen_risk_create_params(event)
+        if create_params is None:
+            return False, None
 
         # 检查是否有已存在的
         # 策略ID相同，原始事件ID相同，命中发现规则相同，不为关单状态或事件时间小于最后发现时间
@@ -320,11 +327,13 @@ class RiskHandler:
                 BindingMetadataHelper.create_risk_scene_binding(risk.risk_id, scene_id)
         logger.info("[CreateRisk] Risk created. risk_id=%s", risk.risk_id)
 
-        if dispatch_result is not None:
+        if dispatch_result is not None and dispatch_result.dispatch_mode == DispatchMode.AFTER_CONFIRM:
             # 待确认阶段不渲染报告、不通知关注人/处理人、不自动流转（确认后触发），
             # 仅通知确认人；事务提交后发送，保证接收人收到通知时数据已落库
             self._send_confirm_notice(risk, risk.confirmer)
             return False, risk
+        # direct 分派（已建场景绑定、状态保持 NEW）与场景策略一致：is_create=True，
+        # 由调用方触发报告渲染/关注人通知/NewRisk 正常流转
         return True, risk
 
     def _match_dispatch(self, event: dict, create_params: dict):
@@ -358,12 +367,12 @@ class RiskHandler:
         strategy = Strategy.objects.filter(strategy_id=event["strategy_id"]).first()
         if strategy is None:
             return None
-        # ctx：事件字段 + 已实例化的规则元信息
+        # ctx 仅投影分派字段白名单（与保存校验同源）：事件输出字段 event_data.* + 命中规则实例化的 risk_level。
+        # 不暴露 strategy_id/operator/event_time 等标准事件字段与 risk_hazard/risk_guidance 等自由文本，
+        # 越界字段引用取值为 None（不匹配），作为存量越界规则数据的纵深防御
         ctx = {
-            **event,
+            "event_data": event.get("event_data") or {},
             "risk_level": create_params.get("risk_level"),
-            "risk_hazard": create_params.get("risk_hazard"),
-            "risk_guidance": create_params.get("risk_guidance"),
         }
         dispatch_result = match_dispatch_rule(ctx, strategy=strategy)
         if not dispatch_result.matched:
@@ -377,15 +386,22 @@ class RiskHandler:
 
     def _apply_dispatch(self, risk: Risk, dispatch_result) -> None:
         """
-        将分派结果固化到风险单（dispatch_rule/confirmer/待确认状态）
+        将分派结果固化到风险单（dispatch_rule/confirmer；after_confirm 才进入待确认状态）
+
+        - 两种分派方式均固化快照（dispatch_rule/confirmer），后续分派规则编辑不影响已产生单据
+        - 仅 after_confirm 写入 PENDING_CONFIRM（等待确认人流转）；
+          direct 按"直接分派"语义保持 NEW，建单后即进入正常流转
         """
         risk.dispatch_rule_id = dispatch_result.rule.rule_id
         confirmers = list(NoticeGroup.objects.filter(group_id__in=dispatch_result.confirmer))
         risk.confirmer = RiskNoticeParser(risk=risk).parse_groups(confirmers)
-        # display_status 同步，否则列表页展示为空；周期任务 process_one_risk 的 match 无该分支会跳过，
-        risk.status = RiskStatus.PENDING_CONFIRM
-        risk.display_status = RiskDisplayStatus.PENDING_CONFIRM
-        risk.save(update_fields=["dispatch_rule", "confirmer", "status", "display_status"])
+        if dispatch_result.dispatch_mode == DispatchMode.AFTER_CONFIRM:
+            # display_status 同步，否则列表页展示为空；周期任务 process_one_risk 的 match 无该分支会跳过，
+            risk.status = RiskStatus.PENDING_CONFIRM
+            risk.display_status = RiskDisplayStatus.PENDING_CONFIRM
+            risk.save(update_fields=["dispatch_rule", "confirmer", "status", "display_status"])
+        else:
+            risk.save(update_fields=["dispatch_rule", "confirmer"])
 
     def _get_strategy_scene_id(self, strategy_id) -> Optional[int]:
         """策略绑定的场景 ID（场景策略）"""

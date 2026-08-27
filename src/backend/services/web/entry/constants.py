@@ -249,6 +249,36 @@ def get_manual_event_strategy_config(rt_id):
             },
         },
         "sql": sql_statement,  # 填入动态生成的 SQL
+        # 发现规则（与手写 SQL 的 manual_synced='false' 过滤条件对齐，保持单规则 + 手写 SQL 兼容形态）：
+        # 多规则改造后 rule 策略必须携带至少一条规则（where 必填），否则序列化校验拒绝
+        "rules": [
+            {
+                "rule_name": "未同步手工事件",
+                "conditions": {
+                    "where": {
+                        "index": 0,
+                        "connector": "and",
+                        "condition": {
+                            "field": {
+                                "table": rt_id,
+                                "raw_name": "manual_synced",
+                                "display_name": "manual_synced",
+                                "field_type": "string",
+                            },
+                            "operator": "eq",
+                            "filters": ["false"],
+                        },
+                    },
+                    "having": None,
+                },
+                "risk_level": "LOW",
+                "risk_hazard": "自定义",
+                "risk_guidance": "自定义",
+                "risk_title": "Dummy",
+                "processor": [ADMIN_NOTICE_GROUP_ID],
+                "follower": [],
+            },
+        ],
         "link_table_uid": None,
         "link_table_version": None,
         "status": "disabled",

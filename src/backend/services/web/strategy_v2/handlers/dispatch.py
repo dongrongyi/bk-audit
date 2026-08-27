@@ -27,11 +27,12 @@ from services.web.strategy_v2.models import DispatchRule, Strategy
 分派规则匹配器: Python 内存求值
 
 字段词表（可引用字段，"分派规则字段词表"契约的具体内容）：
-- 事件输出字段：EventMappingFields 定义的全部字段（strategy_id/strategy_rule_id/event_data/
-  event_type/event_time/event_source/operator/raw_event_id/event_content...）
-- 规则实例化字段：risk_level、risk_hazard / risk_guidance
-- event_data.* JSON 路径：覆盖策略级 select 的维度/聚合字段（如 event_data.resource_type），
-  resolve_field 按 '.' 分层下钻取值
+- 事件输出字段：event_data.<策略级 select 的输出字段>（如 event_data.resource_type），
+  resolve_field 按 '.' 分层下钻取值；聚合字段的值为按命中发现规则实例化的结果
+- 规则实例化字段：risk_level（命中发现规则的等级，HIGH/MIDDLE/LOW）
+- 白名单外字段（strategy_id/operator/event_time 等标准事件字段、risk_hazard/risk_guidance 等）
+  不允许作为分派条件：保存校验拒绝（serializers._check_dispatch_rules），运行时 ctx 不投影、
+  引用取值为 None 恒不匹配（纵深防御）
 """
 
 
