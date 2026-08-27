@@ -48,21 +48,24 @@ from services.web.common.caller_permission import CALLER_RESOURCE_TYPE_CHOICES
 from services.web.common.constants import ScopeType
 from services.web.risk.constants import EVENT_BASIC_MAP_FIELDS
 from services.web.risk.report_config import ReportConfig
-from services.web.scene.constants import BindingType, ResourceVisibilityType, VisibilityScope
+from services.web.scene.constants import (
+    BindingType,
+    ResourceVisibilityType,
+    VisibilityScope,
+)
 from services.web.scene.data_filter import SceneDataFilter
 from services.web.scene.filters import CompositeScopeFilter
 from services.web.scene.models import ResourceBinding, ResourceBindingScene, Scene
-from services.web.scene.serializers import ResourceBindingInputSerializer
 from services.web.strategy_v2.constants import (
     BKMONITOR_AGG_INTERVAL_MIN,
     STRATEGY_SCHEDULE_TIME,
     STRATEGY_STATUS_DEFAULT_INTERVAL,
     ConnectorChoices,
+    DispatchMode,
     LinkTableJoinType,
     LinkTableTableType,
     ListLinkTableSortField,
     ListTableType,
-    DispatchMode,
     RiskLevel,
     RuleAuditAggregateType,
     RuleAuditConditionOperator,
@@ -726,12 +729,18 @@ class StrategyRuleSerializer(serializers.Serializer):
         required=True,
         help_text=gettext_lazy('{"where": {...}, "having": {...}}'),
     )
-    risk_title = serializers.CharField(label=gettext_lazy("Risk Title"), required=False, allow_null=True, allow_blank=True, max_length=255)
+    risk_title = serializers.CharField(
+        label=gettext_lazy("Risk Title"), required=False, allow_null=True, allow_blank=True, max_length=255
+    )
     risk_level = serializers.ChoiceField(
         label=gettext_lazy("Risk Level"), choices=RiskLevel.choices, required=False, allow_null=True
     )
-    risk_hazard = serializers.CharField(label=gettext_lazy("Risk Hazard"), required=False, allow_null=True, allow_blank=True)
-    risk_guidance = serializers.CharField(label=gettext_lazy("Risk Guidance"), required=False, allow_null=True, allow_blank=True)
+    risk_hazard = serializers.CharField(
+        label=gettext_lazy("Risk Hazard"), required=False, allow_null=True, allow_blank=True
+    )
+    risk_guidance = serializers.CharField(
+        label=gettext_lazy("Risk Guidance"), required=False, allow_null=True, allow_blank=True
+    )
     processor = serializers.ListField(
         label=gettext_lazy("Processor"),
         child=serializers.IntegerField(label=gettext_lazy("Processor Group")),
@@ -779,8 +788,10 @@ class DispatchRuleSerializer(serializers.Serializer):
     confirmer = serializers.ListField(
         label=gettext_lazy("Confirmer"),
         child=serializers.IntegerField(label=gettext_lazy("Confirmer Group")),
-        required=True,
-        help_text=gettext_lazy("确认人通知组 ID 列表"),
+        required=False,
+        default=list,
+        allow_empty=True,
+        help_text=gettext_lazy("确认人通知组 ID 列表（仅 dispatch_mode=after_confirm 时必填，直接分派无需确认人）"),
     )
     dispatch_mode = serializers.ChoiceField(
         label=gettext_lazy("Dispatch Mode"), choices=DispatchMode.choices, default=DispatchMode.DIRECT
@@ -855,9 +866,7 @@ class MultiRuleValidateMixin:
 
             # 规则 where 必填
             if self._condition_tree_is_empty(where_tree):
-                raise serializers.ValidationError(
-                    gettext("规则[%s]缺少where过滤条件（规则where必填）") % rule.get("rule_name")
-                )
+                raise serializers.ValidationError(gettext("规则[%s]缺少where过滤条件（规则where必填）") % rule.get("rule_name"))
 
             # having 叶子校验：字段必须带 aggregate 且存在于策略级 select 聚合字段
             for leaf in self._walk_tree_leaves(having_tree):
@@ -912,12 +921,20 @@ class MultiRuleValidateMixin:
                 rule["is_default"] = is_default
                 if is_default:
                     default_count += 1
-                # 处理人/关注人/确认人均必填
-                for list_field in ("processor", "follower", "confirmer"):
+                # 处理人/关注人必填
+                for list_field in ("processor", "follower"):
                     if not rule.get(list_field):
                         raise serializers.ValidationError(
                             gettext("分派规则[%s]的%s不能为空") % (rule.get("rule_name"), list_field)
                         )
+                # 确认人仅"确认后分派"必填；直接分派无需确认人，清空避免脏数据
+                if rule.get("dispatch_mode") == DispatchMode.AFTER_CONFIRM:
+                    if not rule.get("confirmer"):
+                        raise serializers.ValidationError(
+                            gettext("分派规则[%s]的confirmer不能为空（确认后分派需配置确认人）") % rule.get("rule_name")
+                        )
+                else:
+                    rule["confirmer"] = []
                 # 目标场景存在性（软删过滤）
                 if not Scene.objects.filter(scene_id=rule.get("target_scene_id"), is_deleted=False).exists():
                     raise serializers.ValidationError(
@@ -929,9 +946,7 @@ class MultiRuleValidateMixin:
                 )
                 self._validate_notice_groups("dispatch_rules", notice_group_ids, rule.get("target_scene_id"))
             if default_count != 1:
-                raise serializers.ValidationError(
-                    gettext("全局策略必须且仅能有一条默认分派规则（conditions 为空）")
-                )
+                raise serializers.ValidationError(gettext("全局策略必须且仅能有一条默认分派规则（conditions 为空）"))
         return attrs
 
 
@@ -952,9 +967,7 @@ class CreateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
         required=False,
         allow_null=True,
         default=BindingType.SCENE_BINDING,
-        help_text=gettext_lazy(
-            "策略绑定类型（scene_binding=场景策略 / platform_binding=全局策略），不存入模型"
-        ),
+        help_text=gettext_lazy("策略绑定类型（scene_binding=场景策略 / platform_binding=全局策略），不存入模型"),
     )
     sql = serializers.CharField(
         label=gettext_lazy("Rule Audit SQL"),
@@ -999,9 +1012,14 @@ class CreateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
     report_config = ReportConfigSerializer(required=False, allow_null=True)
     rules = StrategyRuleSerializer(many=True, required=False, default=list)
     dispatch_rules = DispatchRuleSerializer(many=True, required=False, default=list)
-    visibility = ResourceBindingInputSerializer(
-        required=False, allow_null=True, label=gettext_lazy("可见范围（仅全局策略）")
+    is_draft = serializers.BooleanField(
+        label=gettext_lazy("Is Draft"),
+        required=False,
+        default=False,
+        write_only=True,
+        help_text=gettext_lazy("是否保存为草稿（草稿不部署，仅本地保存完整配置）"),
     )
+    # 可见范围不再由前端配置：全局策略可见场景 = 分派规则目标场景并集
 
     class Meta:
         model = Strategy
@@ -1033,7 +1051,7 @@ class CreateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
             "binding_type",
             "rules",
             "dispatch_rules",
-            "visibility",
+            "is_draft",
         ]
 
     def validate(self, attrs: dict) -> dict:
@@ -1089,13 +1107,9 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
     Update Strategy
     """
 
-    binding_type = serializers.ChoiceField(
-        label=gettext_lazy("绑定类型"),
-        choices=BindingType.choices,
-        required=False,
-        allow_null=True,
-        help_text=gettext_lazy("策略绑定类型（scene_binding=场景策略 / platform_binding=全局策略）"),
-    )
+    # 更新接口不接收 binding_type / scene_id：绑定类型与场景归属不支持修改，
+    # 校验统一以数据库真实绑定/反查场景为准（见 validate / get_scene_id）；
+    # 客户端误传的这两个参数由 DRF 按未声明字段直接丢弃
     sql = serializers.CharField(
         label=gettext_lazy("Rule Audit SQL"),
         required=False,
@@ -1140,9 +1154,18 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
     report_config = ReportConfigSerializer(required=False, allow_null=True)
     rules = StrategyRuleSerializer(many=True, required=False, default=list)
     dispatch_rules = DispatchRuleSerializer(many=True, required=False, default=list)
-    visibility = ResourceBindingInputSerializer(
-        required=False, allow_null=True, label=gettext_lazy("可见范围（仅全局策略）")
+    is_draft = serializers.BooleanField(
+        label=gettext_lazy("Is Draft"),
+        required=False,
+        allow_null=True,
+        default=None,
+        write_only=True,
+        help_text=gettext_lazy(
+            "仅草稿策略可传：true=保存草稿更新（不部署），false=提交为正式策略（触发部署）；不传=维持现状"
+        ),
     )
+    # 可见范围不再由前端配置：全局策略可见场景 = 分派规则目标场景并集（后端派生，
+    # 见 StrategyV2Base.sync_platform_binding_scenes）；误传的 visibility 由 DRF 丢弃
 
     class Meta:
         model = Strategy
@@ -1172,10 +1195,9 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
             "report_enabled",
             "report_auto_render",
             "report_config",
-            "binding_type",
             "rules",
             "dispatch_rules",
-            "visibility",
+            "is_draft",
         ]
 
     def get_scene_id(self, validated_request_data: dict) -> int | None:
@@ -1185,35 +1207,18 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
         data = super().validate(attrs)
         # check type
         self._validate_strategy_type(data)
-        # binding_type 更新时可不传（绑定类型不可改）：未传时按 DB 已有绑定归一，
-        # 供下游多规则/分派规则校验使用（否则全局策略更新会被误判为场景策略而拒绝 dispatch_rules）
-        if not data.get("binding_type"):
-            data["binding_type"] = (
-                ResourceBinding.objects.filter(
-                    resource_type=ResourceVisibilityType.STRATEGY,
-                    resource_id=str(data["strategy_id"]),
-                )
-                .values_list("binding_type", flat=True)
-                .first()
-                or BindingType.SCENE_BINDING
-            )
-        # scene_id 与 binding_type 联动：仅前端显式传了 scene_id 时才校验
-        if "scene_id" in self.initial_data:
-            binding_type = data.get("binding_type") or BindingType.SCENE_BINDING
-            if binding_type == BindingType.SCENE_BINDING and not data.get("scene_id"):
-                raise serializers.ValidationError(gettext("场景策略（binding_type=scene_binding）必须携带 scene_id"))
-            if binding_type == BindingType.PLATFORM_BINDING and data.get("scene_id"):
-                raise serializers.ValidationError(gettext("全局策略（binding_type=platform_binding）不允许携带 scene_id"))
-        # 可见范围仅全局策略可配（绑定类型不可改，按 DB 中已有绑定判断）
-        if data.get("visibility"):
-            has_platform_binding = ResourceBinding.objects.filter(
+        # binding_type 以数据库真实绑定为准（更新接口不接收该参数，不支持修改绑定类型），
+        # 供下游多规则/分派规则校验（_check_rules / _check_dispatch_rules）使用
+        data["binding_type"] = (
+            ResourceBinding.objects.filter(
                 resource_type=ResourceVisibilityType.STRATEGY,
                 resource_id=str(data["strategy_id"]),
-                binding_type=BindingType.PLATFORM_BINDING,
-            ).exists()
-            if not has_platform_binding:
-                raise serializers.ValidationError(gettext("可见范围（visibility）仅全局策略（platform_binding）可配置"))
-        # processor_groups 条件必填：模型策略必须配置（全量提交契约，与 Create 一致，不做 DB 回退）
+            )
+            .values_list("binding_type", flat=True)
+            .first()
+            or BindingType.SCENE_BINDING
+        )
+        # 模型策略必须配置processor_groups
         strategy_type = data.get("strategy_type")
         if strategy_type == StrategyType.MODEL.value and not data.get("processor_groups"):
             raise serializers.ValidationError(gettext("模型策略（strategy_type=model）必须配置 processor_groups"))
@@ -1376,7 +1381,7 @@ class StrategyToolSerializer(serializers.ModelSerializer):
 
 
 class StrategyVisibilitySerializer(serializers.Serializer):
-    """策略绑定可见范围回显（资源层批量 attach 后输出）"""
+    """策略绑定可见范围回显（只读；全局策略的可见场景由分派规则目标场景自动派生，不支持配置）"""
 
     binding_type = serializers.ChoiceField(
         choices=BindingType.choices, required=False, allow_null=True, label=gettext_lazy("绑定类型")
@@ -1384,12 +1389,8 @@ class StrategyVisibilitySerializer(serializers.Serializer):
     visibility_type = serializers.ChoiceField(
         choices=VisibilityScope.choices, required=False, allow_null=True, label=gettext_lazy("可见范围类型")
     )
-    scene_ids = serializers.ListField(
-        child=serializers.IntegerField(), required=False, label=gettext_lazy("可见场景ID列表")
-    )
-    system_ids = serializers.ListField(
-        child=serializers.CharField(), required=False, label=gettext_lazy("可见系统ID列表")
-    )
+    scene_ids = serializers.ListField(child=serializers.IntegerField(), required=False, label=gettext_lazy("可见场景ID列表"))
+    system_ids = serializers.ListField(child=serializers.CharField(), required=False, label=gettext_lazy("可见系统ID列表"))
 
 
 class ListStrategyResponseSerializer(serializers.ModelSerializer):
@@ -1823,20 +1824,14 @@ class ListTablesRequestSerializer(serializers.Serializer):
 
     table_type = serializers.ChoiceField(label=gettext_lazy("Table Type"), choices=ListTableType.choices)
     namespace = serializers.CharField(label=gettext_lazy("Namespace"), required=False)
-    scene_id = serializers.CharField(label=gettext_lazy("Scene ID"), required=False)
+    scene_id = serializers.CharField(
+        label=gettext_lazy("Scene ID"),
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        help_text=gettext_lazy("场景ID（场景策略按场景收敛；全局策略不传返回平台视角全量）"),
+    )
     bk_biz_id = serializers.CharField(label=gettext_lazy("业务 ID"), required=False)
-
-    def validate(self, attrs):
-        """
-        校验参数逻辑：对于EventLog类型，必须提供scene_id参数
-        """
-        attrs = super().validate(attrs)
-
-        # 对于EventLog类型，必须提供scene_id
-        if attrs.get("table_type") == ListTableType.EVENT_LOG.value and not attrs.get("scene_id"):
-            raise serializers.ValidationError({"scene_id": gettext("对于EventLog类型的表查询，必须提供scene_id参数")})
-
-        return attrs
 
 
 class GetRTFieldsRequestSerializer(serializers.Serializer):
@@ -2369,7 +2364,12 @@ class ListLinkTableRequestSerializer(OrderSerializer, TagsReqSerializer):
 
 
 class ListLinkTableAllRequestSerializer(serializers.Serializer):
-    scene_id = serializers.IntegerField(label=gettext_lazy("场景ID"), required=True, help_text="按场景过滤联表")
+    scene_id = serializers.IntegerField(
+        label=gettext_lazy("场景ID"),
+        required=False,
+        allow_null=True,
+        help_text=gettext_lazy("按场景过滤联表；不传返回全部（全局策略平台视角）"),
+    )
 
 
 class ListLinkTableAllResponseSerializer(serializers.ModelSerializer):

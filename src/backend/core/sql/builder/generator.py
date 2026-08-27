@@ -270,18 +270,14 @@ class SQLGenerator:
             # 聚合字段：直接使用 display_name（已经是 md5 别名）查找 rule_alias_map
             alias = self.rule_alias_map.get((field.display_name, rule_idx))
             if alias is None:
-                raise InvalidRuleConfigError(
-                    f"规则 having 引用的聚合字段 {field.display_name} 不在策略级 select 中"
-                )
+                raise InvalidRuleConfigError(f"规则 having 引用的聚合字段 {field.display_name} 不在策略级 select 中")
             pypika_field = pypika_terms.Field(alias)
             filter_type = (field.aggregate.result_data_type or field.field_type).python_type
         else:
             # 维度字段：L1 输出列别名（display_name 已由上层映射为 md5 别名）
             dimension_columns = {f.display_name for f in self.config.select_fields if not f.aggregate}
             if field.display_name not in dimension_columns:
-                raise InvalidRuleConfigError(
-                    f"规则 having 引用的维度字段 {field.display_name} 不在策略级 select 的维度列中"
-                )
+                raise InvalidRuleConfigError(f"规则 having 引用的维度字段 {field.display_name} 不在策略级 select 的维度列中")
             pypika_field = pypika_terms.Field(field.display_name)
             filter_type = field.field_type.python_type
         try:
@@ -391,8 +387,7 @@ class SQLGenerator:
             return operate(
                 operator,
                 field,
-                # "" 为前端存储约定的"值在 filters"标记，视同未设置；
-                # 注意 0/False 是合法配置值，不能用真值判断（与 _handle_rule_having_condition 一致）
+                # 显式判空：filter=0（数值零值）是合法筛选值
                 filter_type(condition.filter) if condition.filter not in (None, "") else None,
                 [filter_type(f) for f in condition.filters],
             )

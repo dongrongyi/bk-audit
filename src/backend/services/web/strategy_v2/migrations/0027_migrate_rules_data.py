@@ -17,7 +17,6 @@
 
 from django.db import migrations
 
-
 # 数据迁移创建者标识，backwards 判定是否为本次迁移写入
 MIGRATION_CREATED_BY = "migration_0027"
 
@@ -47,9 +46,7 @@ def forwards(apps, schema_editor):
         existing_rule = StrategyRule.objects.filter(strategy=strategy).first()
         if existing_rule:
             if not (strategy.rule_order or []):
-                active_rule_ids = list(
-                    StrategyRule.objects.filter(strategy=strategy).values_list("rule_id", flat=True)
-                )
+                active_rule_ids = list(StrategyRule.objects.filter(strategy=strategy).values_list("rule_id", flat=True))
                 Strategy.objects.filter(pk=strategy.strategy_id).update(rule_order=active_rule_ids)
             strategy_rule_map[strategy.strategy_id] = (
                 existing_rule.rule_id,
@@ -63,6 +60,15 @@ def forwards(apps, schema_editor):
             )
             continue
 
+        # configs 必须为 dict（含 select/where/having）；非 dict（历史遗留的 list 事件字段映射等）
+        # 视为格式异常，跳过迁移并告警，留待人工确认后重新配置规则
+        if not isinstance(strategy.configs, dict):
+            print(
+                f"[forwards] 策略 {strategy.strategy_id} configs 为非 dict "
+                f"（{type(strategy.configs).__name__}），跳过迁移，请人工确认该策略配置",
+                flush=True,
+            )
+            continue
         # 从 configs 中提取 where 和 having
         configs = strategy.configs or {}
         where_conditions = configs.get("where")
@@ -116,10 +122,7 @@ def forwards(apps, schema_editor):
 
     total_updated = 0
     for strategy_id, (rule_id, risk_level, risk_hazard, risk_guidance) in strategy_rule_map.items():
-        updated = Risk.objects.filter(
-            strategy_id=strategy_id,
-            strategy_rule__isnull=True,
-        ).update(
+        updated = Risk.objects.filter(strategy_id=strategy_id, strategy_rule__isnull=True,).update(
             strategy_rule_id=rule_id,
             risk_level=risk_level,
             risk_hazard=risk_hazard,
@@ -138,10 +141,7 @@ def forwards(apps, schema_editor):
 
     total_me_updated = 0
     for strategy_id, (rule_id, risk_level, risk_hazard, risk_guidance) in strategy_rule_map.items():
-        updated = ManualEvent.objects.filter(
-            strategy_id=strategy_id,
-            strategy_rule__isnull=True,
-        ).update(
+        updated = ManualEvent.objects.filter(strategy_id=strategy_id, strategy_rule__isnull=True,).update(
             strategy_rule_id=rule_id,
             risk_level=risk_level,
             risk_hazard=risk_hazard,
