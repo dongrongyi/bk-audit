@@ -5,8 +5,14 @@
 迁移内容：
 1. 为每个 rule 策略生成 1 条 StrategyRule（幂等，跳过已迁移策略）
 2. 回填 Risk 表的元信息字段（strategy_rule, risk_level, risk_hazard, risk_guidance, confirmer）
+   - 活动 rule 策略：风险归因到生成的 StrategyRule，元信息按 规则 > 策略 优先级回填
+   - 其余策略（model 策略 / 已软删策略）：按策略级元信息回填（不归因 strategy_rule），
+     消费端（列表筛选/排序/导出/报告/AI 查询）已切换为读取 Risk 快照，漏回填会导致历史数据
+     按等级筛选查不到、导出显示 None 的回归（旧代码经 strategy__risk_level join 可正常命中）
 3. 回填 ManualEvent 表的元信息字段（strategy_rule, risk_level, risk_hazard, risk_guidance）
 4. 更新 Strategy.rule_order
+5. 尾部可观测统计：回填后仍为 NULL 的风险数（策略行已不存在的真孤儿）——该集合在旧代码
+   join 语义下同样为 NULL（非本次回归），仅告警不做迁移门禁（避免历史脏数据卡死发布）
 
 注意：
 - 当前迁移只处理场景策略（scene_binding），尚未有全局策略
@@ -134,6 +140,30 @@ def forwards(apps, schema_editor):
             total_updated += updated
             print(f"[forwards] Risk strategy={strategy_id} 回填 {updated} 条", flush=True)
 
+    # 2.5 其余策略（model 策略 / 已软删策略 / configs 异常被第一步跳过的策略）的风险：
+    #     按策略级元信息回填快照（不归因 strategy_rule；叠加 risk_level__isnull=True 守卫，
+    #     重跑不覆盖第一步结果）。
+    #     注意：必须走 _base_manager——默认管理器 SoftDeleteModelManager.all() 会过滤 is_deleted，
+    #     用 objects 会漏掉软删策略（其历史风险同样需要快照回填）
+    other_strategies = Strategy._base_manager.exclude(strategy_id__in=strategy_rule_map.keys())
+    for strategy in other_strategies.only("strategy_id", "risk_level", "risk_hazard", "risk_guidance").iterator(
+        chunk_size=1000
+    ):
+        if strategy.risk_level is None and strategy.risk_hazard is None and strategy.risk_guidance is None:
+            continue
+        updated = Risk.objects.filter(
+            strategy_id=strategy.strategy_id,
+            strategy_rule__isnull=True,
+            risk_level__isnull=True,
+        ).update(
+            risk_level=strategy.risk_level,
+            risk_hazard=strategy.risk_hazard,
+            risk_guidance=strategy.risk_guidance,
+        )
+        if updated:
+            total_updated += updated
+            print(f"[forwards] Risk strategy={strategy.strategy_id}（model/软删）回填 {updated} 条", flush=True)
+
     print(f"[forwards] 第二步完成，共回填 {total_updated} 条风险", flush=True)
 
     # -------- 第三步：按策略分组批量回填 ManualEvent 表 --------
@@ -151,7 +181,40 @@ def forwards(apps, schema_editor):
             total_me_updated += updated
             print(f"[forwards] ManualEvent strategy={strategy_id} 回填 {updated} 条", flush=True)
 
+    # 3.5 其余策略（model / 软删）的手工事件：同口径按策略级元信息回填
+    for strategy in other_strategies.only("strategy_id", "risk_level", "risk_hazard", "risk_guidance").iterator(
+        chunk_size=1000
+    ):
+        if strategy.risk_level is None and strategy.risk_hazard is None and strategy.risk_guidance is None:
+            continue
+        updated = ManualEvent.objects.filter(
+            strategy_id=strategy.strategy_id,
+            strategy_rule__isnull=True,
+            risk_level__isnull=True,
+        ).update(
+            risk_level=strategy.risk_level,
+            risk_hazard=strategy.risk_hazard,
+            risk_guidance=strategy.risk_guidance,
+        )
+        if updated:
+            total_me_updated += updated
+            print(f"[forwards] ManualEvent strategy={strategy.strategy_id}（model/软删）回填 {updated} 条", flush=True)
+
     print(f"[forwards] 第三步完成，共回填 {total_me_updated} 条手工事件", flush=True)
+
+    # -------- 第四步：可观测统计——回填后仍为 NULL 的风险（策略行已不存在的真孤儿） --------
+    # 该集合在旧代码 strategy__risk_level join 语义下同样为 NULL（非本次回归），故仅告警不做门禁；
+    # 如需治理，可通过补充策略元数据后重跑本迁移（幂等）或人工修复
+    orphan_null_level = Risk.objects.filter(strategy_rule__isnull=True, risk_level__isnull=True).count()
+    total_risk = Risk.objects.count()
+    if orphan_null_level:
+        print(
+            f"[forwards][WARN] 回填后仍有 {orphan_null_level}/{total_risk} 条风险 risk_level 为空"
+            "（策略行已不存在的孤儿风险，旧 join 语义下同样为空，非回归）；如需治理请补充元数据后重跑",
+            flush=True,
+        )
+    else:
+        print(f"[forwards] 回填覆盖完整：{total_risk} 条风险无 NULL 快照", flush=True)
 
     print("[forwards] 数据迁移完成", flush=True)
 

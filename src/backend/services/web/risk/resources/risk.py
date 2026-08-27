@@ -386,10 +386,11 @@ class ListRisk(RiskMeta):
                 event_filters=event_filters,
                 thedate_range=thedate_range,
             )
+            # scene_id 回填走风险自身 RISK 绑定（分派风险的场景 = 目标场景，而非策略绑定场景）
             BindingMetadataHelper.attach_scene_id_via_binding_resource(
                 paged_risks,
-                binding_resource_type=ResourceVisibilityType.STRATEGY,
-                binding_resource_id_attr="strategy_id",
+                binding_resource_type=ResourceVisibilityType.RISK,
+                binding_resource_id_attr="risk_id",
             )
             return BkBaseResponseAssembler(self, ListRiskResponseSerializer).build_response(
                 paged_risks, page, sql_statements
@@ -404,8 +405,8 @@ class ListRisk(RiskMeta):
             setattr(risk, "experiences", experiences.get(risk.risk_id, 0))
         BindingMetadataHelper.attach_scene_id_via_binding_resource(
             paged_risks,
-            binding_resource_type=ResourceVisibilityType.STRATEGY,
-            binding_resource_id_attr="strategy_id",
+            binding_resource_type=ResourceVisibilityType.RISK,
+            binding_resource_id_attr="risk_id",
         )
 
         response = page.get_paginated_response(
@@ -418,16 +419,18 @@ class ListRisk(RiskMeta):
         if not scene_ids:
             return queryset
 
-        strategy_ids = list(
+        # 按风险自身的 RISK 绑定过滤（单轨制）：
+        # 全局策略分派的风险其策略为 platform_binding、不在任何场景的策略集合内，经 strategy 反查会漏掉
+        bound_risk_ids = list(
             ResourceBindingScene.objects.filter(
                 scene_id__in=scene_ids,
                 scene__is_deleted=False,
-                binding__resource_type=ResourceVisibilityType.STRATEGY,
+                binding__resource_type=ResourceVisibilityType.RISK,
             ).values_list("binding__resource_id", flat=True)
         )
-        if not strategy_ids:
+        if not bound_risk_ids:
             return queryset.none()
-        return queryset.filter(strategy_id__in=strategy_ids)
+        return queryset.filter(risk_id__in=bound_risk_ids)
 
     def _extract_thedate_range(self, validated_request_data) -> Tuple[str, str]:
         end_dt = (
@@ -692,19 +695,10 @@ class ListRisk(RiskMeta):
         q = self._build_filter_query(validated_request_data)
         return (
             Risk.load_iam_authed_risks(action=ActionEnum.LIST_RISK, username=username)
-            .filter(
-                q,
-                # 排除待确认状态（待确认有独立列表）
-                display_status__in=[
-                    RiskDisplayStatus.NEW,
-                    RiskDisplayStatus.PROCESSING,
-                    RiskDisplayStatus.FOR_APPROVE,
-                    RiskDisplayStatus.AUTO_PROCESS,
-                    RiskDisplayStatus.AWAIT_PROCESS,
-                    RiskDisplayStatus.CLOSED,
-                    RiskDisplayStatus.STAND_BY,
-                ],
-            )
+            .filter(q)
+            # 排除待确认状态（待确认有独立列表）；用 exclude 而非白名单，
+            # 白名单会漏新增状态（此前 ListMineRisk 漏 AWAIT_PROCESS、ListNoticingRisk 漏 CLOSED 即此因）
+            .exclude(display_status=RiskDisplayStatus.PENDING_CONFIRM)
             .distinct()
         )
 
@@ -894,14 +888,9 @@ class ListMineRisk(ListRisk):
                 authorized_at_start=event_time_start,
             ),
             current_operator__contains=username,
-            # 排除待确认状态（待确认有独立列表）
-            display_status__in=[
-                RiskDisplayStatus.NEW,
-                RiskDisplayStatus.PROCESSING,
-                RiskDisplayStatus.FOR_APPROVE,
-                RiskDisplayStatus.AUTO_PROCESS,
-            ],
-        ).distinct()
+            # 排除待确认状态（待确认有独立列表）；exclude 保持与改造前一致的完整状态集
+            # （白名单写法曾漏 AWAIT_PROCESS"待处理"，导致待办从"待我处理"列表消失）
+        ).exclude(display_status=RiskDisplayStatus.PENDING_CONFIRM).distinct()
 
 
 class ListNoticingRisk(ListRisk):
@@ -920,15 +909,8 @@ class ListNoticingRisk(ListRisk):
                 authorized_at_start=event_time_start,
             ),
             notice_users__contains=username,
-            # 排除待确认状态（待确认有独立列表）
-            display_status__in=[
-                RiskDisplayStatus.NEW,
-                RiskDisplayStatus.PROCESSING,
-                RiskDisplayStatus.FOR_APPROVE,
-                RiskDisplayStatus.AUTO_PROCESS,
-                RiskDisplayStatus.AWAIT_PROCESS,
-            ],
-        ).distinct()
+            # 排除待确认状态（待确认有独立列表）；exclude 保持与改造前一致的完整状态集（含 CLOSED）
+        ).exclude(display_status=RiskDisplayStatus.PENDING_CONFIRM).distinct()
 
 
 class ListProcessedRisk(ListRisk):
@@ -945,19 +927,12 @@ class ListProcessedRisk(ListRisk):
         processed_risk_ids = TicketNode.objects.filter(
             operator=username,
         ).values("risk_id")
-        return Risk.objects.filter(
-            q,
-            risk_id__in=processed_risk_ids,
-            # 排除待确认状态（待确认有独立列表）
-            display_status__in=[
-                RiskDisplayStatus.NEW,
-                RiskDisplayStatus.PROCESSING,
-                RiskDisplayStatus.FOR_APPROVE,
-                RiskDisplayStatus.AUTO_PROCESS,
-                RiskDisplayStatus.AWAIT_PROCESS,
-                RiskDisplayStatus.CLOSED,
-            ],
-        ).exclude(current_operator__contains=username)
+        return (
+            Risk.objects.filter(q, risk_id__in=processed_risk_ids)
+            # 排除待确认状态（待确认有独立列表）；exclude 保持与改造前一致的完整状态集
+            .exclude(display_status=RiskDisplayStatus.PENDING_CONFIRM)
+            .exclude(current_operator__contains=username)
+        )
 
 
 class ListRiskFields(RiskMeta):
@@ -1985,8 +1960,10 @@ class ListPendingConfirmRisk(ListRisk):
         username = username or get_request_username()
         q = self._build_filter_query(validated_request_data)
 
+        # 用组合权限（IAM + 本地 TicketPermission）：确认人通常没有 IAM 风险权限，
+        # 分派时已为其写入 CONFIRMER 类型的本地授权，仅走 IAM 过滤会导致待确认列表恒为空
         return (
-            Risk.load_iam_authed_risks(action=ActionEnum.LIST_RISK, username=username)
+            Risk.load_authed_risks(action=ActionEnum.LIST_RISK, username=username)
             .filter(
                 q,
                 display_status=RiskDisplayStatus.PENDING_CONFIRM,

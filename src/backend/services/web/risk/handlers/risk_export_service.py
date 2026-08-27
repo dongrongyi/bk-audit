@@ -222,7 +222,8 @@ class RiskExportService:
             RiskExportField.EVENT_CONTENT: risk.event_content,
             RiskExportField.RISK_TAGS: data2string([tag_rel.tag.tag_name for tag_rel in risk.strategy.prefetched_tags]),
             RiskExportField.EVENT_TYPE: data2string(risk.event_type),
-            RiskExportField.RISK_LEVEL: str(RiskLevel.get_label(risk.risk_level)),
+            # 快照为空（孤儿风险等）时输出空串，避免 get_label(None) 渲染成 "None" 字样
+            RiskExportField.RISK_LEVEL: str(RiskLevel.get_label(risk.risk_level)) if risk.risk_level else "",
             RiskExportField.STRATEGY_NAME: risk.strategy.strategy_name,
             RiskExportField.STRATEGY_ID: risk.strategy.strategy_id,
             RiskExportField.RAW_EVENT_ID: risk.raw_event_id,

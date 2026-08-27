@@ -13,33 +13,29 @@ def _default_dispatch_rule_conditions() -> dict:
     return {}
 
 
+# 存在性守卫统一走 connection.introspection（MySQL/PostgreSQL/SQLite 通用），
+# 不直查 information_schema（MySQL 专有，sqlite 测试环境会直接语法报错）
 def table_exists(schema_editor, table: str) -> bool:
     with schema_editor.connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT COUNT(*) FROM information_schema.TABLES " "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
-            [table],
-        )
-        return cursor.fetchone()[0] > 0
+        return table in schema_editor.connection.introspection.table_names(cursor)
 
 
 def column_exists(schema_editor, table: str, column: str) -> bool:
     with schema_editor.connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT COUNT(*) FROM information_schema.COLUMNS "
-            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s",
-            [table, column],
-        )
-        return cursor.fetchone()[0] > 0
+        try:
+            description = schema_editor.connection.introspection.get_table_description(cursor, table)
+        except Exception:  # pylint: disable=broad-except(表不存在等异常视为列不存在，走正常 DDL)
+            return False
+        return any(field.name == column for field in description)
 
 
 def index_exists(schema_editor, table: str, index_name: str) -> bool:
     with schema_editor.connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT COUNT(*) FROM information_schema.STATISTICS "
-            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND INDEX_NAME = %s",
-            [table, index_name],
-        )
-        return cursor.fetchone()[0] > 0
+        try:
+            constraints = schema_editor.connection.introspection.get_constraints(cursor, table)
+        except Exception:  # pylint: disable=broad-except(表不存在等异常视为索引不存在，走正常 DDL)
+            return False
+        return index_name in constraints
 
 
 class SafeCreateModel(migrations.CreateModel):

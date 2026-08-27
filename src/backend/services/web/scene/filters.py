@@ -176,13 +176,13 @@ class BindingMetadataHelper:
         """通过资源绑定关系回填单个 `scene_id`。
 
         适用于“业务对象本身不直接绑定场景，而是经由另一类资源间接绑定场景”的场景。
-        当前风险列表即通过 `strategy_id -> strategy binding -> scene_id` 回填。
+        如风险列表即通过 `risk_id -> RISK binding -> scene_id` 回填（单轨制）。
 
         Args:
             objects: 需要回填的对象集合。
-            binding_resource_type: 绑定资源类型，如 `ResourceVisibilityType.STRATEGY`。
+            binding_resource_type: 绑定资源类型，如 `ResourceVisibilityType.RISK`。
             binding_resource_id_attr: 对象上用于匹配 `ResourceBinding.resource_id` 的属性名。
-            target_attr: 回填到对象上的目标属性名，默认 `scene_id`。
+            target_attr: 回填到对象上的目标属性名，默认为 `scene_id`。
         """
         object_list = list(objects)
         if not object_list:
@@ -250,19 +250,19 @@ class BindingMetadataHelper:
         - 全局策略 after_confirm：confirmer 确认后写（确认接口负责）
 
         幂等：已有绑定（含场景关联）时跳过，避免重复调用产生脏数据。
+
+        失败语义：scene_id 非空但场景不存在/已软删时抛错（而非仅告警跳过），
+        使建单/确认事务回滚并可观测——静默跳过会产生无场景风险
+        （场景列表/IAM/Provider 均不可见、处理规则失效）；scene_id 为空仍容忍跳过
+        （存量孤儿策略无场景归属的历史行为）。
         """
-        from services.web.scene.constants import ResourceVisibilityType
+        from django.utils.translation import gettext
 
         if not scene_id:
             return
-        # 目标场景不存在或已软删时不建绑定（避免风险挂到已删场景形成脏数据）
+        # 目标场景不存在或已软删：严格失败（调用方事务回滚），避免风险挂到已删场景形成脏数据
         if not Scene.objects.filter(scene_id=scene_id, is_deleted=False).exists():
-            logger.warning(
-                "[CreateRiskSceneBinding] scene %s not exists or deleted, skip binding. risk_id=%s",
-                scene_id,
-                risk_id,
-            )
-            return
+            raise ValueError(gettext("场景[%s]不存在或已删除，无法创建风险场景绑定") % scene_id)
         resource_id = str(risk_id)
         binding = ResourceBinding.objects.filter(
             resource_type=ResourceVisibilityType.RISK,
@@ -344,13 +344,16 @@ class SceneScopeFilter:
         scene_ids = _normalize_scope_values(scene_id)
         if scene_ids:
             if resource_type == ResourceVisibilityType.RISK:
-                SceneScopeFilter._assert_scene_binding_integrity(ResourceVisibilityType.STRATEGY)
-                strategy_ids = ResourceBindingScene.objects.filter(
+                # 风险按自身 RISK 绑定过滤（单轨制，见 0060 迁移说明）：
+                # 场景策略风险建单即写绑定、全局策略 direct/after_confirm 分派后写绑定，
+                # 不再经 strategy -> scene 反查（全局策略为 platform_binding，反查会漏掉已分派风险）。
+                # 注：RISK 绑定量级与风险数同阶，跳过 _assert_scene_binding_integrity 全量校验以免拖垮查询。
+                bound_risk_ids = ResourceBindingScene.objects.filter(
                     scene_id__in=scene_ids,
                     scene__is_deleted=False,
-                    binding__resource_type=ResourceVisibilityType.STRATEGY,
+                    binding__resource_type=ResourceVisibilityType.RISK,
                 ).values_list("binding__resource_id", flat=True)
-                return queryset.filter(strategy_id__in=list(strategy_ids))
+                return queryset.filter(**{f"{pk_field}__in": list(bound_risk_ids)})
             SceneScopeFilter._assert_scene_binding_integrity(resource_type)
             # 按场景列表过滤：通过 ResourceBindingScene 查找并取并集
             bound_ids = ResourceBindingScene.objects.filter(
@@ -373,18 +376,7 @@ class SceneScopeFilter:
         :return: 资源 ID 列表
         """
         scene_ids = _normalize_scope_values(scene_id)
-        if resource_type == ResourceVisibilityType.RISK:
-            from services.web.risk.models import Risk
-
-            SceneScopeFilter._assert_scene_binding_integrity(ResourceVisibilityType.STRATEGY)
-            strategy_ids = ResourceBindingScene.objects.filter(
-                scene_id__in=scene_ids,
-                scene__is_deleted=False,
-                binding__resource_type=ResourceVisibilityType.STRATEGY,
-            ).values_list("binding__resource_id", flat=True)
-            return list(Risk.objects.filter(strategy_id__in=list(strategy_ids)).values_list("risk_id", flat=True))
-
-        SceneScopeFilter._assert_scene_binding_integrity(resource_type)
+        # RISK 与其他资源一致，直接按自身绑定返回（不再经 strategy -> scene 反查）
         return list(
             ResourceBindingScene.objects.filter(
                 scene_id__in=scene_ids,

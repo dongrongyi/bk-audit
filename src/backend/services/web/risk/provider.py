@@ -111,7 +111,7 @@ class RiskResourceProvider(IAMResourceProvider):
 
     @staticmethod
     def _get_strategy_ids_by_scene(scene_id: str) -> List[int]:
-        """通过策略绑定的场景反查 strategy_id 列表（风险不直接绑定场景，而是依赖策略所属的场景）
+        """通过策略绑定的场景反查 strategy_id 列表
 
         注意：binding.resource_id 是 CharField(str)，需转为 int 与 Risk.strategy_id(ForeignKey int) 匹配。
         """
@@ -128,14 +128,27 @@ class RiskResourceProvider(IAMResourceProvider):
                 continue
         return int_ids
 
+    @staticmethod
+    def _get_risk_ids_by_scene(scene_id: str) -> List[str]:
+        """分派到该场景的风险 ID 列表（RISK 绑定单轨制，resource_id 与 risk_id 同为 str）"""
+        return list(
+            ResourceBindingScene.objects.filter(
+                binding__resource_type=ResourceVisibilityType.RISK,
+                scene_id=scene_id,
+                scene__is_deleted=False,
+            ).values_list("binding__resource_id", flat=True)
+        )
+
     def filter_list_instance_results(self, parent_id: Optional[str], resource_type: Optional[str], page: Page) -> Tuple:
         """
         根据过滤条件查询资源实例
         """
         if parent_id:
             if resource_type == ResourceEnum.SCENE.id:
-                bound_strategy_ids = self._get_strategy_ids_by_scene(parent_id)
-                queryset: QuerySet[Risk] = Risk.objects.filter(strategy_id__in=bound_strategy_ids)
+                # 场景下风险 = 场景绑定策略的风险 ∪ 分派到该场景的风险（全局策略分派）
+                queryset: QuerySet[Risk] = Risk.objects.filter(
+                    strategy_id__in=self._get_strategy_ids_by_scene(parent_id)
+                ) | Risk.objects.filter(risk_id__in=self._get_risk_ids_by_scene(parent_id))
             elif resource_type == ResourceEnum.STRATEGY.id:
                 strategy_id = int(parent_id)
                 queryset: QuerySet[Risk] = Risk.objects.filter(strategy_id=strategy_id)
@@ -156,8 +169,10 @@ class RiskResourceProvider(IAMResourceProvider):
         """根据风险类型名称查询 ."""
         if parent_id:
             if resource_type == ResourceEnum.SCENE.id:
-                bound_strategy_ids = self._get_strategy_ids_by_scene(parent_id)
-                queryset: QuerySet[Risk] = Risk.objects.filter(strategy_id__in=bound_strategy_ids)
+                # 场景下风险 = 场景绑定策略的风险 ∪ 分派到该场景的风险（全局策略分派）
+                queryset: QuerySet[Risk] = Risk.objects.filter(
+                    strategy_id__in=self._get_strategy_ids_by_scene(parent_id)
+                ) | Risk.objects.filter(risk_id__in=self._get_risk_ids_by_scene(parent_id))
             elif resource_type == ResourceEnum.STRATEGY.id:
                 strategy_id = int(parent_id)
                 queryset: QuerySet[Risk] = Risk.objects.filter(strategy_id=strategy_id)

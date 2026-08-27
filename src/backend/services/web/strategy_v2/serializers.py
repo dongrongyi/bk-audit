@@ -24,6 +24,7 @@ from blueapps.utils.logger import logger
 from blueapps.utils.request_provider import get_request_username
 from django.conf import settings
 from django.utils.translation import gettext, gettext_lazy
+from pydantic import ValidationError as PydanticValidationError
 from rest_framework import serializers
 
 from api.bk_base.constants import UserAuthActionEnum
@@ -35,6 +36,8 @@ from apps.meta.serializers import (
 )
 from apps.notice.models import NoticeGroup
 from core.serializers import ChoiceListSerializer, OrderSerializer
+from core.sql.model import HavingCondition as SqlHavingCondition
+from core.sql.model import WhereCondition as SqlWhereCondition
 from services.web.analyze.constants import (
     ControlTypeChoices,
     FilterConnector,
@@ -810,6 +813,8 @@ class MultiRuleValidateMixin:
     4. 分派规则仅全局策略（binding_type=platform_binding）可配；全局策略必须有默认分派规则（风险必有分派去处）
     5. 分派默认规则唯一；is_default 由 conditions 推导同步
     6. target_scene 存在且通知组属于目标场景
+    7. 条件树结构完整校验（复用 SQL 构建/分派求值侧同源 pydantic 模型）；分派条件字段限 select 输出白名单、
+       操作符限求值器白名单——非法输入在保存时以 400 拒绝，不延迟到 flow 更新或事件分派时失败
     """
 
     @staticmethod
@@ -831,8 +836,28 @@ class MultiRuleValidateMixin:
         for sub in node.get("conditions") or []:
             yield from MultiRuleValidateMixin._walk_tree_leaves(sub)
 
+    @staticmethod
+    def _validate_condition_tree_struct(tree: Optional[dict], model_cls, label: str, clause: str) -> None:
+        """
+        条件树结构完整校验：直接复用构建侧消费的同一 pydantic 模型（单一事实源），
+        覆盖树结构（子节点必须为 dict 树）、connector 枚举、field 结构（table/raw_name/field_type）、
+        operator 枚举、filter/filters 值类型。非法输入在保存时以 400 暴露，
+        而非延迟到 SQL 构造（flow 更新失败 500）或真实事件分派（风险静默丢失）。
+        """
+        try:
+            model_cls(**(tree or {}))
+        except PydanticValidationError as err:
+            first = err.errors()[0]
+            raise serializers.ValidationError(
+                gettext("%s 的 %s 条件树结构非法：位置[%s] %s")
+                % (label, clause, ".".join(str(i) for i in first.get("loc", [])), first.get("msg"))
+            )
+
     def _check_rules(self, attrs: dict) -> dict:
         """校验发现规则集（attrs["rules"]）；由 Create/Update 序列化器在 validate() 中显式调用"""
+        # Update 局部更新：未携带 rules 时不校验也不修改（"至少一条规则"等不变量已由创建/上次更新保证）
+        if "rules" not in attrs:
+            return attrs
         rules = attrs.get("rules") or []
         strategy_type = attrs.get("strategy_type")
 
@@ -869,6 +894,12 @@ class MultiRuleValidateMixin:
             where_tree = conditions.get("where")
             having_tree = conditions.get("having")
 
+            # 结构完整校验（与 SQL 构建侧同源 pydantic 模型）：树结构/connector/field/operator/filter 类型，
+            # 必须先于判空与叶子遍历执行，否则非法子节点会使后续递归直接 AttributeError（500）
+            rule_label = f"规则[{rule.get('rule_name')}]"
+            self._validate_condition_tree_struct(where_tree, SqlWhereCondition, rule_label, "where")
+            self._validate_condition_tree_struct(having_tree, SqlHavingCondition, rule_label, "having")
+
             # 规则 where 必填
             if self._condition_tree_is_empty(where_tree):
                 raise serializers.ValidationError(gettext("规则[%s]缺少where过滤条件（规则where必填）") % rule.get("rule_name"))
@@ -901,10 +932,33 @@ class MultiRuleValidateMixin:
                     raise serializers.ValidationError(
                         gettext("策略select不含聚合字段（行级审计）时，规则[%s]不能配置having条件") % rule.get("rule_name")
                     )
+
+        # 规则级 processor/follower 通知组须属于策略所属场景（与策略级 processor_groups 校验同口径）；
+        # 仅场景策略校验——全局策略风险的处理器来自分派规则，规则级通知组不参与运行期处理人解析。
+        # scene_id 解析：Create 必带（场景策略门禁）；Update 未带时回读策略当前绑定
+        if attrs.get("binding_type") == BindingType.SCENE_BINDING:
+            rule_scene_id = attrs.get("scene_id")
+            if rule_scene_id is None and attrs.get("strategy_id"):
+                rule_scene_id = (
+                    ResourceBindingScene.objects.filter(
+                        scene__is_deleted=False,
+                        binding__resource_type=ResourceVisibilityType.STRATEGY,
+                        binding__resource_id=str(attrs["strategy_id"]),
+                    )
+                    .values_list("scene_id", flat=True)
+                    .first()
+                )
+            for rule in rules:
+                rule_group_ids = list(set((rule.get("processor") or []) + (rule.get("follower") or [])))
+                if rule_group_ids:
+                    self._validate_notice_groups("rules", rule_group_ids, rule_scene_id)
         return attrs
 
     def _check_dispatch_rules(self, attrs: dict) -> dict:
         """校验分派规则集（attrs["dispatch_rules"]）；由 Create/Update 序列化器在 validate() 中显式调用"""
+        # Update 局部更新：未携带 dispatch_rules 时不校验也不修改（"唯一默认规则"不变量已由创建/上次更新保证）
+        if "dispatch_rules" not in attrs:
+            return attrs
         dispatch_rules = attrs.get("dispatch_rules") or []
         binding_type = attrs.get("binding_type")
 
@@ -928,18 +982,32 @@ class MultiRuleValidateMixin:
 
             default_count = 0
             for rule in dispatch_rules:
+                # 分派树结构完整校验：与运行期求值侧（to_condition_tree -> DispatchConditionNode）同源 pydantic 模型，
+                # 非法结构/operator/filter 类型在保存时以 400 暴露，避免落库后每条事件分派时崩溃导致风险丢失
+                # （延迟 import 避免 serializers <-> handlers 顶层相互依赖）
+                from services.web.strategy_v2.handlers.dispatch import DispatchConditionNode, PY_OPERATORS
+
+                self._validate_condition_tree_struct(
+                    rule.get("conditions"), DispatchConditionNode, f"分派规则[{rule.get('rule_name')}]", "conditions"
+                )
                 # is_default 由 conditions 推导同步
                 is_default = self._condition_tree_is_empty(rule.get("conditions"))
                 rule["is_default"] = is_default
                 if is_default:
                     default_count += 1
-                # 条件叶子字段必须在白名单内（默认规则条件为空，无叶子可跳过）
+                # 条件叶子校验：字段白名单 + 求值器支持的操作符（默认规则条件为空，无叶子可跳过）
                 for leaf in self._walk_tree_leaves(rule.get("conditions")):
                     field_name = (leaf or {}).get("field") or ""
                     if field_name not in valid_fields:
                         raise serializers.ValidationError(
                             gettext("分派规则[%s]的条件字段[%s]不在分派字段白名单内（仅支持 event_data.<输出字段> 与 risk_level）")
                             % (rule.get("rule_name"), field_name)
+                        )
+                    operator = (leaf or {}).get("operator")
+                    # Operator 为 str 枚举，与字典键（枚举成员）可直接按值匹配
+                    if operator not in PY_OPERATORS:
+                        raise serializers.ValidationError(
+                            gettext("分派规则[%s]的条件操作符[%s]不被分派求值器支持") % (rule.get("rule_name"), operator)
                         )
                 # 处理人/关注人/确认人均必填
                 for list_field in ("processor", "follower", "confirmer"):
@@ -1158,8 +1226,11 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
         label=gettext_lazy("Risk Level"), choices=RiskLevel.choices, required=False, allow_null=True
     )
     report_config = ReportConfigSerializer(required=False, allow_null=True)
-    rules = StrategyRuleSerializer(many=True, required=False, default=list)
-    dispatch_rules = DispatchRuleSerializer(many=True, required=False, default=list)
+    # rules / dispatch_rules 不设 default：未传 = 不修改（局部更新），
+    # 显式传 [] = 清空（规则策略/全局策略会被 _check_rules/_check_dispatch_rules 拒绝）。
+    # 区别于 Create 序列化器的 default=list（创建时缺席按空集处理以触发必填门禁）
+    rules = StrategyRuleSerializer(many=True, required=False)
+    dispatch_rules = DispatchRuleSerializer(many=True, required=False)
     visibility = ResourceBindingInputSerializer(required=False, allow_null=True, label=gettext_lazy("可见范围（仅全局策略）"))
 
     class Meta:
@@ -1203,17 +1274,26 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
         data = super().validate(attrs)
         # check type
         self._validate_strategy_type(data)
-        # 供下游多规则/分派规则校验使用
-        if not data.get("binding_type"):
-            data["binding_type"] = (
-                ResourceBinding.objects.filter(
-                    resource_type=ResourceVisibilityType.STRATEGY,
-                    resource_id=str(data["strategy_id"]),
-                )
-                .values_list("binding_type", flat=True)
-                .first()
-                or BindingType.SCENE_BINDING
+        # binding_type 以数据库真实绑定为准（客户端输入不可信，资源层更新时也不会应用该字段）：
+        # - 伪造 platform_binding 可让场景策略通过分派规则校验，真实绑定与 DispatchRule 模型分裂；
+        # - 伪造 scene_binding 可绕过"全局策略必须配置默认分派规则"门禁，
+        #   随后 _sync_dispatch_rules([]) 会软删全部分派规则，导致运行期分派未命中、风险丢失。
+        # 绑定类型不支持通过更新接口切换：请求显式携带 binding_type 时必须与当前绑定一致。
+        real_binding_type = (
+            ResourceBinding.objects.filter(
+                resource_type=ResourceVisibilityType.STRATEGY,
+                resource_id=str(data["strategy_id"]),
             )
+            .values_list("binding_type", flat=True)
+            .first()
+            or BindingType.SCENE_BINDING
+        )
+        requested_binding_type = data.get("binding_type")
+        if requested_binding_type and requested_binding_type != real_binding_type:
+            raise serializers.ValidationError(
+                gettext("策略绑定类型不支持修改：当前为 %s，请求为 %s") % (real_binding_type, requested_binding_type)
+            )
+        data["binding_type"] = real_binding_type
         # scene_id 与 binding_type 联动：仅前端显式传了 scene_id 时才校验
         if "scene_id" in self.initial_data:
             binding_type = data.get("binding_type") or BindingType.SCENE_BINDING
@@ -1222,14 +1302,8 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
             if binding_type == BindingType.PLATFORM_BINDING and data.get("scene_id"):
                 raise serializers.ValidationError(gettext("全局策略（binding_type=platform_binding）不允许携带 scene_id"))
         # 可见范围仅全局策略可配
-        if data.get("visibility"):
-            has_platform_binding = ResourceBinding.objects.filter(
-                resource_type=ResourceVisibilityType.STRATEGY,
-                resource_id=str(data["strategy_id"]),
-                binding_type=BindingType.PLATFORM_BINDING,
-            ).exists()
-            if not has_platform_binding:
-                raise serializers.ValidationError(gettext("可见范围（visibility）仅全局策略（platform_binding）可配置"))
+        if data.get("visibility") and real_binding_type != BindingType.PLATFORM_BINDING:
+            raise serializers.ValidationError(gettext("可见范围（visibility）仅全局策略（platform_binding）可配置"))
         # 模型策略必须配置processor_groups
         strategy_type = data.get("strategy_type")
         if strategy_type == StrategyType.MODEL.value and not data.get("processor_groups"):

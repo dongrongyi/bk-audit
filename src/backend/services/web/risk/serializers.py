@@ -84,6 +84,21 @@ def get_strategy_scene_id(strategy_id: int | None) -> int | None:
     )
 
 
+def get_risk_scene_id(risk_id: str | None) -> int | None:
+    """风险自身的场景归属（RISK 绑定单轨制）：全局策略分派风险的场景 = 分派目标场景"""
+    if not risk_id:
+        return None
+    return (
+        ResourceBindingScene.objects.filter(
+            scene__is_deleted=False,
+            binding__resource_type=ResourceVisibilityType.RISK,
+            binding__resource_id=str(risk_id),
+        )
+        .values_list("scene_id", flat=True)
+        .first()
+    )
+
+
 class CreateEventSerializer(serializers.Serializer):
     """
     生成审计事件
@@ -315,7 +330,8 @@ class RiskInfoSerializer(serializers.ModelSerializer):
         return obj.get_tag_ids()
 
     def get_scene_id(self, obj: Risk) -> int | None:
-        return get_strategy_scene_id(obj.strategy_id)
+        # 风险场景归属读自身 RISK 绑定（全局策略分派风险回显目标场景，而非策略绑定场景）
+        return get_risk_scene_id(obj.risk_id)
 
     class Meta:
         model = Risk

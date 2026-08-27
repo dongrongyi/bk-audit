@@ -38,6 +38,7 @@ from apps.meta.utils.format import preprocess_data
 from apps.notice.constants import RelateType
 from apps.notice.handlers import ErrorMsgHandler
 from apps.notice.models import NoticeGroup
+from apps.permission.handlers.actions import ActionEnum
 from core.render import Jinja2Renderer, VariableUndefined
 from services.web.risk.constants import (
     EVENT_DATA_SORT_FIELD,
@@ -46,11 +47,12 @@ from services.web.risk.constants import (
     RISK_RENDER_LOCK_KEY,
     RISK_SYNC_BATCH_SIZE,
     RISK_SYNC_START_TIME_KEY,
+    SECURITY_PERSON_KEY,
     RiskDisplayStatus,
     RiskStatus,
 )
 from services.web.risk.handlers import EventHandler
-from services.web.risk.models import Risk
+from services.web.risk.models import Risk, UserType
 from services.web.risk.parser import RiskNoticeParser
 from services.web.risk.serializers import CreateRiskSerializer
 from services.web.scene.constants import BindingType, ResourceVisibilityType
@@ -367,14 +369,26 @@ class RiskHandler:
         strategy = Strategy.objects.filter(strategy_id=event["strategy_id"]).first()
         if strategy is None:
             return None
+        # CreateRiskSerializer.validate_event_data 会把 event_data 规范化为 JSON 字符串，
+        # 分派条件按 dict 逐层下钻求值，需先还原为 dict（否则 event_data.* 条件恒不匹配、全部落默认规则）
+        event_data = event.get("event_data") or {}
+        if isinstance(event_data, str):
+            try:
+                event_data = json.loads(event_data)
+            except (json.JSONDecodeError, TypeError):
+                event_data = {}
+        if not isinstance(event_data, dict):
+            event_data = {}
         # ctx 仅投影分派字段白名单（与保存校验同源）：事件输出字段 event_data.* + 命中规则实例化的 risk_level。
         # 不暴露 strategy_id/operator/event_time 等标准事件字段与 risk_hazard/risk_guidance 等自由文本，
-        # 越界字段引用取值为 None（不匹配），作为存量越界规则数据的纵深防御
+        # 越界字段引用取值为 None（不匹配），作为存量越界规则数据的纵深防御。
         ctx = {
-            "event_data": event.get("event_data") or {},
+            "event_data": event_data,
             "risk_level": create_params.get("risk_level"),
         }
-        dispatch_result = match_dispatch_rule(ctx, strategy=strategy)
+        # fallback_to_first：默认规则被并发编辑/场景被删等竞态导致未命中时，
+        # 按优先级降级取首条有效规则建单（事件不丢、可观测），仅在完全无可用规则时才报错
+        dispatch_result = match_dispatch_rule(ctx, strategy=strategy, fallback_to_first=True)
         if not dispatch_result.matched:
             logger.error(
                 "[DispatchRisk] no dispatch rule matched. strategy_id=%s, raw_event_id=%s",
@@ -382,7 +396,26 @@ class RiskHandler:
                 event.get("raw_event_id"),
             )
             raise ValueError(gettext("全局策略[%s]分派规则未命中且无默认兜底规则，请检查策略分派规则配置") % event["strategy_id"])
+        if dispatch_result.fallback:
+            logger.error(
+                "[DispatchRisk] fallback to first available dispatch rule (no default matched). "
+                "strategy_id=%s, raw_event_id=%s, dispatch_rule_id=%s, target_scene_id=%s",
+                event["strategy_id"],
+                event.get("raw_event_id"),
+                dispatch_result.rule.rule_id,
+                dispatch_result.target_scene_id,
+            )
         return dispatch_result
+
+    @staticmethod
+    def _load_security_person() -> List[str]:
+        """
+        平台安全接口人（与工单侧 RiskFlowBaseHandler.load_security_person 同源兜底）
+        """
+        persons = GlobalMetaConfig.get(config_key=SECURITY_PERSON_KEY)
+        if isinstance(persons, str):
+            return [persons]
+        return list(persons or [])
 
     def _apply_dispatch(self, risk: Risk, dispatch_result) -> None:
         """
@@ -390,16 +423,30 @@ class RiskHandler:
 
         - 两种分派方式均固化快照（dispatch_rule/confirmer），后续分派规则编辑不影响已产生单据
         - 仅 after_confirm 写入 PENDING_CONFIRM（等待确认人流转）；
-          direct 按"直接分派"语义保持 NEW，建单后即进入正常流转
+          direct 为"直接分派"语义保持 NEW，建单后即进入正常流转
         """
         risk.dispatch_rule_id = dispatch_result.rule.rule_id
         confirmers = list(NoticeGroup.objects.filter(group_id__in=dispatch_result.confirmer))
         risk.confirmer = RiskNoticeParser(risk=risk).parse_groups(confirmers)
         if dispatch_result.dispatch_mode == DispatchMode.AFTER_CONFIRM:
+            if not risk.confirmer:
+                # 确认人解析为空（通知组无有效成员等配置异常）：回退安全接口人，
+                # 避免风险永久滞留待确认状态且无人可确认（确认接口要求 username 在 confirmer 内）
+                risk.confirmer = self._load_security_person()
+                logger.error(
+                    "[ApplyDispatch] confirmer resolved empty, fallback to security person. "
+                    "risk_id=%s, dispatch_rule_id=%s, confirmer_groups=%s",
+                    risk.risk_id,
+                    dispatch_result.rule.rule_id,
+                    dispatch_result.confirmer,
+                )
             # display_status 同步，否则列表页展示为空；周期任务 process_one_risk 的 match 无该分支会跳过，
             risk.status = RiskStatus.PENDING_CONFIRM
             risk.display_status = RiskDisplayStatus.PENDING_CONFIRM
             risk.save(update_fields=["dispatch_rule", "confirmer", "status", "display_status"])
+            # 确认人通常无 IAM 风险权限，写入本地工单权限（UserType.CONFIRMER）保证待确认列表对其可见
+            if risk.confirmer:
+                risk.auth_users(action=ActionEnum.LIST_RISK.id, users=risk.confirmer, user_type=UserType.CONFIRMER)
         else:
             risk.save(update_fields=["dispatch_rule", "confirmer"])
 

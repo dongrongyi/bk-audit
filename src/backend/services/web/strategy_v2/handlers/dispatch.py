@@ -20,6 +20,7 @@ from pydantic import BaseModel as PydanticBaseModel
 from pydantic import Field as PydanticField
 
 from core.sql.constants import FilterConnector, Operator
+from services.web.scene.models import Scene
 from services.web.strategy_v2.constants import DispatchMode
 from services.web.strategy_v2.models import DispatchRule, Strategy
 
@@ -68,6 +69,8 @@ class DispatchResult:
 
     matched: bool = False
     rule: Optional[DispatchRule] = None
+    # 未命中兜底标记：未匹配任何规则时按优先级取首条有效规则的降级结果（可观测，见 match_dispatch_rule）
+    fallback: bool = False
     # 以下字段为实例化快照（分派时一次性固化，后续规则编辑不影响已产生单据）
     dispatch_mode: str = DispatchMode.DIRECT
     target_scene_id: Optional[int] = None
@@ -80,10 +83,11 @@ class DispatchResult:
         return cls(matched=False)
 
     @classmethod
-    def hit(cls, rule: DispatchRule) -> "DispatchResult":
+    def hit(cls, rule: DispatchRule, fallback: bool = False) -> "DispatchResult":
         return cls(
             matched=True,
             rule=rule,
+            fallback=fallback,
             dispatch_mode=rule.dispatch_mode,
             target_scene_id=rule.target_scene_id,
             processor=list(rule.processor or []),
@@ -253,6 +257,7 @@ def match_dispatch_rule(
     rules: Optional[List[DispatchRule]] = None,
     strategy: Optional[Strategy] = None,
     rule_order: Optional[List[int]] = None,
+    fallback_to_first: bool = False,
 ) -> DispatchResult:
     """
     按分派规则首匹配（dispatch_rule_order 顺序）。
@@ -261,7 +266,10 @@ def match_dispatch_rule(
     :param rules: 候选分派规则（默认从 strategy.dispatch_rules 取）
     :param strategy: 全局策略
     :param rule_order: 分派规则优先级（默认 strategy.dispatch_rule_order）
-    :return: DispatchResult；未命中且无默认规则 -> matched=False（调用方兜底策略级）
+    :param fallback_to_first: 未命中且无默认规则时，是否按优先级降级取首条有效规则
+        （保存期门禁保证"有且仅有一条默认规则"，未命中仅出现在规则被并发编辑/场景被删等
+        竞态下；降级建单优于直接报错丢事件，fallback=True 供调用方记录可观测日志）
+    :return: DispatchResult；未命中 -> matched=False（调用方兜底策略级）
 
     匹配语义：
     - 非默认规则：evaluate(conditions) 为真 -> 命中
@@ -270,6 +278,18 @@ def match_dispatch_rule(
     if strategy is not None:
         rules = rules if rules is not None else list(strategy.dispatch_rules.filter(is_deleted=False))
         rule_order = rule_order if rule_order is not None else strategy.dispatch_rule_order or []
+    if not rules:
+        return DispatchResult.miss()
+    # 运行时再校验：目标场景已删除/不存在的分派规则视为不可用（保存期已校验存在性，
+    # 此处防御"场景删除/分派规则编辑"与"事件分派"之间的竞态及存量脏数据）；
+    # 被过滤的规则（含默认规则）不再参与匹配
+    valid_scene_ids = set(
+        Scene.objects.filter(
+            scene_id__in={r.target_scene_id for r in rules if r.target_scene_id is not None},
+            is_deleted=False,
+        ).values_list("scene_id", flat=True)
+    )
+    rules = [r for r in rules if r.target_scene_id in valid_scene_ids]
     if not rules:
         return DispatchResult.miss()
     # 分派规则按优先级排序
@@ -285,7 +305,12 @@ def match_dispatch_rule(
             continue
         if evaluate(to_condition_tree(conditions), ctx):
             return DispatchResult.hit(rule)
-    return default_result if default_result is not None else DispatchResult.miss()
+    if default_result is not None:
+        return default_result
+    if fallback_to_first and ordered:
+        # 降级兜底：默认规则被过滤/缺失时按优先级取首条有效规则，避免事件丢失
+        return DispatchResult.hit(ordered[0], fallback=True)
+    return DispatchResult.miss()
 
 
 def to_condition_tree(conditions: Union[dict, DispatchConditionNode]) -> DispatchConditionNode:

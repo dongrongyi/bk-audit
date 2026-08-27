@@ -53,6 +53,7 @@ from services.web.scene.exceptions import (
     ApplicationPending,
     ApproveServiceNotConfigured,
     SceneException,
+    SceneHasRelatedResources,
     SceneNotEnabled,
     SceneNotExist,
     SceneStrategyNotDisabled,
@@ -87,7 +88,7 @@ from services.web.scene.serializers import (
     UpdateSceneSerializer,
 )
 from services.web.strategy_v2.constants import StrategySource, StrategyStatusChoices
-from services.web.strategy_v2.models import Strategy
+from services.web.strategy_v2.models import DispatchRule, Strategy
 
 
 class SceneResource(AuditMixinResource, abc.ABC):
@@ -540,6 +541,24 @@ class DeleteScene(SceneResource):
         )
         if active_strategy_ids:
             raise SceneStrategyNotDisabled(strategy_ids=active_strategy_ids)
+
+        # 活动分派规则引用检查：全局策略（platform_binding）的分派规则以本场景为目标场景，
+        # 若放任删除，DIRECT 建单与确认后建绑定都会产生无场景风险（场景列表/IAM/Provider/处理规则随即失效），
+        # 必须先在策略侧移除/改派这些分派规则后再删除场景
+        active_dispatch_rules = list(
+            DispatchRule.objects.filter(target_scene_id=scene.scene_id, is_deleted=False).order_by("rule_id")
+        )
+        if active_dispatch_rules:
+            raise SceneHasRelatedResources(
+                related_resources=[
+                    {
+                        "resource_type": "dispatch_rule",
+                        "resource_type_name": gettext_lazy("分派规则"),
+                        "resource_id": str(rule.rule_id),
+                    }
+                    for rule in active_dispatch_rules[:10]
+                ]
+            )
 
         scene.delete()
         return {"message": "success"}

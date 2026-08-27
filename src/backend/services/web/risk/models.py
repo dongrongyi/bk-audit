@@ -304,10 +304,10 @@ class Risk(StrategyTagMixin, SoftDeleteModel):
         authorized_at_start: Optional[datetime.datetime] = None,
     ) -> Q:
         """
-        本地权限：通过 TicketPermission 授权的风险（处理人/关注人）
+        本地权限：通过 TicketPermission 授权的风险（处理人/关注人/确认人）
         """
 
-        user_types = user_types or [UserType.NOTICE_USER, UserType.OPERATOR]
+        user_types = user_types or [UserType.NOTICE_USER, UserType.OPERATOR, UserType.CONFIRMER]
         permission_filters = {
             "user_type__in": user_types,
             "user": username or get_request_username(),
