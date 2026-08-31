@@ -24,6 +24,7 @@ from blueapps.utils.logger import logger
 from blueapps.utils.request_provider import get_request_username
 from django.conf import settings
 from django.utils.translation import gettext, gettext_lazy
+from pydantic import ValidationError as PydanticValidationError
 from rest_framework import serializers
 
 from api.bk_base.constants import UserAuthActionEnum
@@ -35,6 +36,7 @@ from apps.meta.serializers import (
 )
 from apps.notice.models import NoticeGroup
 from core.serializers import ChoiceListSerializer, OrderSerializer
+from core.sql.model import HavingCondition, WhereCondition
 from services.web.analyze.constants import (
     ControlTypeChoices,
     FilterConnector,
@@ -85,6 +87,7 @@ from services.web.strategy_v2.exceptions import (
     SchedulePeriodInvalid,
     StrategyTypeNotSupport,
 )
+from services.web.strategy_v2.handlers.dispatch import DispatchConditionNode
 from services.web.strategy_v2.models import (
     DispatchRule,
     LinkTable,
@@ -832,6 +835,21 @@ class MultiRuleValidateMixin:
         for sub in node.get("conditions") or []:
             yield from MultiRuleValidateMixin._walk_tree_leaves(sub)
 
+    @staticmethod
+    def _validate_condition_tree(tree: Optional[dict], model_cls, label: str) -> None:
+        """
+        递归校验条件树结构（connector/field/operator/filter 类型与必填）
+        """
+        if not tree:
+            return
+        try:
+            model_cls.model_validate(tree)
+        except PydanticValidationError as exc:
+            first = exc.errors()[0] if exc.errors() else {}
+            loc = ".".join(str(item) for item in first.get("loc", []))
+            msg = first.get("msg", str(exc))
+            raise serializers.ValidationError(gettext("条件树[%s]结构非法（%s）：%s") % (label, loc, msg))
+
     def _check_rules(self, attrs: dict) -> dict:
         """校验发现规则集（attrs["rules"]）；由 Create/Update 序列化器在 validate() 中显式调用"""
         rules = attrs.get("rules") or []
@@ -857,12 +875,19 @@ class MultiRuleValidateMixin:
         if not configs:
             raise serializers.ValidationError(gettext("携带发现规则（rules）时必须同时携带策略配置（configs）"))
         select_fields = configs.get("select") or []
-        aggregate_names = {f.get("display_name") for f in select_fields if f.get("aggregate")}
+        # 聚合字段身份集合：(table, raw_name, aggregate)，用于 having 条件引用的字段身份匹配
+        aggregate_identities = {
+            (f.get("table"), f.get("raw_name"), f.get("aggregate")) for f in select_fields if f.get("aggregate")
+        }
 
         for rule in rules:
             conditions = rule.get("conditions") or {}
             where_tree = conditions.get("where")
             having_tree = conditions.get("having")
+
+            # 条件树结构校验（connector/field/operator/filter 类型与必填），前移 Pydantic 校验
+            self._validate_condition_tree(where_tree, WhereCondition, "where")
+            self._validate_condition_tree(having_tree, HavingCondition, "having")
 
             # 规则 where 必填
             if self._condition_tree_is_empty(where_tree):
@@ -876,7 +901,8 @@ class MultiRuleValidateMixin:
                     raise serializers.ValidationError(
                         gettext("规则[%s]的having条件字段[%s]必须为聚合字段") % (rule.get("rule_name"), field_name)
                     )
-                if field_name not in aggregate_names:
+                field_identity = (field.get("table"), field.get("raw_name"), field.get("aggregate"))
+                if field_identity not in aggregate_identities:
                     raise serializers.ValidationError(
                         gettext("规则[%s]的having条件字段[%s]不存在于策略级select的聚合字段中") % (rule.get("rule_name"), field_name)
                     )
@@ -889,7 +915,7 @@ class MultiRuleValidateMixin:
                     )
 
         # 行级配置（无聚合字段）时禁 having（having 无聚合字段可引用）
-        if not aggregate_names:
+        if not aggregate_identities:
             for rule in rules:
                 conditions = rule.get("conditions") or {}
                 if not self._condition_tree_is_empty(conditions.get("having")):
@@ -916,6 +942,8 @@ class MultiRuleValidateMixin:
 
             default_count = 0
             for rule in dispatch_rules:
+                # 分派条件树结构校验（connector/field/operator/filter 类型与必填），前移 Pydantic 校验
+                self._validate_condition_tree(rule.get("conditions"), DispatchConditionNode, "dispatch_conditions")
                 # is_default 由 conditions 推导同步
                 is_default = self._condition_tree_is_empty(rule.get("conditions"))
                 rule["is_default"] = is_default
@@ -1056,6 +1084,25 @@ class CreateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
 
     def validate(self, attrs: dict) -> dict:
         data = super().validate(attrs)
+        # 草稿：跳过业务校验，仅保留落库保底检查；提交转正式时走全量校验
+        if data.get("is_draft"):
+            # binding_type 归一化 + 联动检查：resource 建绑定依赖
+            binding_type = data.get("binding_type") or BindingType.SCENE_BINDING
+            if binding_type == BindingType.SCENE_BINDING and not data.get("scene_id"):
+                raise serializers.ValidationError(gettext("场景策略（binding_type=scene_binding）必须携带 scene_id"))
+            if binding_type == BindingType.PLATFORM_BINDING and data.get("scene_id"):
+                raise serializers.ValidationError(gettext("全局策略（binding_type=platform_binding）不允许携带 scene_id"))
+            data["binding_type"] = binding_type
+            # check name
+            if Strategy.objects.filter(strategy_name=data["strategy_name"]).exists():
+                raise serializers.ValidationError(gettext("Strategy Name Duplicate"))
+            # 场景策略 scene_id 需真实存在（创建 ResourceBinding 依赖）
+            if (
+                binding_type == BindingType.SCENE_BINDING
+                and not Scene.objects.filter(scene_id=data["scene_id"], is_deleted=False).exists()
+            ):
+                raise serializers.ValidationError({"scene_id": gettext("Scene Not Exists")})
+            return data
         # check type
         self._validate_strategy_type(data)
         # scene_id 与 binding_type 联动：场景策略必带场景，全局策略不允许挂场景
@@ -1160,9 +1207,7 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
         allow_null=True,
         default=None,
         write_only=True,
-        help_text=gettext_lazy(
-            "仅草稿策略可传：true=保存草稿更新（不部署），false=提交为正式策略（触发部署）；不传=维持现状"
-        ),
+        help_text=gettext_lazy("仅草稿策略可传：true=保存草稿更新（不部署），false=提交为正式策略（触发部署）；不传=维持现状"),
     )
     # 可见范围不再由前端配置：全局策略可见场景 = 分派规则目标场景并集（后端派生，
     # 见 StrategyV2Base.sync_platform_binding_scenes）；误传的 visibility 由 DRF 丢弃
@@ -1205,6 +1250,15 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
 
     def validate(self, attrs: dict) -> dict:
         data = super().validate(attrs)
+        # 草稿保存（is_draft=true）：跳过业务校验，仅保留重名检查；提交（is_draft=false）走全量校验
+        if data.get("is_draft") is True:
+            if (
+                Strategy.objects.filter(strategy_name=data["strategy_name"])
+                .exclude(strategy_id=data["strategy_id"])
+                .exists()
+            ):
+                raise serializers.ValidationError(gettext("Strategy Name Duplicate"))
+            return data
         # check type
         self._validate_strategy_type(data)
         # binding_type 以数据库真实绑定为准（更新接口不接收该参数，不支持修改绑定类型），
