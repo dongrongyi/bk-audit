@@ -79,6 +79,7 @@ from services.web.strategy_v2.constants import (
     StrategyOperator,
     StrategyReportStatus,
     StrategySource,
+    StrategyStatusChoices,
     StrategyType,
     TableType,
 )
@@ -1309,15 +1310,20 @@ class UpdateStrategyRequestSerializer(StrategySerializer, MultiRuleValidateMixin
         self._validate_strategy_type(data)
         # binding_type 以数据库真实绑定为准（更新接口不接收该参数，不支持修改绑定类型），
         # 供下游多规则/分派规则校验（_check_rules / _check_dispatch_rules）使用
-        data["binding_type"] = (
-            ResourceBinding.objects.filter(
-                resource_type=ResourceVisibilityType.STRATEGY,
-                resource_id=str(data["strategy_id"]),
+        data["binding_type"] = ResourceBinding.objects.filter(
+            resource_type=ResourceVisibilityType.STRATEGY,
+            resource_id=str(data["strategy_id"]),
+        ).values_list("binding_type", flat=True).first()
+        if data["binding_type"] is None:
+            # 无绑定的草稿 = 全局策略草稿（场景草稿创建时已建 scene 绑定），按全局策略校验分派规则；
+            # 非草稿无绑定属数据异常，维持场景策略兜底语义
+            data["binding_type"] = (
+                BindingType.PLATFORM_BINDING
+                if Strategy.objects.filter(
+                    strategy_id=data["strategy_id"], status=StrategyStatusChoices.DRAFT.value
+                ).exists()
+                else BindingType.SCENE_BINDING
             )
-            .values_list("binding_type", flat=True)
-            .first()
-            or BindingType.SCENE_BINDING
-        )
         # 模型策略必须配置processor_groups
         strategy_type = data.get("strategy_type")
         if strategy_type == StrategyType.MODEL.value and not data.get("processor_groups"):

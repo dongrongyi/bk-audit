@@ -365,7 +365,7 @@ class BkBaseFieldResolver:
         合并 base_fields 与排序字段，返回 BKBase SELECT 需要的所有字段名。
 
         - event_data.xxx 字段通过 JSON_EXTRACT 获取，不加入 value_fields
-        - strategy__risk_level 排序需要 event_time 参与 CASE/WHEN 排名，自动补充
+        - risk_level 排序需要 event_time 参与 CASE/WHEN 排名，自动补充
         """
         fields = list(base_fields)
         for order_field in self.order_fields:
@@ -900,7 +900,7 @@ class FinalSelectAssembler(SQLHelper):
 
         每个字段按类型分三种处理方式：
         1. event_data.xxx  → __order_event_field + dteventtimestamp DESC（只取第一个，相同值按时间倒序）
-        2. strategy__risk_level → CASE/WHEN 将 LOW/MIDDLE/HIGH 映射为 0/1/2 排名
+        2. risk_level → CASE/WHEN 将 LOW/MIDDLE/HIGH 映射为 0/1/2 排名
         3. 其他普通字段      → 直接引用 base_query.field_name
         """
         if not order_fields:
