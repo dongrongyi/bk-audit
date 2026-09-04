@@ -1070,7 +1070,7 @@ class NL2RiskFilterLog(OperateRecordModel):
         max_length=32,
         choices=RiskViewType.choices,
         blank=True,
-        default="",
+        default=RiskViewType.ALL,
         db_index=True,
     )
 
@@ -1096,7 +1096,7 @@ class NL2RiskFilterLog(OperateRecordModel):
         response_data: Optional[dict] = None,
         status: str = NL2RiskFilterLogStatus.SUCCESS,
         error_message: str = "",
-        risk_view_type: str = "",
+        risk_view_type: str = RiskViewType.ALL,
         result: Optional[str] = None,
         message: str = "",
     ) -> None:
