@@ -341,6 +341,17 @@ def get_manual_event_strategy_config(rt_id):
                 "enum_mappings": {"mappings": []},
                 "duplicate_field": False,
             },
+            {
+                "is_show": False,
+                "field_name": "event_data",
+                "map_config": {"source_field": "事件拓展数据"},
+                "description": "事件拓展数据（用户填写的事件数据原样直传）",
+                "is_priority": False,
+                "display_name": "事件拓展数据",
+                "drill_config": [],
+                "enum_mappings": {"mappings": []},
+                "duplicate_field": False,
+            },
         ],
         "event_data_field_configs": [
             {
