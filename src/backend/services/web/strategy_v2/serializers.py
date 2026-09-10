@@ -901,6 +901,8 @@ class MultiRuleValidateMixin:
             if f.get("aggregate")
         }
 
+        # 场景策略：规则级通知组按策略所属场景校验（全局策略 scene_id=None 自动跳过）
+        scene_id = self.get_scene_id(attrs)
         for rule in rules:
             conditions = rule.get("conditions") or {}
             where_tree = conditions.get("where")
@@ -946,6 +948,11 @@ class MultiRuleValidateMixin:
                     raise serializers.ValidationError(
                         gettext("规则[%s]的where条件操作符[%s]不合法") % (rule.get("rule_name"), operator)
                     )
+
+            # 规则级通知组（processor/follower）：存在性 + 场景归属校验，
+            # 与 dispatch_rules 按 target_scene 校验的口径对齐，封死跨场景引用通知组
+            notice_group_ids = list(set((rule.get("processor") or []) + (rule.get("follower") or [])))
+            self._validate_notice_groups("rules", notice_group_ids, scene_id)
 
         # 行级配置（无聚合字段）时禁 having（having 无聚合字段可引用）
         if not aggregate_identities:
