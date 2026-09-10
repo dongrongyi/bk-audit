@@ -202,13 +202,15 @@ def evaluate(node: Optional[WhereCondition], ctx: dict) -> bool:
     - None / 空树 -> True（无条件匹配）
     - 叶子 -> apply_condition
     - 分支 -> 子节点按 connector（and/or）聚合
+    - 空子组 -> 视为无约束剔除（与 SQL 构造器忽略 EmptyCriterion 语义一致，
+      避免 OR 树混入空子组被判恒真、抢走后续规则/默认场景的路由）
     """
     if node is None:
         return True
     if node.condition:
         return apply_condition(node.condition, ctx)
     if node.conditions:
-        results = [evaluate(sub, ctx) for sub in node.conditions]
+        results = [evaluate(sub, ctx) for sub in node.conditions if not evaluate_is_empty(sub)]
         if not results:
             return True
         return all(results) if node.connector == FilterConnector.AND else any(results)
