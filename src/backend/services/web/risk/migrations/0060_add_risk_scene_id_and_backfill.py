@@ -227,7 +227,7 @@ class Migration(migrations.Migration):
             field=models.IntegerField(
                 blank=True,
                 db_index=True,
-                help_text=gettext_lazy("风险归属场景"),
+                help_text=gettext_lazy("风险归属场景（固化到风险单，作为列表/权限/IAM/Provider 的唯一场景来源）"),
                 null=True,
                 verbose_name=gettext_lazy("Scene ID"),
             ),

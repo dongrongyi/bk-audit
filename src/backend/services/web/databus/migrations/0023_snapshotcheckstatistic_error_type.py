@@ -18,7 +18,6 @@ class Migration(migrations.Migration):
                 default=None,
                 max_length=16,
                 null=True,
-                verbose_name="失败类型：None=成功，source=源系统拉取失败，storage=存储查询失败",
             ),
         ),
     ]

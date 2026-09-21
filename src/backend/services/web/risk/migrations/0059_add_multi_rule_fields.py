@@ -90,7 +90,7 @@ class Migration(migrations.Migration):
         SafeAddField(
             model_name='risk',
             name='confirmer',
-            field=models.JSONField(blank=True, default=list, help_text='确认人用户名列表（仅全局策略）', verbose_name='Confirmer'),
+            field=models.JSONField(blank=True, default=list, help_text='确认人用户名 列表', verbose_name='Confirmer'),
         ),
         SafeAddField(
             model_name='risk',

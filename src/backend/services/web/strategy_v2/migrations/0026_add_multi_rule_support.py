@@ -90,7 +90,7 @@ class Migration(migrations.Migration):
             field=models.JSONField(
                 blank=True,
                 default=list,
-                help_text='分派规则优先级列表 [dispatch_rule_id, ...]，仅全局策略有',
+                help_text='分派规则优先级列表 [rule_id, ...]，仅全局策略有',
                 verbose_name='Dispatch Rule Order',
             ),
         ),
@@ -129,7 +129,7 @@ class Migration(migrations.Migration):
                     models.JSONField(
                         blank=True,
                         default=_default_strategy_rule_conditions,
-                        help_text='发现规则命中条件，结构：{"where": {...}, "having": {...}}',
+                        help_text='检测条件，结构：{"where": {...}, "having": {...}}',
                         verbose_name='Conditions',
                     ),
                 ),
