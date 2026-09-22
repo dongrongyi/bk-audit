@@ -379,6 +379,14 @@ class NewRisk(RiskFlowBaseHandler):
         ):
             raise RiskStatusInvalid(message=RiskStatusInvalid.MESSAGE % self.risk.status)
 
+    def init_strategy_bksec_enabled(self) -> bool:
+        """
+        策略是否启用 BKSEC 发单
+        """
+        from services.web.risk.bksec.rules import is_bksec_enabled
+
+        return is_bksec_enabled(self.strategy)
+
     def process(self, *args, **kwargs) -> dict:
         # 初始化参数
         self.risk.origin_operator = []
@@ -386,8 +394,8 @@ class NewRisk(RiskFlowBaseHandler):
         if not getattr(self.risk, "dispatch_rule_id", None):
             self.risk.current_operator = []
         self.risk.save(update_fields=["origin_operator", "current_operator"])
-        # 只有有责任人时走规则
-        if self.risk.operator:
+        # 有责任人时走规则；策略启用 BKSEC 发单时即使无责任人也走规则（安全接口人兜底发单）
+        if self.risk.operator or self.init_strategy_bksec_enabled():
             # 初始化处理规则
             self.match_risk_rule()
             # 重新初始化
@@ -398,7 +406,11 @@ class NewRisk(RiskFlowBaseHandler):
 
     def update_operator(self, process_result: dict, *args, **kwargs) -> None:
         # 有处理套餐则当前处理人为空，否则为安全责任人
-        self.risk.current_operator = [] if self.process_application and self.risk.operator else self.load_processor()
+        # （BKSEC 策略风险无责任人时同样由套餐接管）
+        if self.process_application and (self.risk.operator or self.init_strategy_bksec_enabled()):
+            self.risk.current_operator = []
+        else:
+            self.risk.current_operator = self.load_processor()
         self.risk.save(update_fields=["current_operator"])
 
     def match_risk_rule(self) -> None:
@@ -607,6 +619,11 @@ class AutoProcess(RiskFlowBaseHandler):
             field = pa_params.get(c["key"])
             # 如果配置了常量，优先使用，没有常量使用字段映射
             value = field.get("value") or getattr(self.risk, field.get("field"), "")
+            # BKSEC 契约：值中含 {{ }} 模板串时按风险/事件上下文渲染（预览/测试/正式发送同一引擎）
+            if isinstance(value, str) and "{{" in value:
+                from services.web.risk.bksec.contract import render_event_constant
+
+                value = render_event_constant(value, risk=self.risk)
             # 对值的类型进行转换
             if isinstance(value, (dict, list)):
                 value = json.dumps(value, ensure_ascii=False)

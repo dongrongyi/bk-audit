@@ -197,6 +197,14 @@ BK_BASE_DEBUG_API_URL = os.getenv("BKAPP_BASE_DEBUG_API_URL", BK_BASE_API_URL or
 BK_CMSI_API_URL = os.getenv("BKAPP_CMSI_URL")
 BK_SOPS_API_URL = os.getenv("BKAPP_BK_SOPS_API_URL")
 BK_SOPS_APIGW_NAME = os.getenv("BKAPP_BK_SOPS_APIGW_NAME", "bk-sops")
+# BKSEC 安全工单（风险类型接入 / 事件上报）
+BK_SEC_API_URL = os.getenv("BKAPP_BK_SEC_API_URL")
+BK_SEC_APIGW_NAME = os.getenv("BKAPP_BK_SEC_APIGW_NAME", "bksec")
+BK_SEC_API_RATE_LIMIT = os.getenv("BKAPP_BK_SEC_API_RATE_LIMIT", "10/s")
+# BKSEC 项目 ID（risk_access 接口必填的项目维度，策略页风险类型下拉按此过滤）
+BKSEC_PROJECT_ID = os.getenv("BKAPP_BKSEC_PROJECT_ID")
+# 预置 BKSEC 发单套餐指向的标准运维流程模板（方案a 契约：唯一事件常量 ${__bksec_event__}）
+BKSEC_SOPS_TEMPLATE_ID = os.getenv("BKAPP_BKSEC_SOPS_TEMPLATE_ID")
 BK_ITSM_APIGW_NAME = os.getenv("BKAPP_BK_ITSM_APIGW_NAME", "bk-itsm")
 BKIAM_APIGW_NAME = os.getenv("BKAPP_BKIAM_APIGW_NAME", "bkiam")
 # IAM V4 API 地址覆盖；默认由 api.domains 解析到预发布网关，本地 dev e2e 可临时指定 dev 地址。

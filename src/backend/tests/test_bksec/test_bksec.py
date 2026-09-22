@@ -1,0 +1,301 @@
+# -*- coding: utf-8 -*-
+"""
+TencentBlueKing is pleased to support the open source community by making
+蓝鲸智云 - 审计中心 (BlueKing - Audit Center) available.
+Copyright (C) 2023 THL A29 Limited,
+a Tencent company. All rights reserved.
+Licensed under the MIT License (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at http://opensource.org/licenses/MIT
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+We undertake not to change the open source license (MIT license) applicable
+to the current version of the project delivered to anyone in the future.
+"""
+
+import json
+from unittest import mock
+
+import pytest
+from bk_resource import resource
+
+from services.web.risk.bksec.config import BkSecConfig
+from services.web.risk.bksec.contract import (
+    build_event_payload,
+    build_pa_params,
+    build_plugin_constants,
+)
+from services.web.risk.bksec.renderer import render_value
+from services.web.risk.bksec.variables import build_render_context, build_risk_data
+from services.web.risk.models import ProcessApplication, Risk, RiskRule
+from tests.test_risk.test_tickets.base import RiskContext
+from tests.test_risk.test_tickets.constants import RISK_INFO
+
+BKSEC_CONFIG_DATA = {
+    "enabled": True,
+    "risk_type_id": "cloud-account-no-mfa",
+    "risk_type_name": "云安全-云账号未启用MFA",
+    "field_mappings": [
+        {"key": "target", "name": "风险资产信息", "value": "风险单 {{ risk.risk_id }} 的资产信息", "required": True},
+        {"key": "operator", "name": "初始责任人", "value": "{{ risk.operator }}", "required": True},
+        {"key": "description", "name": "描述", "value": "{{ risk.event_content }}（事件数 {{ count(event.event_id) }}）"},
+    ],
+}
+
+
+class TestBkSecConfig:
+    @pytest.mark.django_db
+    def test_risk_variable_meta_matches_render_context(self):
+        """RISK_VARIABLE_META 与 build_risk_data 的键集合严格一致，防止漂移"""
+        from services.web.risk.bksec.variables import RISK_VARIABLE_META
+
+        risk = Risk()
+        risk.risk_id = "R-TEST"
+        risk.strategy = None
+        data = build_risk_data(risk)
+        assert set(RISK_VARIABLE_META.keys()) == set(data.keys())
+
+    def test_parse_and_dedupe(self):
+        data = {
+            **BKSEC_CONFIG_DATA,
+            "field_mappings": BKSEC_CONFIG_DATA["field_mappings"] + [BKSEC_CONFIG_DATA["field_mappings"][0]],
+        }
+        config = BkSecConfig.model_validate(data)
+        assert len(config.field_mappings) == 3
+
+    def test_validate_for_submit_missing_type(self):
+        config = BkSecConfig.model_validate({**BKSEC_CONFIG_DATA, "risk_type_id": ""})
+        with pytest.raises(ValueError):
+            config.validate_for_submit()
+
+    def test_validate_for_submit_missing_required_field(self):
+        mappings = [m for m in BKSEC_CONFIG_DATA["field_mappings"] if m["key"] != "operator"]
+        config = BkSecConfig.model_validate({**BKSEC_CONFIG_DATA, "field_mappings": mappings})
+        with pytest.raises(ValueError):
+            config.validate_for_submit()
+
+    def test_validate_disabled_skip(self):
+        config = BkSecConfig.model_validate({"enabled": False})
+        config.validate_for_submit()
+
+
+@pytest.mark.django_db
+class TestRenderer:
+    def test_render_risk_variables(self):
+        with RiskContext() as risk:
+            context = build_render_context(risk=risk, events=[])
+            assert render_value("{{ risk.risk_id }}", context) == risk.risk_id
+            assert render_value("{{ risk.operator }}", context) == "admin"
+            assert render_value("static text", context) == "static text"
+            assert render_value("{{ risk.not_exist }}", context) == ""
+
+    def test_render_event_aggregations(self):
+        events = [
+            {"event_id": "e1", "username": "tom"},
+            {"event_id": "e2", "username": "jerry"},
+            {"event_id": "e3", "username": "tom"},
+        ]
+        context = build_render_context(events=events)
+        assert render_value("{{ count(event.event_id) }}", context) == "3"
+        assert render_value("{{ count_distinct(event.username) }}", context) == "2"
+        assert render_value("{{ first(event.username) }}", context) == "tom"
+        assert render_value("{{ latest(event.username) }}", context) == "tom"
+        assert render_value("{{ list_distinct(event.username) }}", context) == "tom;jerry"
+        # 裸事件变量默认取最后一条事件
+        assert render_value("{{ event.username }}", context) == "tom"
+
+
+@pytest.mark.django_db
+class TestContract:
+    def test_build_event_payload_with_fallback(self):
+        config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
+        # 无责任人 → 初始责任人兜底为安全接口人
+        with RiskContext(risk_info={"operator": []}) as risk:
+            with mock.patch(
+                "services.web.risk.bksec.contract.load_security_person", mock.Mock(return_value=["sec_admin"])
+            ):
+                payload = build_event_payload(config, risk=risk, events=[])
+        assert payload["risk_type"] == "cloud-account-no-mfa"
+        assert payload["fields"]["operator"] == "sec_admin"
+        assert risk.risk_id in payload["fields"]["target"]
+
+    def test_build_pa_params_and_plugin_constants(self):
+        config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
+        pa_params = build_pa_params(config)
+        # 字段级契约：标准入参走 field 映射，event_type/event_data/action/once_task 走 value
+        assert pa_params["${risk_id}"] == {"field": "risk_id", "value": ""}
+        assert pa_params["${strategy_id}"] == {"field": "strategy_id", "value": ""}
+        assert pa_params["${event_type}"] == {"field": "", "value": "cloud-account-no-mfa"}
+        assert pa_params["${operator}"] == {
+            "field": "",
+            "value": "{{ (risk.operator or risk.security_person).split(';')[0] }}",
+        }
+        assert "${event_data}" in pa_params and "${action}" in pa_params and "${once_task}" in pa_params
+        # 渲染后的插件常量（测试发送用）
+        with RiskContext() as risk:
+            with mock.patch(
+                "services.web.risk.bksec.variables.load_risk_events", mock.Mock(return_value=[{"event_id": "e1"}])
+            ):
+                constants = build_plugin_constants(config, risk=risk, test_operator="tester")
+        assert constants["${risk_id}"] == risk.risk_id
+        assert constants["${event_type}"] == "cloud-account-no-mfa"
+        assert constants["${operator}"] == "tester"
+        fields = json.loads(constants["${event_data}"])
+        assert fields["operator"] == "tester"
+        assert risk.risk_id in fields["target"]
+
+    def test_test_operator_marker(self):
+        config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
+        payload = build_event_payload(config, risk=None, events=[], test_operator="tester")
+        assert payload["is_test"] is True
+        assert payload["test_operator"] == "tester"
+
+
+@pytest.mark.django_db
+class TestBkSecRules:
+    def _strategy(self, bksec_config=None):
+        from services.web.strategy_v2.models import Strategy
+
+        strategy, _ = Strategy.objects.get_or_create(
+            strategy_id=RISK_INFO["strategy_id"],
+            defaults={
+                "strategy_name": f"test_strategy_{RISK_INFO['strategy_id']}",
+                "bksec_config": bksec_config or {},
+            },
+        )
+        if bksec_config is not None:
+            strategy.bksec_config = bksec_config
+            strategy.save(update_fields=["bksec_config"])
+        return strategy
+
+    def test_ensure_preset_pa(self, settings):
+        from services.web.risk.bksec.rules import ensure_preset_pa
+
+        settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
+        pa = ensure_preset_pa()
+        assert pa is not None and pa.sops_template_id == 10001 and pa.is_builtin and not pa.need_approve
+        # 幂等
+        assert ensure_preset_pa().id == pa.id
+
+    def test_sync_rule_create_and_idempotent(self, settings):
+        from services.web.risk.bksec.rules import sync_bksec_rule
+
+        settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
+        RiskRule.objects.all().delete()
+        ProcessApplication.objects.all().delete()
+        strategy = self._strategy(BKSEC_CONFIG_DATA)
+        rule = sync_bksec_rule(strategy)
+        assert rule is not None and rule.is_enabled and rule.auto_strategy_id == strategy.strategy_id
+        assert rule.scope == [{"field": "strategy_id", "operator": "=", "value": [strategy.strategy_id]}]
+        assert rule.auto_close_risk is True
+        assert "${event_data}" in rule.pa_params and "${event_type}" in rule.pa_params
+        # 手工规则优先级低于自动规则（置顶，决策 D2）
+        manual = RiskRule.objects.create(name="manual", scope=[], pa_id=rule.pa_id, version=1, priority_index=1)
+        assert rule.priority_index > manual.priority_index
+        # 幂等：内容未变不产生新版本
+        again = sync_bksec_rule(strategy)
+        assert again.version == rule.version
+
+    def test_sync_rule_disable_and_update(self, settings):
+        from services.web.risk.bksec.rules import sync_bksec_rule
+
+        settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
+        RiskRule.objects.all().delete()
+        ProcessApplication.objects.all().delete()
+        strategy = self._strategy(BKSEC_CONFIG_DATA)
+        rule = sync_bksec_rule(strategy)
+        # 关闭开关 → 原地停用（不产生新版本，对齐 ToggleRiskRule）
+        strategy.bksec_config = {"enabled": False}
+        strategy.save(update_fields=["bksec_config"])
+        assert sync_bksec_rule(strategy) is None
+        latest = RiskRule.objects.filter(auto_strategy_id=strategy.strategy_id).order_by("-version").first()
+        assert not latest.is_enabled
+        assert latest.version == rule.version
+        assert RiskRule.objects.filter(auto_strategy_id=strategy.strategy_id).count() == 1
+        # 重新启用（内容未变）→ 原地启用，仍不产生新版本
+        strategy.bksec_config = BKSEC_CONFIG_DATA
+        strategy.save(update_fields=["bksec_config"])
+        reenabled = sync_bksec_rule(strategy)
+        assert reenabled.is_enabled
+        assert reenabled.version == rule.version
+        assert RiskRule.objects.filter(auto_strategy_id=strategy.strategy_id).count() == 1
+        # 内容变更（换风险类型）→ 产生启用的新版本，旧版本保留供在途风险单引用
+        strategy.bksec_config = {**BKSEC_CONFIG_DATA, "risk_type_id": "host-highrisk-port"}
+        strategy.save(update_fields=["bksec_config"])
+        updated = sync_bksec_rule(strategy)
+        assert updated.is_enabled
+        assert updated.version == rule.version + 1
+        assert RiskRule.objects.filter(rule_id=rule.rule_id, version=rule.version).exists()
+
+    def test_sync_rule_without_preset_pa(self, settings):
+        from services.web.risk.bksec.rules import sync_bksec_rule
+
+        settings.BKSEC_SOPS_TEMPLATE_ID = None
+        RiskRule.objects.all().delete()
+        ProcessApplication.objects.all().delete()
+        strategy = self._strategy(BKSEC_CONFIG_DATA)
+        assert sync_bksec_rule(strategy) is None
+
+
+@pytest.mark.django_db
+class TestBkSecResources:
+    def test_preview_ticket(self):
+        config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
+        with RiskContext() as risk:
+            result = resource.risk.preview_bk_sec_ticket.perform_request(
+                {"bksec_config": config.model_dump(), "risk_id": risk.risk_id}
+            )
+        assert result["has_sample_risk"] is True
+        assert result["ticket"]["fields"]["operator"] == "admin"
+        assert risk.risk_id in result["ticket"]["fields"]["target"]
+
+    def test_send_test_ticket(self, settings):
+        """测试发送经 SOPS 真实通道（create_task + start_task），事件常量含测试标记与处理人覆盖"""
+        from tests.test_risk.test_tickets.constants import SOPS_FLOW_INFO
+
+        config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
+        settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
+        ProcessApplication.objects.filter(is_builtin=True).delete()
+        with RiskContext() as risk:
+            with mock.patch(
+                "services.web.risk.resources.bksec.api.bk_sops.create_task", mock.Mock(return_value=SOPS_FLOW_INFO)
+            ) as create_task, mock.patch(
+                "services.web.risk.resources.bksec.api.bk_sops.start_task", mock.Mock(return_value=None)
+            ) as start_task:
+                result = resource.risk.send_bk_sec_test_ticket.perform_request(
+                    {"bksec_config": config.model_dump(), "test_operator": "tester", "risk_id": risk.risk_id}
+                )
+        assert result["task"]["task_id"] == SOPS_FLOW_INFO["task_id"]
+        start_task.assert_called_once()
+        constants = create_task.call_args.kwargs["constants"]
+        # 字段级插件契约（P1 确认后结构）
+        assert constants["${event_type}"] == "cloud-account-no-mfa"
+        fields = json.loads(constants["${event_data}"])
+        # Bug1 修复锁定：测试发送必须以指定处理人覆盖初始责任人，保证隔离
+        assert fields["operator"] == "tester"
+        assert constants["${operator}"] == "tester"
+        # 决策 A 修复锁定：测试发送必须携带样例风险单，risk 变量按真实数据渲染
+        assert risk.risk_id in fields["target"]
+        # 测试任务名带【测试】前缀，便于 SOPS 侧区分
+        assert create_task.call_args.kwargs["name"].startswith("【测试】")
+
+    def test_list_variables(self):
+        from services.web.strategy_v2.models import Strategy
+
+        strategy = Strategy.objects.get_or_create(
+            strategy_id=RISK_INFO["strategy_id"],
+            defaults={"strategy_name": "s"},
+        )[0]
+        strategy.event_data_field_configs = [{"field_name": "username", "display_name": "操作人"}]
+        strategy.save(update_fields=["event_data_field_configs"])
+        result = resource.risk.list_bk_sec_variables.perform_request({"strategy_id": strategy.strategy_id})
+        risk_keys = [v["key"] for v in result["risk_variables"]]
+        assert "risk.operator" in risk_keys and "risk.security_person" in risk_keys
+        event_keys = [v["key"] for v in result["event_variables"]]
+        # 事件基本字段（EventBasicField）+ 策略扩展字段
+        assert "event.raw_event_id" in event_keys
+        assert "event.event_time" in event_keys
+        assert "event.username" in event_keys
