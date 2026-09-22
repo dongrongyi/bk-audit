@@ -551,6 +551,9 @@ class ProcessApplication(SoftDeleteModel):
     approve_config = models.JSONField(gettext_lazy("Approve Config"), null=True, blank=True)
     description = models.TextField(gettext_lazy("Description"), null=True, blank=True)
     is_enabled = models.BooleanField(gettext_lazy("Is Enabled"), default=True)
+    is_builtin = models.BooleanField(
+        gettext_lazy("Is Builtin"), default=False, help_text=gettext_lazy("系统内置套餐（如 BKSEC 发单），请勿删除或停用")
+    )
 
     class Meta:
         verbose_name = gettext_lazy("Process Application")
@@ -574,6 +577,13 @@ class RiskRule(SoftDeleteModel):
     auto_close_risk = models.BooleanField(gettext_lazy("Auto Close Risk"), default=True)
     priority_index = models.IntegerField(gettext_lazy("Priority Index"), default=0)
     is_enabled = models.BooleanField(gettext_lazy("Is Enabled"), default=True)
+    auto_strategy_id = models.BigIntegerField(
+        gettext_lazy("Auto Created By Strategy"),
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text=gettext_lazy("策略 BKSEC 发单自动创建时记录来源策略 ID，非空表示系统自动规则"),
+    )
 
     class Meta:
         verbose_name = gettext_lazy("Risk Rule")

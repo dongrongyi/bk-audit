@@ -299,7 +299,7 @@ class ProcessApplicationsViewSet(ResourceViewSet):
         )
 
     def get_permissions(self):
-        if self.action in ["list"]:
+        if self.action in ["list", "execution_records"]:
             return [
                 InstanceActionPermission(
                     actions=[ActionEnum.LIST_PA],
@@ -341,6 +341,10 @@ class ProcessApplicationsViewSet(ResourceViewSet):
         ResourceRoute("GET", resource.risk.list_rule_by_pa, pk_field="id", endpoint="rules", enable_paginate=True),
         ResourceRoute("PUT", resource.risk.toggle_process_application, pk_field="id", endpoint="toggle"),
         ResourceRoute("GET", resource.risk.approve_build_in_fields, endpoint="approve_build_in_fields"),
+        # 套餐执行记录侧滑：套餐页全部/单套餐；风险入口带 risk_id 筛选
+        ResourceRoute(
+            "GET", resource.risk.list_pa_execution_records, endpoint="execution_records", enable_paginate=True
+        ),
     ]
 
 
@@ -477,6 +481,21 @@ class AnalyseReportViewSet(ResourceViewSet):
         ),
         # 风险反查报告
         ResourceRoute("GET", resource.risk.list_analyse_report_by_risk, endpoint="by_risk"),
+    ]
+
+
+class BkSecViewSet(ResourceViewSet):
+    """
+    BKSEC 安全工单：风险类型 / 字段 schema / 变量 / 预览 / 测试发送
+    """
+
+    resource_routes = [
+        ResourceRoute("GET", resource.risk.list_bk_sec_risk_types, endpoint="risk_types"),
+        ResourceRoute("POST", resource.risk.retrieve_bk_sec_risk_type, endpoint="risk_type_detail"),
+        ResourceRoute("GET", resource.risk.list_bk_sec_variables, endpoint="variables"),
+        ResourceRoute("POST", resource.risk.preview_bk_sec_ticket, endpoint="preview"),
+        ResourceRoute("POST", resource.risk.send_bk_sec_test_ticket, endpoint="test_send"),
+        ResourceRoute("GET", resource.risk.get_bk_sec_test_task_status, endpoint="test_task_status"),
     ]
 
 

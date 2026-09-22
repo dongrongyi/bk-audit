@@ -21,19 +21,22 @@ import abc
 from django.db import transaction
 from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404
-from django.utils.translation import gettext_lazy
+from django.utils.translation import gettext, gettext_lazy
+from rest_framework import serializers
 
 from apps.audit.resources import AuditMixinResource
 from apps.meta.constants import OrderTypeChoices
 from apps.permission.handlers.actions import ActionEnum
 from apps.permission.handlers.resource_types import ResourceEnum
+from apps.sops.constants import SOPSTaskStatus
 from services.web.risk.constants import ApproveTicketFields, RiskStatus
-from services.web.risk.models import ProcessApplication, Risk, RiskRule
+from services.web.risk.models import ProcessApplication, Risk, RiskRule, TicketNode
 from services.web.risk.serializers import (
     CreateProcessApplicationsReqSerializer,
     ListAllProcessApplicationsReqSerializer,
     ListProcessApplicationsReqSerializer,
     ListRiskResponseSerializer,
+    PAExecutionRecordInfoSerializer,
     ProcessApplicationsInfoSerializer,
     RiskRuleInfoSerializer,
     ToggleProcessApplicationReqSerializer,
@@ -127,6 +130,19 @@ class CreateProcessApplication(ProcessApplicationMeta):
         return pa
 
 
+def _reject_builtin_edit(pa: ProcessApplication) -> None:
+    """
+    内置套餐（BKSEC 发单）禁止编辑/启停：
+
+    参数由策略配置生成并挂在自动规则上，套餐本身不承载配置；
+    修改 need_approve/sops_template_id 等会破坏发送契约。
+    """
+    if pa.is_builtin:
+        raise serializers.ValidationError(
+            gettext("内置套餐【%s】由系统维护，不支持编辑或启停；如需调整 SOPS 模板请修改 BKSEC_SOPS_TEMPLATE_ID 环境变量") % pa.name
+        )
+
+
 class UpdateProcessApplication(ProcessApplicationMeta):
     name = gettext_lazy("更新处理套餐")
     RequestSerializer = UpdateProcessApplicationsReqSerializer
@@ -135,6 +151,7 @@ class UpdateProcessApplication(ProcessApplicationMeta):
 
     def perform_request(self, validated_request_data):
         pa = get_object_or_404(ProcessApplication, id=validated_request_data["id"])
+        _reject_builtin_edit(pa)
         for key, val in validated_request_data.items():
             setattr(pa, key, val)
         pa.save()
@@ -179,6 +196,94 @@ class ListRuleByPA(ProcessApplicationMeta):
         return RiskRule.load_latest_rules().filter(pa_id=pa.id).order_by("-is_enabled", order_field)
 
 
+class ListPAExecutionRecords(ProcessApplicationMeta):
+    """
+    获取处理套餐执行记录（执行记录侧滑：套餐页看全部/单套餐，风险入口按风险ID筛选）
+
+    数据链路：TicketNode(action=AutoProcess) → Risk(rule_id) → RiskRule(pa_id) → 套餐
+    """
+
+    name = gettext_lazy("获取处理套餐执行记录")
+    ResponseSerializer = PAExecutionRecordInfoSerializer
+    many_response_data = True
+    audit_action = ActionEnum.LIST_PA
+
+    class RequestSerializer(serializers.Serializer):
+        id = serializers.IntegerField(label=gettext_lazy("套餐ID"), required=False, allow_null=True)
+        risk_id = serializers.CharField(label=gettext_lazy("风险ID"), required=False, allow_blank=True, allow_null=True)
+        scene_id = serializers.IntegerField(label=gettext_lazy("场景ID"), required=False, allow_null=True)
+
+    def perform_request(self, validated_request_data):
+        pa_id = validated_request_data.get("id")
+        risk_id = validated_request_data.get("risk_id")
+        scene_id = validated_request_data.get("scene_id")
+        nodes = TicketNode.objects.filter(action="AutoProcess")
+        # 套餐筛选 / 场景范围：套餐 → 规则 → 风险 → 执行节点
+        if pa_id or scene_id:
+            pa_queryset = ProcessApplication.objects.all()
+            if pa_id:
+                pa_queryset = pa_queryset.filter(id=pa_id)
+            if scene_id:
+                pa_queryset = SceneScopeFilter.filter_queryset(
+                    queryset=pa_queryset,
+                    scene_id=scene_id,
+                    resource_type=ResourceVisibilityType.PROCESS_APPLICATION,
+                    pk_field="id",
+                )
+            rule_ids = RiskRule.objects.filter(pa_id__in=pa_queryset.values("id")).values("rule_id")
+            nodes = nodes.filter(risk_id__in=Risk.objects.filter(rule_id__in=rule_ids).values("risk_id"))
+        # 风险入口：按风险 ID 筛选
+        if risk_id:
+            nodes = nodes.filter(risk_id=risk_id)
+        nodes = nodes.order_by("-timestamp")
+        # 批量装配：风险信息 + 套餐信息
+        risk_map = {
+            risk["risk_id"]: risk
+            for risk in Risk.objects.filter(risk_id__in=[n.risk_id for n in nodes]).values(
+                "risk_id", "title", "status", "rule_id"
+            )
+        }
+        rule_pa_map = {}
+        for item in RiskRule.objects.filter(
+            rule_id__in={r["rule_id"] for r in risk_map.values() if r["rule_id"]}
+        ).values("rule_id", "pa_id"):
+            rule_pa_map.setdefault(item["rule_id"], item["pa_id"])
+        pa_name_map = {
+            pa["id"]: pa["name"]
+            for pa in ProcessApplication.objects.filter(id__in=set(rule_pa_map.values())).values("id", "name")
+        }
+        records = []
+        for node in nodes:
+            risk = risk_map.get(node.risk_id, {})
+            pa_id_of_risk = rule_pa_map.get(risk.get("rule_id"))
+            process_result = node.process_result or {}
+            state = (process_result.get("status") or {}).get("state", "")
+            if state in SOPSTaskStatus.get_success_status():
+                result = "success"
+            elif state in SOPSTaskStatus.get_failed_status():
+                result = "failed"
+            elif state:
+                result = "running"
+            else:
+                result = "unknown"
+            records.append(
+                {
+                    "id": node.id,
+                    "risk_id": node.risk_id,
+                    "risk_title": risk.get("title") or "",
+                    "risk_status": risk.get("status") or "",
+                    "pa_id": pa_id_of_risk or 0,
+                    "pa_name": pa_name_map.get(pa_id_of_risk, ""),
+                    "operator": node.operator,
+                    "time": node.time,
+                    "sops_task_id": str((process_result.get("task") or {}).get("task_id", "") or ""),
+                    "sops_state": state,
+                    "result": result,
+                }
+            )
+        return records
+
+
 class ToggleProcessApplication(ProcessApplicationMeta):
     name = gettext_lazy("启停处理套餐")
     RequestSerializer = ToggleProcessApplicationReqSerializer
@@ -186,6 +291,7 @@ class ToggleProcessApplication(ProcessApplicationMeta):
 
     def perform_request(self, validated_request_data):
         pa = get_object_or_404(ProcessApplication, id=validated_request_data["id"])
+        _reject_builtin_edit(pa)
         pa.is_enabled = validated_request_data["is_enabled"]
         pa.save(update_fields=["is_enabled"])
 
