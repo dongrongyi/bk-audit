@@ -145,10 +145,10 @@ def build_plugin_constants(config: BkSecConfig, risk: Optional[Risk] = None, tes
     elif not fields.get(BKSEC_FIELD_INITIAL_OWNER):
         fields[BKSEC_FIELD_INITIAL_OWNER] = ";".join(load_security_person())
     constants[BKSEC_PARAM_EVENT_DATA] = json.dumps(fields, ensure_ascii=False)
-    # 责任人（D4 兜底）
+    # 责任人（D4 兜底）：模板经 tojson 自足产出数组串，满足插件 json.loads 契约
     constants[BKSEC_PARAM_OPERATOR] = render_value(BKSEC_OPERATOR_TEMPLATE, context)
     if test_operator:
-        constants[BKSEC_PARAM_OPERATOR] = test_operator
+        constants[BKSEC_PARAM_OPERATOR] = json.dumps([test_operator], ensure_ascii=False)
     # 插件控制参数：测试发送用"否"豁免单次去重（样例风险单的 raw_event_id 可能已被正式发送占用）
     constants[BKSEC_PARAM_ACTION] = BKSEC_ACTION_DEFAULT
     constants[BKSEC_PARAM_ONCE_TASK] = BKSEC_ONCE_TASK_TEST if test_operator else BKSEC_ONCE_TASK_DEFAULT
@@ -160,14 +160,16 @@ def render_event_constant(template_json: str, risk: Optional[Risk] = None) -> st
     渲染事件契约常量（AutoProcess 正式发送时调用），返回最终事件 JSON 字符串
     """
     rendered = render_value(template_json, build_render_context(risk=risk))
-    # 初始责任人兜底（渲染后仍为空时补安全接口人）
+    # 初始责任人兜底（渲染后仍为空时补安全接口人）——仅事件体(dict)适用；
+    # operator 等其它契约常量渲染结果为 JSON 数组(list)，不在此处理
     try:
         payload = json.loads(rendered)
-        fields = payload.get(BKSEC_EVENT_FIELD_FIELDS) or {}
-        if not fields.get(BKSEC_FIELD_INITIAL_OWNER):
-            fields[BKSEC_FIELD_INITIAL_OWNER] = ";".join(load_security_person())
-            payload[BKSEC_EVENT_FIELD_FIELDS] = fields
-            rendered = json.dumps(payload, ensure_ascii=False)
+        if isinstance(payload, dict):
+            fields = payload.get(BKSEC_EVENT_FIELD_FIELDS) or {}
+            if not fields.get(BKSEC_FIELD_INITIAL_OWNER):
+                fields[BKSEC_FIELD_INITIAL_OWNER] = ";".join(load_security_person())
+                payload[BKSEC_EVENT_FIELD_FIELDS] = fields
+                rendered = json.dumps(payload, ensure_ascii=False)
     except (ValueError, TypeError):
         logger.exception("[BkSecContract] Rendered payload is not valid json, keep origin")
     return rendered

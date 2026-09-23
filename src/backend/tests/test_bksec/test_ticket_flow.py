@@ -75,7 +75,7 @@ PA_PARAMS = {
             ensure_ascii=False,
         ),
     },
-    "${operator}": {"field": "", "value": "{{ risk.operator or risk.security_person }}"},
+    "${operator}": {"field": "", "value": '{{ (risk.operator or risk.security_person or "").split(";") | tojson }}'},
     "${action}": {"field": "", "value": "poll"},
     "${once_task}": {"field": "", "value": "yes"},
 }
@@ -196,4 +196,4 @@ class TestAutoProcessBkSecRender:
             assert risk.risk_id in fields["target"]
             assert fields["operator"] == "admin"
             # operator 兜底模板已渲染
-            assert constants["${operator}"] == "admin"
+            assert constants["${operator}"] == '["admin"]'  # 数组串，满足插件 json.loads 契约

@@ -58,11 +58,11 @@ BKSEC_PLUGIN_STANDARD_FIELDS = {
     "${raw_event_id}": "raw_event_id",
 }
 # operator 兜底模板（D4：无责任人时取安全接口人）。
-# 注意：push_events 文档 operator 为"用户名"（String、单数）——按字面保守取首个执行人，
-# 完整责任人名单由 extra.operator（初始责任人）承载。⚠️ 待环境就绪后单变量验证：
-# ①信封是否支持多人（逗号/分号），若支持则去掉 .split 取完整名单；
-# ②此前"执行人校验失败"的真实原因（operator 数组与 event_type 空值两嫌疑未隔离）。
-BKSEC_OPERATOR_TEMPLATE = "{{ (risk.operator or risk.security_person).split(';')[0] }}"
+# 契约依据（插件源码实证 2026-09-23）：插件对 ${operator} 执行 ",".join(json.loads(x))——
+# ①必须 JSON 数组串；②天然支持多人（全量责任人以逗号拼接，与旧链路 list 直传语义一致）。
+# 上下文中 risk.operator / risk.security_person 为分号拼接的展示串，split 后经 tojson
+# 还原为数组串，预览/测试/正式三路同构，无需消费者二次处理。
+BKSEC_OPERATOR_TEMPLATE = '{{ (risk.operator or risk.security_person or "").split(";") | tojson }}'
 
 # 预置处理套餐
 BKSEC_PRESET_PA_NAME = gettext_lazy("【内置】BKSEC安全工单发单")
