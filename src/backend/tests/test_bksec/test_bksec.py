@@ -25,7 +25,10 @@ from django.conf import settings
 
 from services.web.risk.bksec import sync_bksec_rule
 from services.web.risk.bksec.config import BkSecConfig
-from services.web.risk.bksec.constants import BKSEC_RULE_PRIORITY_BASE
+from services.web.risk.bksec.constants import (
+    BKSEC_OPERATOR_TEMPLATE,
+    BKSEC_RULE_PRIORITY_BASE,
+)
 from services.web.risk.bksec.contract import (
     build_event_payload,
     build_pa_params,
@@ -320,6 +323,68 @@ class TestBkSecResources:
         assert risk.risk_id in fields["target"]
         # 测试任务名带【测试】前缀，便于 SOPS 侧区分
         assert create_task.call_args.kwargs["name"].startswith("【测试】")
+
+    def test_send_test_ticket_blocked_by_formal_dispatch(self, settings):
+        """回调隔离守卫：风险存在正式派单历史时拒绝测试发送（防插件回调复用污染/静默拦截）"""
+        import time as _time
+
+        from services.web.risk.models import TicketNode
+
+        config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
+        settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
+        with RiskContext() as risk:
+            TicketNode.objects.create(
+                risk_id=risk.risk_id,
+                operator="bk-audit",
+                action="AutoProcess",
+                timestamp=_time.time(),
+                time="2026-09-23 00:00:00",
+                process_result={"task": {"task_id": 1}},
+                extra={},
+            )
+            with mock.patch("services.web.risk.resources.bksec.api.bk_sops.create_task") as create_task:
+                with pytest.raises(Exception) as err:
+                    resource.risk.send_bk_sec_test_ticket.perform_request(
+                        {"bksec_config": config.model_dump(), "test_operator": "tester", "risk_id": risk.risk_id}
+                    )
+            create_task.assert_not_called()
+            assert "正式派单" in str(err.value.args)
+
+    def test_test_task_status_failure_hint(self):
+        """任务失败时轮询接口返回可操作的失败提示（Config 缺失特征映射）"""
+        with mock.patch(
+            "services.web.risk.resources.bksec.api.bk_sops.get_task_status",
+            mock.Mock(return_value={"state": "FAILED"}),
+        ), mock.patch(
+            "services.web.risk.resources.bksec.api.bk_sops.get_node_data",
+            mock.Mock(return_value={"detail": "plugin execute failed: Config matching query does not exist."}),
+        ):
+            result = resource.risk.get_bk_sec_test_task_status.perform_request({"task_id": "1"})
+        assert result["state"] == "FAILED"
+        assert "Config" in result["failure_hint"] and "插件 Admin" in result["failure_hint"]
+        # 特征未命中 → 通用指引
+        with mock.patch(
+            "services.web.risk.resources.bksec.api.bk_sops.get_task_status",
+            mock.Mock(return_value={"state": "FAILED"}),
+        ), mock.patch(
+            "services.web.risk.resources.bksec.api.bk_sops.get_node_data",
+            mock.Mock(side_effect=Exception("boom")),
+        ):
+            result = resource.risk.get_bk_sec_test_task_status.perform_request({"task_id": "1"})
+        assert result["failure_hint"] == resource.risk.get_bk_sec_test_task_status.GENERIC_HINT
+        # 成功状态不附带提示
+        with mock.patch(
+            "services.web.risk.resources.bksec.api.bk_sops.get_task_status",
+            mock.Mock(return_value={"state": "FINISHED"}),
+        ):
+            result = resource.risk.get_bk_sec_test_task_status.perform_request({"task_id": "1"})
+        assert "failure_hint" not in result
+
+    def test_operator_template_empty_value_renders_valid_json_array(self):
+        """断点1固化：无责任人且无安全接口人时，operator 仍渲染为合法 JSON 数组串（插件 json.loads 不崩）"""
+        ctx = {"risk": type("R", (), {"operator": "", "security_person": ""})(), "event": {}}
+        out = render_value(BKSEC_OPERATOR_TEMPLATE, ctx)
+        assert json.loads(out) == [""]  # 合法数组，插件侧 join 后为空串（数据质量项，非崩溃）
 
     def test_list_variables(self):
         from services.web.strategy_v2.models import Strategy
