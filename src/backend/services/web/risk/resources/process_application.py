@@ -17,6 +17,8 @@ to the current version of the project delivered to anyone in the future.
 """
 
 import abc
+import datetime
+from typing import Optional
 
 from django.db import transaction
 from django.db.models import Count, Q
@@ -208,6 +210,31 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
     many_response_data = True
     audit_action = ActionEnum.LIST_PA
 
+    @staticmethod
+    def _parse_sops_time(value) -> Optional[datetime.datetime]:
+        """解析 SOPS 状态里的时间字段（源格式或 ISO 格式，均可能出现在 JSONField 回读值中）"""
+        if not value or not isinstance(value, str):
+            return None
+        value = value.strip()
+        for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.datetime.strptime(value, fmt)
+            except ValueError:
+                continue
+        try:
+            return datetime.datetime.fromisoformat(value)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _calc_duration(cls, status_info: dict) -> Optional[int]:
+        """耗时（秒）：SOPS 任务实际 start_time/finish_time 之差；未结束/缺失返回 None"""
+        start = cls._parse_sops_time(status_info.get("start_time"))
+        finish = cls._parse_sops_time(status_info.get("finish_time"))
+        if start and finish:
+            return int((finish - start).total_seconds())
+        return None
+
     class RequestSerializer(serializers.Serializer):
         id = serializers.IntegerField(label=gettext_lazy("套餐ID"), required=False, allow_null=True)
         risk_id = serializers.CharField(label=gettext_lazy("风险ID"), required=False, allow_blank=True, allow_null=True)
@@ -255,8 +282,9 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
         records = []
         for node in nodes:
             risk = risk_map.get(node.risk_id, {})
-            pa_id_of_risk = rule_pa_map.get(risk.get("rule_id"))
             process_result = node.process_result or {}
+            # 套餐归属：优先取执行时快照（手动分派/规则改绑套餐均正确），历史节点无快照时走规则链路兜底
+            pa_id_of_record = process_result.get("pa_id") or rule_pa_map.get(risk.get("rule_id"))
             state = (process_result.get("status") or {}).get("state", "")
             if state in SOPSTaskStatus.get_success_status():
                 result = "success"
@@ -272,13 +300,16 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
                     "risk_id": node.risk_id,
                     "risk_title": risk.get("title") or "",
                     "risk_status": risk.get("status") or "",
-                    "pa_id": pa_id_of_risk or 0,
-                    "pa_name": pa_name_map.get(pa_id_of_risk, ""),
+                    "pa_id": pa_id_of_record or 0,
+                    "pa_name": process_result.get("pa_name") or pa_name_map.get(pa_id_of_record, ""),
                     "operator": node.operator,
                     "time": node.time,
                     "sops_task_id": str((process_result.get("task") or {}).get("task_id", "") or ""),
                     "sops_state": state,
                     "result": result,
+                    "task_name": process_result.get("task_name") or "",
+                    "trigger": process_result.get("trigger") or "",
+                    "duration": self._calc_duration(process_result.get("status") or {}),
                 }
             )
         return records

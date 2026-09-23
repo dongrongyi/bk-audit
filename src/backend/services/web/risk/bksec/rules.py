@@ -20,20 +20,20 @@ import logging
 from typing import Optional
 
 from django.db import transaction
-from django.db.models import Max
 
 from services.web.risk.bksec.config import BkSecConfig
 from services.web.risk.bksec.constants import (
     BKSEC_AUTO_RULE_NAME,
-    BKSEC_AUTO_RULE_PRIORITY_STEP,
     BKSEC_PRESET_PA_DESCRIPTION,
     BKSEC_PRESET_PA_NAME,
+    BKSEC_RULE_PRIORITY_BASE,
 )
 from services.web.risk.bksec.contract import build_pa_params
 from services.web.risk.models import ProcessApplication, RiskRule
 from services.web.scene.constants import ResourceVisibilityType
 from services.web.scene.filters import BindingMetadataHelper
 from services.web.scene.models import ResourceBindingScene
+from services.web.strategy_v2.constants import StrategyStatusChoices
 from services.web.strategy_v2.models import Strategy
 
 logger = logging.getLogger("celery")
@@ -133,8 +133,11 @@ def _next_rule_id() -> int:
 
 
 def _top_priority() -> int:
-    current = RiskRule.objects.all().aggregate(max_priority=Max("priority_index"))["max_priority"] or 0
-    return current + BKSEC_AUTO_RULE_PRIORITY_STEP
+    """
+    自动规则优先级：保留段内取值（结构性最高，手动规则恒低于本段）
+    """
+    latest = RiskRule.objects.filter(priority_index__gte=BKSEC_RULE_PRIORITY_BASE).order_by("-priority_index").first()
+    return (latest.priority_index + 1) if latest else BKSEC_RULE_PRIORITY_BASE
 
 
 def _latest_auto_rule(strategy_id: int) -> Optional[RiskRule]:
@@ -147,7 +150,9 @@ def _build_rule_fields(strategy: Strategy, config: BkSecConfig, pa_id: int) -> d
         "scope": [{"field": "strategy_id", "operator": "=", "value": [strategy.strategy_id]}],
         "pa_id": pa_id,
         "pa_params": build_pa_params(config),
-        "auto_close_risk": True,
+        # 评审定论：审计风险闭环由人工判定，BKSEC 工单办结（SOPS 任务成功）不自动关风险——
+        # 复用既有"成功不关单"路径：任务完成后风险转 AWAIT_PROCESS、处理人转节点处理人/安全责任人
+        "auto_close_risk": False,
     }
 
 
@@ -199,19 +204,31 @@ def _toggle_rule(rule: Optional[RiskRule], is_enabled: bool) -> None:
         logger.info("[BkSecRule] Auto rule toggled, rule_id=%s enabled=%s", rule.rule_id, is_enabled)
 
 
+def _strategy_alive(strategy: Strategy) -> bool:
+    """
+    策略是否处于启用态（非停用、非草稿）
+    """
+    return strategy.status not in (StrategyStatusChoices.DISABLED, StrategyStatusChoices.DRAFT)
+
+
 @transaction.atomic
-def sync_bksec_rule(strategy: Strategy) -> Optional[RiskRule]:
+def sync_bksec_rule(strategy: Strategy, strategy_alive: Optional[bool] = None) -> Optional[RiskRule]:
     """
     策略保存后自动同步处理规则：
         1. 无处理规则时新建
         2. 有处理规则时
             2.1 启停状态有变更：根据策略的bksec配置状态更新处理规则的启停状态
             2.2 内容有变更：创建启用的新版本
+
+    规则生效条件 = bksec_config.enabled AND 策略启用态。
+    strategy_alive：显式覆盖策略存活判断——ToggleStrategy 的启停经 celery 异步落库，
+    调用瞬间 strategy.status 仍是旧值，须由调用方传入方向（True=启用 / False=停用）。
     """
     config = load_bksec_config(strategy)
     latest = _latest_auto_rule(strategy.strategy_id)
-    # 未启用 → 原地停用已有规则
-    if not (config and config.enabled):
+    alive = _strategy_alive(strategy) if strategy_alive is None else strategy_alive
+    # 未启用（配置关 或 策略停用）→ 原地停用已有规则
+    if not (config and config.enabled and alive):
         _toggle_rule(latest, is_enabled=False)
         return None
     # 启用 → 平台策略不支持，跳过并告警

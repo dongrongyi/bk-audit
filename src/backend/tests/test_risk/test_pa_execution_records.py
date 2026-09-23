@@ -26,7 +26,26 @@ from services.web.risk.models import ProcessApplication, Risk, RiskRule, TicketN
 from tests.test_risk.test_tickets.constants import RISK_INFO
 
 
-def _create_node(risk_id: str, state: str, task_id: int = 1, action: str = "AutoProcess") -> TicketNode:
+def _create_node(
+    risk_id: str,
+    state: str,
+    task_id: int = 1,
+    action: str = "AutoProcess",
+    pa_id: int = None,
+    pa_name: str = "",
+    task_name: str = "",
+    trigger: str = "",
+    start_time: str = "",
+    finish_time: str = "",
+) -> TicketNode:
+    process_result = {"task": {"task_id": task_id}, "status": {"state": state}}
+    # 执行时套餐快照（新链路写入；pa_id=None 模拟历史节点）
+    if pa_id is not None:
+        process_result.update({"pa_id": pa_id, "pa_name": pa_name})
+    if task_name or trigger:
+        process_result.update({"task_name": task_name, "trigger": trigger})
+    if start_time or finish_time:
+        process_result["status"].update({"start_time": start_time, "finish_time": finish_time})
     return TicketNode.objects.create(
         risk_id=risk_id,
         operator="admin",
@@ -34,7 +53,7 @@ def _create_node(risk_id: str, state: str, task_id: int = 1, action: str = "Auto
         action=action,
         timestamp=time.time(),
         time="2026-09-20 12:00:00",
-        process_result={"task": {"task_id": task_id}, "status": {"state": state}},
+        process_result=process_result,
         extra={},
     )
 
@@ -103,3 +122,34 @@ class TestListPAExecutionRecords:
         records = resource.risk.list_pa_execution_records.perform_request({})
         by_task = {r["sops_task_id"]: r["result"] for r in records}
         assert by_task == {"1": "running", "2": "failed", "3": "unknown"}
+
+    def test_pa_snapshot_priority_over_rule_chain(self):
+        """套餐归属：执行时快照优先，历史节点（无快照）走规则链路兜底"""
+        pa_a, pa_b, risk_a, risk_b = self._prepare()
+        # 场景1：手动分派——风险无规则（rule_id 空），节点带快照 → 归属正确
+        risk_manual = Risk.objects.create(**{**RISK_INFO, "risk_id": "R-M", "raw_event_id": "raw-m", "rule_id": None})
+        _create_node(
+            risk_manual.risk_id,
+            SOPSTaskStatus.FINISHED.value,
+            task_id=9,
+            pa_id=pa_b.id,
+            pa_name="套餐B",
+            task_name="套餐B_1790000000000",
+            trigger="manual",
+            start_time="2026-09-22 10:32:37 +0800",
+            finish_time="2026-09-22 10:32:40 +0800",
+        )
+        # 场景2：历史节点（无快照）+ 风险规则 → 规则链路兜底
+        _create_node(risk_a.risk_id, SOPSTaskStatus.FINISHED.value, task_id=10)
+        # 场景3：快照与规则指向不同套餐（规则后来改绑）→ 以快照为准
+        _create_node(risk_a.risk_id, SOPSTaskStatus.FINISHED.value, task_id=11, pa_id=pa_b.id, pa_name="套餐B")
+        records = resource.risk.list_pa_execution_records.perform_request({})
+        by_task = {r["sops_task_id"]: (r["pa_id"], r["pa_name"]) for r in records}
+        assert by_task["9"] == (pa_b.id, "套餐B")  # 无规则也能归属
+        rec9 = next(r for r in records if r["sops_task_id"] == "9")
+        assert rec9["task_name"] == "套餐B_1790000000000"
+        assert rec9["trigger"] == "manual"
+        assert rec9["duration"] == 3  # finish - start（秒）
+        assert next(r for r in records if r["sops_task_id"] == "10")["duration"] is None  # 未结束无耗时
+        assert by_task["10"] == (pa_a.id, "套餐A")  # 兜底链路
+        assert by_task["11"] == (pa_b.id, "套餐B")  # 快照优先于规则
