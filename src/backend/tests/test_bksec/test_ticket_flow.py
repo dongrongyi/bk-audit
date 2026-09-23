@@ -76,8 +76,8 @@ PA_PARAMS = {
         ),
     },
     "${operator}": {"field": "", "value": '{{ (risk.operator or risk.security_person or "").split(";") | tojson }}'},
-    "${action}": {"field": "", "value": "poll"},
-    "${once_task}": {"field": "", "value": "yes"},
+    "${action}": {"field": "", "value": "callback"},
+    "${once_task}": {"field": "", "value": "no"},
 }
 
 
