@@ -21,8 +21,11 @@ from unittest import mock
 
 import pytest
 from bk_resource import resource
+from django.conf import settings
 
+from services.web.risk.bksec import sync_bksec_rule
 from services.web.risk.bksec.config import BkSecConfig
+from services.web.risk.bksec.constants import BKSEC_RULE_PRIORITY_BASE
 from services.web.risk.bksec.contract import (
     build_event_payload,
     build_pa_params,
@@ -190,11 +193,11 @@ class TestBkSecRules:
         rule = sync_bksec_rule(strategy)
         assert rule is not None and rule.is_enabled and rule.auto_strategy_id == strategy.strategy_id
         assert rule.scope == [{"field": "strategy_id", "operator": "=", "value": [strategy.strategy_id]}]
-        assert rule.auto_close_risk is True
+        assert rule.auto_close_risk is False  # 评审定论：不自动关审计风险
         assert "${event_data}" in rule.pa_params and "${event_type}" in rule.pa_params
-        # 手工规则优先级低于自动规则（置顶，决策 D2）
+        # 保留优先级段：自动规则结构性最高（段基址 9000），手动规则恒低于段
         manual = RiskRule.objects.create(name="manual", scope=[], pa_id=rule.pa_id, version=1, priority_index=1)
-        assert rule.priority_index > manual.priority_index
+        assert rule.priority_index >= BKSEC_RULE_PRIORITY_BASE > manual.priority_index
         # 幂等：内容未变不产生新版本
         again = sync_bksec_rule(strategy)
         assert again.version == rule.version
@@ -229,6 +232,42 @@ class TestBkSecRules:
         assert updated.is_enabled
         assert updated.version == rule.version + 1
         assert RiskRule.objects.filter(rule_id=rule.rule_id, version=rule.version).exists()
+        # 策略停用（评审定论：停用策略须禁用自动规则）——Toggle 经 celery 异步落库，
+        # 调用方显式传方向；即便配置仍启用，规则也停
+        stopped = sync_bksec_rule(strategy, strategy_alive=False)
+        assert stopped is None
+        latest = RiskRule.objects.filter(auto_strategy_id=strategy.strategy_id).order_by("-version").first()
+        assert not latest.is_enabled
+        assert latest.version == updated.version  # 原地切换不产生新版本
+        # 策略重新启用 → 原地恢复
+        resumed = sync_bksec_rule(strategy, strategy_alive=True)
+        assert resumed.is_enabled and resumed.version == updated.version
+        # 状态推导路径：strategy.status=disabled（已落库）时不传覆盖 → 同样停用
+        strategy.status = "disabled"
+        strategy.save(update_fields=["status"])
+        assert sync_bksec_rule(strategy) is None
+        assert (
+            not RiskRule.objects.filter(auto_strategy_id=strategy.strategy_id).order_by("-version").first().is_enabled
+        )
+        strategy.status = "running"
+        strategy.save(update_fields=["status"])
+
+    def test_auto_rule_edit_guard(self):
+        """自动规则禁人工维护：Update/Toggle/Delete/批量调整一律拒绝"""
+        settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
+        RiskRule.objects.all().delete()
+        ProcessApplication.objects.all().delete()
+        strategy = self._strategy(BKSEC_CONFIG_DATA)
+        rule = sync_bksec_rule(strategy)
+        with pytest.raises(Exception) as err:
+            resource.risk.toggle_risk_rule.perform_request({"rule_id": rule.rule_id, "is_enabled": False})
+        assert "自动发单规则" in str(err.value)
+        with pytest.raises(Exception) as err:
+            resource.risk.delete_risk_rule.perform_request({"rule_id": rule.rule_id})
+        assert "自动发单规则" in str(err.value)
+        # 守卫生效：规则未被人工改动
+        latest = RiskRule.objects.filter(auto_strategy_id=strategy.strategy_id).order_by("-version").first()
+        assert latest.is_enabled and latest.version == rule.version
 
     def test_sync_rule_without_preset_pa(self, settings):
         from services.web.risk.bksec.rules import sync_bksec_rule
@@ -295,7 +334,7 @@ class TestBkSecResources:
         risk_keys = [v["key"] for v in result["risk_variables"]]
         assert "risk.operator" in risk_keys and "risk.security_person" in risk_keys
         event_keys = [v["key"] for v in result["event_variables"]]
-        # 事件基本字段（EventBasicField）+ 策略扩展字段
+        # 事件基本字段（EventBasicField）+ 策略扩展字段（key 取 display_name，与事件调查报告引用语法一致）
         assert "event.raw_event_id" in event_keys
         assert "event.event_time" in event_keys
-        assert "event.username" in event_keys
+        assert "event.操作人" in event_keys

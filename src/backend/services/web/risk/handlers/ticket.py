@@ -599,6 +599,11 @@ class AutoProcess(RiskFlowBaseHandler):
         task_id = self.load_task_id()
         if task_id:
             return {"status": api.bk_sops.get_task_status(task_id=task_id, bk_biz_id=settings.DEFAULT_BK_BIZ_ID)}
+        # 触发方式快照：人工选择(显式传参) / 审批通过(上个节点为审批) / 规则自动匹配
+        last_node = self.risk.last_history
+        trigger = (
+            "manual" if pa_config else ("approve" if last_node and last_node.action == ForApprove.__name__ else "auto")
+        )
         # 优先使用参数
         pa_config = pa_config
         # 或者使用上个节点(审批节点)配置
@@ -642,6 +647,11 @@ class AutoProcess(RiskFlowBaseHandler):
         return {
             "task": result,
             "status": api.bk_sops.get_task_status(task_id=result["task_id"], bk_biz_id=settings.DEFAULT_BK_BIZ_ID),
+            # 套餐/任务快照：执行记录据此展示（历史节点无快照时由记录接口走规则链路兜底）
+            "pa_id": self.process_application.id,
+            "pa_name": self.process_application.name,
+            "task_name": params["name"],
+            "trigger": trigger,
         }
 
     def update_operator(self, process_result: dict, *args, **kwargs) -> None:

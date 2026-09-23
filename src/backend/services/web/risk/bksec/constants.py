@@ -68,11 +68,14 @@ BKSEC_OPERATOR_TEMPLATE = "{{ (risk.operator or risk.security_person).split(';')
 BKSEC_PRESET_PA_NAME = gettext_lazy("【内置】BKSEC安全工单发单")
 BKSEC_PRESET_PA_DESCRIPTION = gettext_lazy("策略 BKSEC 安全工单发单内置套餐，由系统维护，请勿删除或停用")
 
+# 自动规则保留优先级段（结构性保证：启用 BKSEC 的发单规则恒高于一切手动规则，与创建先后无关）：
+#   [BKSEC_RULE_PRIORITY_BASE, +∞) 专属自动规则；手动规则的优先级来源须排除本段（创建时 max 只统计段下值）
+# 评审定论（2026-09）：不使用"当前 max+N"（相对值会被后来规则压过），改用保留段
+BKSEC_RULE_PRIORITY_BASE = 9000
+
 # 自动创建的处理规则
 BKSEC_AUTO_RULE_NAME = gettext_lazy("【自动】策略 %s BKSEC发单")
 # 自动规则置顶优先级间隔（在当前最大值上叠加，保证策略级规则优先命中）
-BKSEC_AUTO_RULE_PRIORITY_STEP = 100
-
 # 必填字段 key（需求文档指定：所有类型两个必填字段 target/operator；
 # 需求原文「风险资产信息(target)」「初始责任人(operator)，首次为空时默认 {{operator}}」）
 BKSEC_FIELD_RISK_ASSET = "target"

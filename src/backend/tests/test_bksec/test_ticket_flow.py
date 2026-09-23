@@ -96,7 +96,7 @@ def _prepare_rule(settings, strategy_id: int) -> None:
         scope=[{"field": "strategy_id", "operator": "=", "value": [strategy_id]}],
         pa_id=pa.id,
         pa_params=PA_PARAMS,
-        auto_close_risk=True,
+        auto_close_risk=False,
         version=1,
         is_enabled=True,
         auto_strategy_id=strategy_id,
