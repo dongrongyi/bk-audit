@@ -27,9 +27,11 @@ from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy
 from rest_framework import serializers
 
+from apps.sops.constants import SOPSTaskStatus
 from services.web.risk.bksec.config import BkSecConfig
 from services.web.risk.bksec.constants import (
     BKSEC_CACHE_TIMEOUT,
+    BKSEC_FIELD_INITIAL_OWNER,
     BKSEC_REQUIRED_FIELDS,
     BKSEC_RISK_TYPE_CACHE_KEY,
 )
@@ -233,6 +235,11 @@ class PreviewBkSecTicket(BkSecResourceMeta):
         # 风险快照：供前端组装预览头部区块（工单标题/等级/关注人/当前责任人/发现时间等；
         # 工单ID、提单时间、处理截止时间由前端按需求规则生成）
         risk_data = build_risk_data(risk)
+        warnings = []
+        # 断点1残留提示：初始责任人兜底后仍为空（样例风险无责任人且未配置安全接口人）
+        # → 工单 operator 为空串，可能被 BKSEC 拒收；运行时数据保存时无法预知，预览是首个可见点
+        if risk is not None and not (payload.get("fields", {}).get(BKSEC_FIELD_INITIAL_OWNER) or "").strip():
+            warnings.append(gettext_lazy("初始责任人为空（该风险单无责任人且未配置安全接口人兜底），工单可能被 BKSEC 拒收，" "请到系统配置设置安全接口人或调整映射"))
         return {
             "risk_type_id": config.risk_type_id,
             "risk_type_name": config.risk_type_name,
@@ -241,6 +248,7 @@ class PreviewBkSecTicket(BkSecResourceMeta):
             "risk": risk_data,
             # 供前端渲染变量空值提示
             "risk_context_keys": list(risk_data.keys()),
+            "warnings": warnings,
         }
 
 
@@ -266,6 +274,16 @@ class SendBkSecTestTicket(BkSecResourceMeta):
         except ValueError as err:
             raise serializers.ValidationError(gettext_lazy("BKSEC 配置不合法：%s") % err)
         risk = get_object_or_404(Risk, risk_id=validated_request_data["risk_id"])
+        # 回调隔离守卫（插件源码实证 2026-09-23）：插件 Callback 表按 risk_id 查找复用——
+        # ① 风险存在进行中的正式派单 → 测试会复用其回调，测试工单办结会误触发正式节点完成；
+        # ② 风险存在已完成的正式派单（Callback.is_finished）→ 测试被插件静默拦截（任务成功但未发单）。
+        # 故该风险存在任何 AutoProcess 正式派单历史时拒绝测试发送，引导换一张风险单
+        from services.web.risk.models import TicketNode
+
+        if TicketNode.objects.filter(risk_id=risk.risk_id, action="AutoProcess").exists():
+            raise serializers.ValidationError(
+                gettext_lazy("该风险单已有正式派单记录：插件的回调按风险单复用，在其上发送测试工单" "会干扰正式回调或被静默拦截，请选择一张未发送过正式工单的风险单进行测试")
+            )
         # 确保预置套餐就绪（依赖 BKSEC_SOPS_TEMPLATE_ID 环境变量）
         from services.web.risk.bksec.rules import ensure_preset_pa
 
@@ -277,14 +295,20 @@ class SendBkSecTestTicket(BkSecResourceMeta):
             constants = build_plugin_constants(config, risk=risk, test_operator=validated_request_data["test_operator"])
         except Exception as err:  # NOCC:broad-except(测试发送即时报错，便于定位配置问题)
             raise serializers.ValidationError(gettext_lazy("字段模板渲染失败，请检查变量语法：%s") % err)
-        # 经预置套餐模板创建并启动测试任务（与正式发送同一通道、同一入参结构）
-        result = api.bk_sops.create_task(
-            name="【测试】{}_{}".format(pa.name, int(datetime.datetime.now().timestamp() * 1000)),
-            constants=constants,
-            bk_biz_id=settings.DEFAULT_BK_BIZ_ID,
-            template_id=pa.sops_template_id,
-        )
-        api.bk_sops.start_task(task_id=result["task_id"], bk_biz_id=settings.DEFAULT_BK_BIZ_ID)
+        # 经预置套餐模板创建并启动测试任务（与正式发送同一通道、同一入参结构）。
+        # 注意：插件侧错误（Config 缺失/白名单/参数格式）发生在 SOPS 异步执行阶段，
+        # 此处只能捕获 SOPS 调用自身的失败（网络/鉴权），插件错误由 test_task_status 轮询侧转换提示
+        try:
+            result = api.bk_sops.create_task(
+                name="【测试】{}_{}".format(pa.name, int(datetime.datetime.now().timestamp() * 1000)),
+                constants=constants,
+                bk_biz_id=settings.DEFAULT_BK_BIZ_ID,
+                template_id=pa.sops_template_id,
+            )
+            api.bk_sops.start_task(task_id=result["task_id"], bk_biz_id=settings.DEFAULT_BK_BIZ_ID)
+        except Exception as err:  # NOCC:broad-except(SOPS 调用失败转友好提示)
+            logger.exception("[BkSecTestTicket] SOPS task create/start failed, risk_id=%s", risk.risk_id)
+            raise serializers.ValidationError(gettext_lazy("SOPS 测试任务创建/启动失败：%s") % err)
         logger.info(
             "[BkSecTestTicket] SOPS task started, task_id=%s risk_type=%s test_operator=%s risk_id=%s",
             result.get("task_id"),
@@ -298,14 +322,45 @@ class SendBkSecTestTicket(BkSecResourceMeta):
 class GetBkSecTestTaskStatus(BkSecResourceMeta):
     """
     查询 BKSEC 测试任务状态（透传 SOPS 任务状态，供前端轮询至终态）
+
+    任务失败时附带可操作的失败提示（failure_hint）：插件 Config 缺失 / 白名单未放行 /
+    参数格式错误为联调实证的三类高发原因，命中已知错误特征时映射为处置指引，
+    未命中时给出通用指引 + SOPS 任务链接。
+    注意：插件侧错误（如 Config 缺失）发生在 SOPS 异步执行阶段，create_task 时刻无法感知，
+    只能在本接口（轮询）侧转换。
     """
 
     name = gettext_lazy("查询BKSEC测试任务状态")
+
+    # 已知插件错误特征 → 处置指引（联调实证 2026-09-23）
+    FAILURE_HINTS = [
+        ("Config matching query does not exist", "插件侧未配置该策略的发单配置（Config 表），请在插件 Admin 为对应 strategy_id 添加后重试"),
+        ("业务或执行人校验失败", "插件白名单未放行：请检查插件环境变量 BKAPP_EXECUTOR / BKAPP_BK_BIZ_ID"),
+        ("Expecting value", "插件参数格式错误：operator 须为 JSON 数组串、event_type/event_data/event_evidence 须为合法 JSON"),
+    ]
+    GENERIC_HINT = "任务执行失败，详情请查看 SOPS 任务执行记录"
 
     class RequestSerializer(serializers.Serializer):
         task_id = serializers.CharField(label=gettext_lazy("SOPS任务ID"), required=True)
 
     def perform_request(self, validated_request_data):
-        return api.bk_sops.get_task_status(
+        status = api.bk_sops.get_task_status(
             task_id=validated_request_data["task_id"], bk_biz_id=settings.DEFAULT_BK_BIZ_ID
         )
+        result = dict(status)
+        if result.get("state") in SOPSTaskStatus.get_failed_status():
+            result["failure_hint"] = self._build_failure_hint(validated_request_data["task_id"])
+        return result
+
+    def _build_failure_hint(self, task_id: str) -> str:
+        # 尽力取节点错误详情做特征匹配，取不到则回退通用指引
+        detail_text = ""
+        try:
+            node_data = api.bk_sops.get_node_data(task_id=task_id, bk_biz_id=settings.DEFAULT_BK_BIZ_ID)
+            detail_text = str(node_data)
+        except Exception:  # NOCC:broad-except(详情获取失败不影响状态返回)
+            logger.warning("[BkSecTestTicket] Fetch node data failed, task_id=%s", task_id)
+        for pattern, hint in self.FAILURE_HINTS:
+            if pattern in detail_text:
+                return hint
+        return self.GENERIC_HINT
