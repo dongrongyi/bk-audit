@@ -134,7 +134,7 @@ class TestContract:
         assert pa_params["${event_type}"] == {"field": "", "value": "cloud-account-no-mfa"}
         assert pa_params["${operator}"] == {
             "field": "",
-            "value": "{{ (risk.operator or risk.security_person).split(';')[0] }}",
+            "value": '{{ (risk.operator or risk.security_person or "").split(";") | tojson }}',
         }
         assert "${event_data}" in pa_params and "${action}" in pa_params and "${once_task}" in pa_params
         # 渲染后的插件常量（测试发送用）
@@ -145,7 +145,7 @@ class TestContract:
                 constants = build_plugin_constants(config, risk=risk, test_operator="tester")
         assert constants["${risk_id}"] == risk.risk_id
         assert constants["${event_type}"] == "cloud-account-no-mfa"
-        assert constants["${operator}"] == "tester"
+        assert constants["${operator}"] == '["tester"]'  # 数组串，满足插件 json.loads 契约
         fields = json.loads(constants["${event_data}"])
         assert fields["operator"] == "tester"
         assert risk.risk_id in fields["target"]
@@ -261,10 +261,10 @@ class TestBkSecRules:
         rule = sync_bksec_rule(strategy)
         with pytest.raises(Exception) as err:
             resource.risk.toggle_risk_rule.perform_request({"rule_id": rule.rule_id, "is_enabled": False})
-        assert "自动发单规则" in str(err.value)
+        assert "自动发单规则" in str(err.value.args)
         with pytest.raises(Exception) as err:
             resource.risk.delete_risk_rule.perform_request({"rule_id": rule.rule_id})
-        assert "自动发单规则" in str(err.value)
+        assert "自动发单规则" in str(err.value.args)
         # 守卫生效：规则未被人工改动
         latest = RiskRule.objects.filter(auto_strategy_id=strategy.strategy_id).order_by("-version").first()
         assert latest.is_enabled and latest.version == rule.version
@@ -315,7 +315,7 @@ class TestBkSecResources:
         fields = json.loads(constants["${event_data}"])
         # Bug1 修复锁定：测试发送必须以指定处理人覆盖初始责任人，保证隔离
         assert fields["operator"] == "tester"
-        assert constants["${operator}"] == "tester"
+        assert constants["${operator}"] == '["tester"]'  # 数组串，满足插件 json.loads 契约
         # 决策 A 修复锁定：测试发送必须携带样例风险单，risk 变量按真实数据渲染
         assert risk.risk_id in fields["target"]
         # 测试任务名带【测试】前缀，便于 SOPS 侧区分
