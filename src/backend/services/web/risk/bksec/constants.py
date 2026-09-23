@@ -38,13 +38,17 @@ BKSEC_PARAM_OPERATOR = "${operator}"
 BKSEC_PARAM_ACTION = "${action}"
 BKSEC_PARAM_ONCE_TASK = "${once_task}"
 # - action：插件提交事件后获取 BKSEC 工单结果的方式
-#   默认 poll（轮询）：自包含、不依赖 WeSec→SOPS 回调可达性，时延对本场景无影响
-# - once_task：单次发单（按 raw_event_id 去重）；
-#   正式发送用 yes（同一风险不重复建单），测试发送用 no（样例风险单的
-#   raw_event_id 可能已被正式发送占用，yes 会拦截测试）
-BKSEC_ACTION_DEFAULT = "poll"
-BKSEC_ONCE_TASK_DEFAULT = "yes"
-BKSEC_ONCE_TASK_TEST = "no"
+#   固定 callback（回调）：⚠️ 不能用 poll——插件源码实证（2026-09-23）POLL 模式首跑在
+#   Callback 表无记录时直接返回"等待首次回调发单"而【不实际发单】（旧模板靠 callback+poll
+#   双节点协作绕过：callback 负责首发，poll 负责后续增量）。我们单节点设计必须用 callback。
+#   callback 模式：发单 → extra._callback 挂钩 → BKSEC 办结回调插件 → SOPS 节点完成
+# - once_task：发单后的等待行为
+#   正式发送用 no：发单后挂起等 BKSEC 办结回调，任务 FINISHED = 工单办结
+#   （对齐 D3 翻转后语义：办结时刻触发风险转人工流转）
+#   测试发送用 yes：发单后节点立即成功结束（快速反馈，不留挂起任务）
+BKSEC_ACTION_DEFAULT = "callback"
+BKSEC_ONCE_TASK_DEFAULT = "no"
+BKSEC_ONCE_TASK_TEST = "yes"
 # event_type 传 risk_access 的数字 id（存量值为数字串 "56"，与 risk_access.id 形态一致）
 BKSEC_EVENT_TYPE_FORMAT = "id"
 # 插件标准入参 → Risk 模型字段（event_type/event_data/operator 被征用，不走此表）
