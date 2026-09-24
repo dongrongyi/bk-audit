@@ -38,7 +38,6 @@ from services.web.risk.serializers import (
     ListAllProcessApplicationsReqSerializer,
     ListProcessApplicationsReqSerializer,
     ListRiskResponseSerializer,
-    PAExecutionRecordInfoSerializer,
     ProcessApplicationsInfoSerializer,
     RiskRuleInfoSerializer,
     ToggleProcessApplicationReqSerializer,
@@ -206,8 +205,7 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
     """
 
     name = gettext_lazy("获取处理套餐执行记录")
-    ResponseSerializer = PAExecutionRecordInfoSerializer
-    many_response_data = True
+    # 分页响应：返回 {count, page, page_size, num_pages, results[]}；框架无 serializer 时直接透传 dict
     audit_action = ActionEnum.LIST_PA
 
     @staticmethod
@@ -239,11 +237,17 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
         id = serializers.IntegerField(label=gettext_lazy("套餐ID"), required=False, allow_null=True)
         risk_id = serializers.CharField(label=gettext_lazy("风险ID"), required=False, allow_blank=True, allow_null=True)
         scene_id = serializers.IntegerField(label=gettext_lazy("场景ID"), required=False, allow_null=True)
+        page = serializers.IntegerField(label=gettext_lazy("页码"), required=False, min_value=1, default=1)
+        page_size = serializers.IntegerField(
+            label=gettext_lazy("单页数量"), required=False, min_value=1, max_value=100, default=20
+        )
 
     def perform_request(self, validated_request_data):
         pa_id = validated_request_data.get("id")
         risk_id = validated_request_data.get("risk_id")
         scene_id = validated_request_data.get("scene_id")
+        page = validated_request_data.get("page", 1)
+        page_size = validated_request_data.get("page_size", 20)
         nodes = TicketNode.objects.filter(action="AutoProcess")
         # 套餐筛选 / 场景范围：套餐 → 规则 → 风险 → 执行节点
         if pa_id or scene_id:
@@ -263,6 +267,10 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
         if risk_id:
             nodes = nodes.filter(risk_id=risk_id)
         nodes = nodes.order_by("-timestamp")
+        # 分页：count 先于切片（总数）；切片后仅组装当前页数据
+        total = nodes.count()
+        start = (page - 1) * page_size
+        nodes = nodes[start : start + page_size]
         # 批量装配：风险信息 + 套餐信息
         risk_map = {
             risk["risk_id"]: risk
@@ -312,7 +320,13 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
                     "duration": self._calc_duration(process_result.get("status") or {}),
                 }
             )
-        return records
+        return {
+            "count": total,
+            "page": page,
+            "page_size": page_size,
+            "num_pages": (total + page_size - 1) // page_size,
+            "results": records,
+        }
 
 
 class ToggleProcessApplication(ProcessApplicationMeta):

@@ -44,6 +44,7 @@ BKSEC_CONFIG_DATA = {
     "enabled": True,
     "risk_type_id": "cloud-account-no-mfa",
     "risk_type_name": "云安全-云账号未启用MFA",
+    "target_type": "tencentcloud_sub_user",
     "field_mappings": [
         {"key": "target", "name": "风险资产信息", "value": "风险单 {{ risk.risk_id }} 的资产信息", "required": True},
         {"key": "operator", "name": "初始责任人", "value": "{{ risk.operator }}", "required": True},

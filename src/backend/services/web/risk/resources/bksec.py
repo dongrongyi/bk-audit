@@ -86,7 +86,7 @@ def _normalize_risk_type_detail(raw: dict) -> dict:
         )
     # 按 sequence 排序，与 BKSEC 侧展示顺序一致
     normalized_fields.sort(key=lambda x: x["sequence"] or 0)
-    return {**_normalize_risk_type(raw), "fields": normalized_fields}
+    return {**_normalize_risk_type(raw), "fields": normalized_fields, "token": raw.get("token", "")}
 
 
 class ListBkSecRiskTypes(BkSecResourceMeta):

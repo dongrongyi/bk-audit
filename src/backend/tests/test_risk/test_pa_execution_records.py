@@ -85,7 +85,9 @@ class TestListPAExecutionRecords:
         pa_a, pa_b, risk_a, risk_b = self._prepare()
         _create_node(risk_a.risk_id, SOPSTaskStatus.FINISHED.value, task_id=11)
         _create_node(risk_b.risk_id, SOPSTaskStatus.RUNNING.value, task_id=22)
-        records = resource.risk.list_pa_execution_records.perform_request({"id": pa_a.id})
+        resp = resource.risk.list_pa_execution_records.perform_request({"id": pa_a.id})
+        records = resp["results"]
+        assert resp["count"] == 1
         assert len(records) == 1
         assert records[0]["pa_name"] == "套餐A"
         assert records[0]["risk_id"] == "R-A"
@@ -98,7 +100,9 @@ class TestListPAExecutionRecords:
         _create_node(risk_a.risk_id, SOPSTaskStatus.RUNNING.value, task_id=1)
         _create_node(risk_a.risk_id, SOPSTaskStatus.FAILED.value, task_id=2)
         _create_node(risk_b.risk_id, SOPSTaskStatus.FINISHED.value, task_id=3)
-        records = resource.risk.list_pa_execution_records.perform_request({"risk_id": risk_a.risk_id})
+        resp = resource.risk.list_pa_execution_records.perform_request({"risk_id": risk_a.risk_id})
+        records = resp["results"]
+        assert resp["count"] == 2
         assert len(records) == 2
         results = {r["sops_task_id"] for r in records}
         assert results == {"1", "2"}
@@ -119,7 +123,8 @@ class TestListPAExecutionRecords:
         )
         # 非 AutoProcess 节点不进执行记录
         _create_node(risk_a.risk_id, SOPSTaskStatus.FINISHED.value, task_id=4, action="NewRisk")
-        records = resource.risk.list_pa_execution_records.perform_request({})
+        resp = resource.risk.list_pa_execution_records.perform_request({})
+        records = resp["results"]
         by_task = {r["sops_task_id"]: r["result"] for r in records}
         assert by_task == {"1": "running", "2": "failed", "3": "unknown"}
 
@@ -143,7 +148,8 @@ class TestListPAExecutionRecords:
         _create_node(risk_a.risk_id, SOPSTaskStatus.FINISHED.value, task_id=10)
         # 场景3：快照与规则指向不同套餐（规则后来改绑）→ 以快照为准
         _create_node(risk_a.risk_id, SOPSTaskStatus.FINISHED.value, task_id=11, pa_id=pa_b.id, pa_name="套餐B")
-        records = resource.risk.list_pa_execution_records.perform_request({})
+        resp = resource.risk.list_pa_execution_records.perform_request({})
+        records = resp["results"]
         by_task = {r["sops_task_id"]: (r["pa_id"], r["pa_name"]) for r in records}
         assert by_task["9"] == (pa_b.id, "套餐B")  # 无规则也能归属
         rec9 = next(r for r in records if r["sops_task_id"] == "9")

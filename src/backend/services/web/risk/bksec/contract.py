@@ -19,6 +19,7 @@ to the current version of the project delivered to anyone in the future.
 import datetime
 import json
 import logging
+import re
 from typing import List, Optional
 
 from django.utils import timezone
@@ -93,6 +94,17 @@ def build_event_payload(
     return payload
 
 
+def _wrap_json_escape(template_value: str) -> str:
+    """
+    给模板值中的每个 {{ expr }} 表达式包 json_escape 过滤器。
+
+    事件字段映射的 value 会被序列化进 ${event_data} 的 JSON 模板串（build_pa_params）。
+    运行时整串渲染时，变量值若含双引号/反斜杠/换行会破坏 JSON 结构。
+    json_escape 保证值在 JSON 字符串字面量内安全（R1 转义缺陷修复）。
+    """
+    return re.sub(r"\{\{(.+?)\}\}", r"{{\1 | json_escape}}", template_value)
+
+
 def build_pa_params(config: BkSecConfig) -> dict:
     """
     生成自动创建处理规则的 pa_params（字段级契约，对接 SOPS 插件「审计中心WeSec发单」入参）
@@ -109,7 +121,10 @@ def build_pa_params(config: BkSecConfig) -> dict:
     params[BKSEC_PARAM_EVENT_TYPE] = {"field": "", "value": config.risk_type_id}
     params[BKSEC_PARAM_EVENT_DATA] = {
         "field": "",
-        "value": json.dumps({m.key: m.value for m in config.field_mappings if m.key}, ensure_ascii=False),
+        "value": json.dumps(
+            {m.key: _wrap_json_escape(m.value) for m in config.field_mappings if m.key},
+            ensure_ascii=False,
+        ),
     }
     params[BKSEC_PARAM_OPERATOR] = {"field": "", "value": BKSEC_OPERATOR_TEMPLATE}
     params[BKSEC_PARAM_ACTION] = {"field": "", "value": BKSEC_ACTION_DEFAULT}
