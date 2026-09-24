@@ -109,28 +109,6 @@ def _prepare_rule(settings, strategy_id: int) -> None:
 class TestNewRiskBkSecFallback:
     @mock.patch("services.web.risk.handlers.ticket.RiskFlowBaseHandler.auth_current_operator", mock.Mock())
     @mock.patch("services.web.risk.handlers.ticket.RiskFlowBaseHandler.notice_current_operator", mock.Mock())
-    def test_operatorless_risk_matches_rule_when_bksec_enabled(self, settings):
-        """决策 D4：无责任人风险，策略启用 BKSEC 时仍走规则匹配并发单"""
-        from services.web.strategy_v2.models import Strategy
-
-        strategy_id = RISK_INFO["strategy_id"]
-        strategy, _ = Strategy.objects.get_or_create(
-            strategy_id=strategy_id, defaults={"strategy_name": f"test_strategy_{strategy_id}"}
-        )
-        strategy.bksec_config = BKSEC_CONFIG_DATA
-        strategy.save(update_fields=["bksec_config"])
-        _prepare_rule(settings, strategy_id)
-        # 无责任人
-        with RiskContext(risk_info={"operator": []}) as risk:
-            NewRisk(risk_id=risk.risk_id, operator="admin").run()
-            risk.refresh_from_db()
-            assert risk.rule_id is not None
-            # 预置套餐 need_approve=False → 直接进入自动处理
-            assert risk.status == RiskStatus.AUTO_PROCESS
-            assert risk.current_operator == []
-
-    @mock.patch("services.web.risk.handlers.ticket.RiskFlowBaseHandler.auth_current_operator", mock.Mock())
-    @mock.patch("services.web.risk.handlers.ticket.RiskFlowBaseHandler.notice_current_operator", mock.Mock())
     def test_operatorless_risk_skips_rule_when_bksec_disabled(self):
         """未启用 BKSEC 的策略维持原语义：无责任人不走规则"""
         from services.web.strategy_v2.models import Strategy

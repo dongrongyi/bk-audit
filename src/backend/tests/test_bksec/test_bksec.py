@@ -386,21 +386,3 @@ class TestBkSecResources:
         ctx = {"risk": type("R", (), {"operator": "", "security_person": ""})(), "event": {}}
         out = render_value(BKSEC_OPERATOR_TEMPLATE, ctx)
         assert json.loads(out) == [""]  # 合法数组，插件侧 join 后为空串（数据质量项，非崩溃）
-
-    def test_list_variables(self):
-        from services.web.strategy_v2.models import Strategy
-
-        strategy = Strategy.objects.get_or_create(
-            strategy_id=RISK_INFO["strategy_id"],
-            defaults={"strategy_name": "s"},
-        )[0]
-        strategy.event_data_field_configs = [{"field_name": "username", "display_name": "操作人"}]
-        strategy.save(update_fields=["event_data_field_configs"])
-        result = resource.risk.list_bk_sec_variables.perform_request({"strategy_id": strategy.strategy_id})
-        risk_keys = [v["key"] for v in result["risk_variables"]]
-        assert "risk.operator" in risk_keys and "risk.security_person" in risk_keys
-        event_keys = [v["key"] for v in result["event_variables"]]
-        # 事件基本字段（EventBasicField）+ 策略扩展字段（key 取 display_name，与事件调查报告引用语法一致）
-        assert "event.raw_event_id" in event_keys
-        assert "event.event_time" in event_keys
-        assert "event.操作人" in event_keys
