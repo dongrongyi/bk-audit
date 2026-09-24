@@ -157,7 +157,7 @@ def load_risk_events(risk: Risk, limit: int = BKSEC_RENDER_EVENT_LIMIT) -> List[
 
 # 风险变量展示元数据（单一事实源）：
 # key 集合必须与 build_risk_data 的输出键严格一致（由测试 TestRiskVariableMetaSync 校验），
-# 引用变量弹窗（ListBkSecVariables）直接遍历本表生成菜单，避免手工枚举漂移。
+# 防止渲染引擎使用的变量与可用变量清单漂移。
 RISK_VARIABLE_META = {
     "risk_id": (gettext_lazy("风险ID"), "R-20260101-0001"),
     "title": (gettext_lazy("风险标题"), "异常登录风险"),

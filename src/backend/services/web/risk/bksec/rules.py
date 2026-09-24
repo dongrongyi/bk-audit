@@ -279,12 +279,13 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> None:
     同步插件 Config（方案 1）：调插件 upsert API 写入 Config 记录。
 
     凭证现取现推（token 不落审计中心库，避免序列化泄露）。
-    失败仅告警，不阻断策略保存。
+    失败上报监控平台（BkSecConfigSyncFailedEvent，与资产同步异常同机制），不阻断策略保存。
     """
     from django.conf import settings
 
+    from services.web.common.monitor import BkSecConfigSyncFailedEvent
+
     api_url = getattr(settings, "BKSEC_PLUGIN_CONFIG_API_URL", None)
-    api_token = getattr(settings, "BKSEC_PLUGIN_CONFIG_API_TOKEN", None)
     if not api_url:
         logger.warning("[BkSecPluginConfig] BKSEC_PLUGIN_CONFIG_API_URL not set, skip plugin config sync")
         return
@@ -295,8 +296,11 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> None:
 
         detail = api.bk_sec.risk_access_retrieve.perform_request({"id": config.risk_type_id})
         token = (detail or {}).get("token", "")
-    except Exception as err:  # NOCC:broad-except(凭证获取失败仅告警)
+    except Exception as err:  # NOCC:broad-except(凭证获取失败上报监控)
         logger.warning("[BkSecPluginConfig] Fetch risk_access failed, skip: %s", err)
+        BkSecConfigSyncFailedEvent(
+            context={"strategy_id": str(strategy.strategy_id), "stage": "fetch_token", "error": str(err)},
+        ).report()
         return
 
     plugin_config = {
@@ -314,17 +318,11 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> None:
 
     import requests as _requests
 
-    headers = {"Content-Type": "application/json"}
-    if api_token:
-        headers["X-Config-Token"] = api_token
-    else:
-        logger.warning("[BkSecPluginConfig] BKSEC_PLUGIN_CONFIG_API_TOKEN not set, proceed without auth")
-
     try:
         resp = _requests.post(
             api_url,
             json={"strategy_id": str(strategy.strategy_id), "config": plugin_config},
-            headers=headers,
+            headers={"Content-Type": "application/json"},
             timeout=10,
         )
         result = resp.json()
@@ -332,5 +330,15 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> None:
             logger.info("[BkSecPluginConfig] Synced, strategy_id=%s", strategy.strategy_id)
         else:
             logger.warning("[BkSecPluginConfig] Upsert rejected: %s", result.get("message"))
-    except Exception as err:  # NOCC:broad-except(插件不可达仅告警，不阻断策略保存)
+            BkSecConfigSyncFailedEvent(
+                context={
+                    "strategy_id": str(strategy.strategy_id),
+                    "stage": "upsert_rejected",
+                    "error": str(result.get("message")),
+                },
+            ).report()
+    except Exception as err:  # NOCC:broad-except(插件不可达上报监控，不阻断策略保存)
         logger.warning("[BkSecPluginConfig] Sync failed, strategy_id=%s err=%s", strategy.strategy_id, err)
+        BkSecConfigSyncFailedEvent(
+            context={"strategy_id": str(strategy.strategy_id), "stage": "api_unreachable", "error": str(err)},
+        ).report()

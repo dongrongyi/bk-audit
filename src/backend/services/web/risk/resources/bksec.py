@@ -36,12 +36,7 @@ from services.web.risk.bksec.constants import (
     BKSEC_RISK_TYPE_CACHE_KEY,
 )
 from services.web.risk.bksec.contract import build_event_payload, build_plugin_constants
-from services.web.risk.bksec.variables import (
-    AGGREGATION_FUNCTIONS,
-    RISK_VARIABLE_META,
-    build_risk_data,
-)
-from services.web.risk.constants import EventBasicField
+from services.web.risk.bksec.variables import build_risk_data
 from services.web.risk.models import Risk
 
 logger = logging.getLogger("celery")
@@ -86,7 +81,7 @@ def _normalize_risk_type_detail(raw: dict) -> dict:
         )
     # 按 sequence 排序，与 BKSEC 侧展示顺序一致
     normalized_fields.sort(key=lambda x: x["sequence"] or 0)
-    return {**_normalize_risk_type(raw), "fields": normalized_fields, "token": raw.get("token", "")}
+    return {**_normalize_risk_type(raw), "fields": normalized_fields}
 
 
 class ListBkSecRiskTypes(BkSecResourceMeta):
@@ -136,72 +131,6 @@ class RetrieveBkSecRiskType(BkSecResourceMeta):
             detail = _normalize_risk_type_detail(detail or {})
             cache.set(cache_key, detail, timeout=BKSEC_CACHE_TIMEOUT)
         return detail
-
-
-class ListBkSecVariables(BkSecResourceMeta):
-    """
-    查询 BKSEC 字段可用变量列表（引用变量弹窗：风险字段 / 事件字段）
-    """
-
-    name = gettext_lazy("查询BKSEC可用变量")
-
-    class RequestSerializer(serializers.Serializer):
-        strategy_id = serializers.IntegerField(label=gettext_lazy("策略ID"), required=False, allow_null=True)
-
-    def perform_request(self, validated_request_data):
-        # 风险变量：遍历单一事实源 RISK_VARIABLE_META（与渲染引擎 build_risk_data 的键集合一致，测试校验防漂移）
-        risk_variables = [
-            {
-                "group": "risk",
-                "key": "risk.%s" % key,
-                "name": str(label),
-                "sample": sample,
-                "insert": "{{ risk.%s }}" % key,
-            }
-            for key, (label, sample) in RISK_VARIABLE_META.items()
-        ]
-        # 事件变量 = 事件基本字段（EventBasicField，与 ListEventFieldsByStrategy 同源）+ 策略扩展字段
-        event_variables = [
-            {
-                "group": "event",
-                "key": "event.%s" % field_name,
-                "name": str(label),
-                "sample": "",
-                "insert": "{{ event.%s }}" % field_name,
-                "aggregations": [
-                    {"name": func, "insert": "{{{{ {}(event.{}) }}}}".format(func, field_name)}
-                    for func in AGGREGATION_FUNCTIONS
-                ],
-            }
-            for field_name, label in EventBasicField.choices
-        ]
-        basic_field_names = {field_name for field_name, _ in EventBasicField.choices}
-        strategy_id = validated_request_data.get("strategy_id")
-        if strategy_id:
-            from services.web.strategy_v2.models import Strategy
-
-            strategy = Strategy.objects.filter(strategy_id=strategy_id).first()
-            # 策略事件拓展字段（key 取 display_name，与事件调查报告的变量引用语法一致）
-            for cfg in (getattr(strategy, "event_data_field_configs", None) or []) if strategy else []:
-                display_name = cfg.get("display_name") or cfg.get("field_name")
-                field_name = cfg.get("field_name")
-                if not display_name or field_name in basic_field_names:
-                    continue
-                event_variables.append(
-                    {
-                        "group": "event",
-                        "key": "event.%s" % display_name,
-                        "name": str(display_name),
-                        "sample": "",
-                        # 默认插入为最后一条事件取值；聚合写法由前端按需选择
-                        "insert": "{{ event.%s }}" % display_name,
-                        "aggregations": [
-                            {"name": func, "insert": "{{{{ {}(event.{}) }}}}".format(func, display_name)}
-                            for func in AGGREGATION_FUNCTIONS
-                        ],
-                    }
-                )
-        return {"risk_variables": risk_variables, "event_variables": event_variables}
 
 
 class PreviewBkSecTicket(BkSecResourceMeta):
