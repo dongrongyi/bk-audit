@@ -251,6 +251,8 @@ def sync_bksec_rule(strategy: Strategy, strategy_alive: Optional[bool] = None) -
     # 幂等：内容一致 → 仅原地确保启用
     if latest and all(getattr(latest, k) == v for k, v in fields.items()):
         _toggle_rule(latest, is_enabled=True)
+        # Config 同步：即使规则内容未变，插件侧凭证/配方可能更新（如用户改了 target_type）
+        sync_plugin_config(strategy, config)
         return latest
     # 内容变化/首次 → 创建启用的新版本
     instance = _create_rule_version(strategy, fields, rule_id=latest.rule_id if latest else None)
@@ -260,6 +262,8 @@ def sync_bksec_rule(strategy: Strategy, strategy_alive: Optional[bool] = None) -
         instance.rule_id,
         instance.version,
     )
+    # 方案 1：规则同步成功后，顺带同步插件 Config（失败仅告警，不阻断）
+    sync_plugin_config(strategy, config)
     return instance
 
 
@@ -268,3 +272,65 @@ def disable_bksec_rule(strategy_id: int) -> None:
     停用策略的自动发单规则
     """
     _toggle_rule(_latest_auto_rule(strategy_id), is_enabled=False)
+
+
+def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> None:
+    """
+    同步插件 Config（方案 1）：调插件 upsert API 写入 Config 记录。
+
+    凭证现取现推（token 不落审计中心库，避免序列化泄露）。
+    失败仅告警，不阻断策略保存。
+    """
+    from django.conf import settings
+
+    api_url = getattr(settings, "BKSEC_PLUGIN_CONFIG_API_URL", None)
+    api_token = getattr(settings, "BKSEC_PLUGIN_CONFIG_API_TOKEN", None)
+    if not api_url:
+        logger.warning("[BkSecPluginConfig] BKSEC_PLUGIN_CONFIG_API_URL not set, skip plugin config sync")
+        return
+
+    # 凭证：从 risk_access detail 现取（data_id = risk_type_id）
+    try:
+        from bk_resource import api
+
+        detail = api.bk_sec.risk_access_retrieve.perform_request({"id": config.risk_type_id})
+        token = (detail or {}).get("token", "")
+    except Exception as err:  # NOCC:broad-except(凭证获取失败仅告警)
+        logger.warning("[BkSecPluginConfig] Fetch risk_access failed, skip: %s", err)
+        return
+
+    plugin_config = {
+        "raw_data": {
+            "data_id": int(config.risk_type_id) if config.risk_type_id.isdigit() else config.risk_type_id,
+            "token": token,
+            "target_type": config.target_type,
+            "source_type": "bk-audit",
+        },
+        "operator": {"field_path": "operator"},
+        "target": {"field_path": "event_data.target"},
+        "risk_evidence": {"display_fields": []},
+        "custom_data": {"fields": []},
+    }
+
+    import requests as _requests
+
+    headers = {"Content-Type": "application/json"}
+    if api_token:
+        headers["X-Config-Token"] = api_token
+    else:
+        logger.warning("[BkSecPluginConfig] BKSEC_PLUGIN_CONFIG_API_TOKEN not set, proceed without auth")
+
+    try:
+        resp = _requests.post(
+            api_url,
+            json={"strategy_id": str(strategy.strategy_id), "config": plugin_config},
+            headers=headers,
+            timeout=10,
+        )
+        result = resp.json()
+        if result.get("result"):
+            logger.info("[BkSecPluginConfig] Synced, strategy_id=%s", strategy.strategy_id)
+        else:
+            logger.warning("[BkSecPluginConfig] Upsert rejected: %s", result.get("message"))
+    except Exception as err:  # NOCC:broad-except(插件不可达仅告警，不阻断策略保存)
+        logger.warning("[BkSecPluginConfig] Sync failed, strategy_id=%s err=%s", strategy.strategy_id, err)

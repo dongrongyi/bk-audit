@@ -205,6 +205,9 @@ BK_SEC_API_RATE_LIMIT = os.getenv("BKAPP_BK_SEC_API_RATE_LIMIT", "10/s")
 BKSEC_PROJECT_ID = os.getenv("BKAPP_BKSEC_PROJECT_ID")
 # 预置 BKSEC 发单套餐指向的标准运维流程模板（方案a 契约：唯一事件常量 ${__bksec_event__}）
 BKSEC_SOPS_TEMPLATE_ID = os.getenv("BKAPP_BKSEC_SOPS_TEMPLATE_ID")
+# BKSEC 发单插件 Config 同步 API 地址（方案 1 自动同步时调用；未配置则跳过同步并告警）
+BKSEC_PLUGIN_CONFIG_API_URL = os.getenv("BKAPP_BKSEC_PLUGIN_CONFIG_API_URL")
+BKSEC_PLUGIN_CONFIG_API_TOKEN = os.getenv("BKAPP_BKSEC_PLUGIN_CONFIG_API_TOKEN")
 BK_ITSM_APIGW_NAME = os.getenv("BKAPP_BK_ITSM_APIGW_NAME", "bk-itsm")
 BKIAM_APIGW_NAME = os.getenv("BKAPP_BKIAM_APIGW_NAME", "bkiam")
 # IAM V4 API 地址覆盖；默认由 api.domains 解析到预发布网关，本地 dev e2e 可临时指定 dev 地址。

@@ -51,6 +51,7 @@ class BkSecConfig(BaseModel):
     enabled: bool = Field(False, description="是否启用 BKSEC 安全工单")
     risk_type_id: str = Field("", description="BKSEC 风险类型 ID")
     risk_type_name: str = Field("", description="BKSEC 风险类型名称")
+    target_type: str = Field("", description="BKSEC 目标资产类型（上报方自定义，如 tencentcloud_sub_user）")
     field_mappings: List[BkSecFieldMapping] = Field(default_factory=list, description="字段映射列表")
 
     @field_validator("field_mappings")
@@ -78,6 +79,8 @@ class BkSecConfig(BaseModel):
             return
         if not self.risk_type_id:
             raise ValueError(gettext("启用 BKSEC 安全工单时必须选择风险类型"))
+        if not self.target_type or not self.target_type.strip():
+            raise ValueError(gettext("启用 BKSEC 安全工单时必须填写目标资产类型（target_type）"))
         for key in (BKSEC_FIELD_RISK_ASSET, BKSEC_FIELD_INITIAL_OWNER):
             mapping = self.get_field_mapping(key)
             if not mapping.value or not mapping.value.strip():

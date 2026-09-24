@@ -16,6 +16,7 @@ We undertake not to change the open source license (MIT license) applicable
 to the current version of the project delivered to anyone in the future.
 """
 
+import json
 import logging
 from typing import List, Optional
 
@@ -24,6 +25,19 @@ from services.web.risk.bksec.variables import build_render_context
 from services.web.risk.models import Risk
 
 logger = logging.getLogger("celery")
+
+
+def _json_escape_filter(value):
+    """
+    Jinja2 过滤器：将值转为 JSON 字符串字面量内容（不含外层引号）。
+
+    用途：build_pa_params 生成 ${event_data} 模板时，给每个 {{ expr }} 包此过滤器，
+    保证模板渲染后仍是合法 JSON——防止用户配置的值包含双引号/反斜杠/换行时
+    破坏 event_data 的 JSON 结构（R1 转义缺陷修复）。
+    """
+    if value is None:
+        return ""
+    return json.dumps(str(value))[1:-1]
 
 
 def render_value(template: str, context: dict) -> str:
@@ -38,6 +52,7 @@ def render_value(template: str, context: dict) -> str:
     if not isinstance(template, str) or "{{" not in template:
         return template if isinstance(template, str) else ""
     env = jinja2_environment(autoescape=False)
+    env.filters["json_escape"] = _json_escape_filter
     try:
         return env.from_string(template).render(**context).strip()
     except Exception as err:  # NOCC:broad-except(渲染失败需明确可见)
