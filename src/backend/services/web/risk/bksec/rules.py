@@ -20,6 +20,7 @@ import logging
 from typing import Optional
 
 from django.db import transaction
+from django.utils.translation import gettext
 
 from services.web.risk.bksec.config import BkSecConfig
 from services.web.risk.bksec.constants import (
@@ -252,7 +253,8 @@ def sync_bksec_rule(strategy: Strategy, strategy_alive: Optional[bool] = None) -
     if latest and all(getattr(latest, k) == v for k, v in fields.items()):
         _toggle_rule(latest, is_enabled=True)
         # Config 同步：即使规则内容未变，插件侧凭证/配方可能更新（如用户改了 target_type）
-        sync_plugin_config(strategy, config)
+        # 启用路径为保存前置强校验：同步失败则阻断策略保存，避免“假启用”（规则在、插件无 Config、发不出单）
+        _ensure_plugin_config_synced(strategy, config)
         return latest
     # 内容变化/首次 → 创建启用的新版本
     instance = _create_rule_version(strategy, fields, rule_id=latest.rule_id if latest else None)
@@ -262,8 +264,8 @@ def sync_bksec_rule(strategy: Strategy, strategy_alive: Optional[bool] = None) -
         instance.rule_id,
         instance.version,
     )
-    # 方案 1：规则同步成功后，顺带同步插件 Config（失败仅告警，不阻断）
-    sync_plugin_config(strategy, config)
+    # 启用路径同步插件 Config，失败阻断保存
+    _ensure_plugin_config_synced(strategy, config)
     return instance
 
 
@@ -274,12 +276,16 @@ def disable_bksec_rule(strategy_id: int) -> None:
     _toggle_rule(_latest_auto_rule(strategy_id), is_enabled=False)
 
 
-def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> None:
+def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> tuple:
     """
     同步插件 Config（方案 1）：传业务参数给插件，插件内部构造完整 Config 并存储。
 
     审计中心只传 strategy_id + risk_type_id + target_type，格式细节（凭证/桥接配方/默认值）归插件管理。
-    失败上报监控平台（BkSecConfigSyncFailedEvent，与资产同步异常同机制），不阻断策略保存。
+    返回 (success: bool, message: str)：
+        - success=True  → 插件已成功建立/更新 Config
+        - success=False → 失败原因（含插件返回的 message 或网络异常信息）
+
+    监控上报（BkSecConfigSyncFailedEvent）保留，供可观测；调用方据此决定是否阻断。
     """
     from django.conf import settings
 
@@ -287,8 +293,12 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> None:
 
     api_url = getattr(settings, "BKSEC_PLUGIN_CONFIG_API_URL", None)
     if not api_url:
-        logger.warning("[BkSecPluginConfig] BKSEC_PLUGIN_CONFIG_API_URL not set, skip plugin config sync")
-        return
+        message = "BKSEC_PLUGIN_CONFIG_API_URL 未配置，无法同步插件配置"
+        logger.warning("[BkSecPluginConfig] %s, strategy_id=%s", message, strategy.strategy_id)
+        BkSecConfigSyncFailedEvent(
+            context={"strategy_id": str(strategy.strategy_id), "stage": "api_url_missing", "error": message},
+        ).report()
+        return (False, message)
 
     import requests as _requests
 
@@ -308,17 +318,34 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> None:
             logger.info(
                 "[BkSecPluginConfig] Synced, strategy_id=%s risk_type_id=%s", strategy.strategy_id, config.risk_type_id
             )
-        else:
-            logger.warning("[BkSecPluginConfig] Upsert rejected: %s", result.get("message"))
-            BkSecConfigSyncFailedEvent(
-                context={
-                    "strategy_id": str(strategy.strategy_id),
-                    "stage": "upsert_rejected",
-                    "error": str(result.get("message")),
-                },
-            ).report()
-    except Exception as err:  # NOCC:broad-except(插件不可达上报监控，不阻断策略保存)
+            return (True, "ok")
+        message = str(result.get("message", "插件拒绝写入 Config"))
+        logger.warning("[BkSecPluginConfig] Upsert rejected: %s", message)
+        BkSecConfigSyncFailedEvent(
+            context={
+                "strategy_id": str(strategy.strategy_id),
+                "stage": "upsert_rejected",
+                "error": message,
+            },
+        ).report()
+        return (False, message)
+    except Exception as err:  # NOCC:broad-except(插件不可达上报监控)
+        message = "插件配置同步接口不可达：%s" % err
         logger.warning("[BkSecPluginConfig] Sync failed, strategy_id=%s err=%s", strategy.strategy_id, err)
         BkSecConfigSyncFailedEvent(
             context={"strategy_id": str(strategy.strategy_id), "stage": "api_unreachable", "error": str(err)},
         ).report()
+        return (False, message)
+
+
+def _ensure_plugin_config_synced(strategy: Strategy, config: BkSecConfig) -> None:
+    """
+    启用路径的插件 Config 同步强校验：失败则抛出 ValueError 阻断策略保存。
+
+    避免“假启用”——策略显示已启用、规则已建，但插件侧没有对应 Config，
+    导致风险命中后实际发不出工单（静默失败）。
+    关闭/停用路径不应调用本函数（见 sync_bksec_rule 的未启用分支，直接停用规则返回，不碰插件 Config）。
+    """
+    success, message = sync_plugin_config(strategy, config)
+    if not success:
+        raise ValueError(gettext("BKSEC 安全工单已启用但插件配置同步失败，策略保存被阻断：%s") % message)
