@@ -301,7 +301,8 @@ class TestQueryLogSubscription(TestCase):
 
         # 验证时间范围条件
         self.assertIn(
-            f"`{expected_table}`.`{TIMESTAMP_PARTITION_FIELD}` BETWEEN 1734589800000 AND 1734593400000", query_sql
+            f"CAST(`{expected_table}`.`{TIMESTAMP_PARTITION_FIELD}` AS BIGINT) BETWEEN 1734589800000 AND 1734593400000",
+            query_sql,
         )
 
         # 验证订阅配置的筛选条件
@@ -343,11 +344,12 @@ class TestQueryLogSubscription(TestCase):
 
         # 验证时间范围
         self.assertIn(
-            f"`{expected_table}`.`{TIMESTAMP_PARTITION_FIELD}` BETWEEN 1734589800000 AND 1734593400000", query_sql
+            f"CAST(`{expected_table}`.`{TIMESTAMP_PARTITION_FIELD}` AS BIGINT) BETWEEN 1734589800000 AND 1734593400000",
+            query_sql,
         )
 
         # 验证订阅配置的筛选条件
-        self.assertIn(f"`{expected_table}`.`strategy_id` IN (1,2,3)", query_sql)
+        self.assertIn(f"CAST(`{expected_table}`.`strategy_id` AS INT) IN (1,2,3)", query_sql)
 
         # 验证分页（第2页，每页20条，offset=20）
         self.assertIn("LIMIT 20 OFFSET 20", query_sql)
@@ -427,7 +429,7 @@ class TestQueryLogSubscription(TestCase):
 
         # 验证自定义筛选条件（表名已替换）
         self.assertIn(f"`{expected_table}`.`username`='admin'", query_sql)
-        self.assertIn(f"`{expected_table}`.`result_code`=200", query_sql)
+        self.assertIn(f"CAST(`{expected_table}`.`result_code` AS INT)=200", query_sql)
 
         # 验证原订阅条件仍然存在
         self.assertIn(f"`{expected_table}`.`namespace`='bkaudit'", query_sql)
@@ -744,5 +746,5 @@ class TestQueryLogSubscription(TestCase):
 
         # 验证所有筛选条件都已正确应用
         self.assertIn(f"`{expected_table}`.`username`='admin'", query_sql)
-        self.assertIn(f"`{expected_table}`.`result_code`=200", query_sql)
+        self.assertIn(f"CAST(`{expected_table}`.`result_code` AS INT)=200", query_sql)
         self.assertIn(f"`{expected_table}`.`action_id`='create'", query_sql)

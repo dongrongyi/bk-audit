@@ -99,6 +99,22 @@ class SQLGenerator:
             raise TableNotRegisteredError(table)
         return self.table_map[table]
 
+    # 比较/条件运算中需要对齐类型的数值/时间字段类型（规避引擎隐式转换异常）
+    _CONDITION_CAST_TYPES = {
+        FieldType.DOUBLE,
+        FieldType.FLOAT,
+        FieldType.INT,
+        FieldType.LONG,
+        FieldType.TIMESTAMP,
+    }
+
+    def _cast_condition_field(self, field_type, pypika_field):
+        """对比较/条件运算中的数值/时间字段显式 CAST，规避引擎隐式类型转换问题"""
+        target_type = field_type or FieldType.STRING
+        if target_type in self._CONDITION_CAST_TYPES:
+            return Cast(pypika_field, target_type.query_data_type)
+        return pypika_field
+
     def _get_pypika_field(self, field: Field) -> PypikaField:
         """根据 Field 获取 PyPika 字段"""
         table = self._get_table(field.table)
@@ -291,14 +307,18 @@ class SQLGenerator:
             if alias is None:
                 raise InvalidRuleConfigError(f"规则 having 引用的聚合字段 {field.display_name} 不在策略级 select 中")
             pypika_field = pypika_terms.Field(alias)
-            filter_type = (field.aggregate.result_data_type or field.field_type).python_type
+            field_type = field.aggregate.result_data_type or field.field_type
+            filter_type = field_type.python_type
         else:
             # 维度字段：L1 输出列别名（display_name 已由上层映射为 md5 别名）
             dimension_columns = {f.display_name for f in self.config.select_fields if not f.aggregate}
             if field.display_name not in dimension_columns:
                 raise InvalidRuleConfigError(f"规则 having 引用的维度字段 {field.display_name} 不在策略级 select 的维度列中")
             pypika_field = pypika_terms.Field(field.display_name)
-            filter_type = field.field_type.python_type
+            field_type = field.field_type
+            filter_type = field_type.python_type
+        # 比较/条件运算中对数值/时间字段显式 CAST，规避引擎隐式类型转换异常
+        pypika_field = self._cast_condition_field(field_type, pypika_field)
         try:
             return operate(
                 condition.operator,
@@ -396,11 +416,17 @@ class SQLGenerator:
             # 如果条件字段是聚合函数，则使用聚合函数处理
             field = self._build_aggregate(condition.field)
             # 采用聚合函数规定的类型 or 字段本身类型
-            filter_type = (condition.field.aggregate.result_data_type or condition.field.field_type).python_type
+            field_type = condition.field.aggregate.result_data_type or condition.field.field_type
+            filter_type = field_type.python_type
         else:
             # 否则，使用普通字段处理
             field = self._get_pypika_field(condition.field)
-            filter_type = condition.field.field_type.python_type
+            field_type = condition.field.field_type
+            filter_type = field_type.python_type
+        # 比较/条件运算中对数值/时间字段显式 CAST，规避引擎隐式类型转换异常
+        # 下钻字段（field.keys）经 _get_pypika_field 已自带类型转换，跳过避免双重 CAST
+        if not condition.field.keys:
+            field = self._cast_condition_field(field_type, field)
         operator = condition.operator
         try:
             return operate(

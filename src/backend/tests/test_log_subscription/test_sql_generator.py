@@ -73,7 +73,7 @@ class BkBaseComputeSqlGeneratorTest(TestCase):
         self.assertIn("SELECT *", sql)
         self.assertIn("FROM 591_test_table.doris", sql)
         self.assertIn("WHERE", sql)
-        self.assertIn("`dtEventTimeStamp` BETWEEN", sql)
+        self.assertIn("CAST(`591_test_table.doris`.`dtEventTimeStamp` AS BIGINT) BETWEEN", sql)
         self.assertIn("ORDER BY", sql)
         self.assertIn("LIMIT 10", sql)
 

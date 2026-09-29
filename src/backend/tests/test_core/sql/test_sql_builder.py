@@ -198,7 +198,7 @@ class TestSQLGenerator(SimpleTestCase):
         expected_query = (
             'SELECT "users"."id" "user_id" '
             'FROM "users" "users" '
-            'WHERE "users"."age"=18 AND "users"."country"=\'Ireland\' '
+            'WHERE CAST("users"."age" AS INT)=18 AND "users"."country"=\'Ireland\' '
             'AND "users"."name" LIKE \'%Jack%\' '
             'AND CAST(GET_JSON_OBJECT("users"."address",\'$.["k1"].["k2"]\') AS STRING)=\'Dublin\''
         )
@@ -235,7 +235,7 @@ class TestSQLGenerator(SimpleTestCase):
 
         generator = SQLGenerator(self.query_builder)
         query = generator.generate(config)
-        expected_query = 'SELECT "users"."id" "user_id" FROM "users" "users" WHERE "users"."age"=18'
+        expected_query = 'SELECT "users"."id" "user_id" FROM "users" "users" WHERE CAST("users"."age" AS INT)=18'
         self.assertEqual(str(query), expected_query, f"Expected: {expected_query}, but got: {query}")
 
         # 4. 组合: valid OR empty -> 应该只剩下 valid
@@ -493,7 +493,7 @@ class TestSQLGenerator(SimpleTestCase):
             'FROM "orders" "orders" '
             'GROUP BY "orders"."status",'
             'CAST(GET_JSON_OBJECT("orders"."details",\'$.["product"].["category"]\') AS STRING) '
-            'HAVING COUNT("orders"."id")>100'
+            'HAVING CAST(COUNT("orders"."id") AS BIGINT)>100'
         )
         self.assertEqual(str(query), expected_query, f"Expected: {expected_query}, but got: {query}")
 
@@ -888,7 +888,7 @@ class TestSQLGenerator(SimpleTestCase):
             'FROM "users" "users" '
             'JOIN "orders" "orders" ON "users"."id"="orders"."user_id" '
             'LEFT JOIN "products" "products" ON "orders"."order_id"="products"."id" GROUP BY "products"."name" '
-            'HAVING SUM("orders"."price")>100 AND SUM("orders"."price")<500'
+            'HAVING CAST(SUM("orders"."price") AS INT)>100 AND CAST(SUM("orders"."price") AS INT)<500'
         )
         self.assertEqual(str(query), expected_query, f"Expected: {expected_query}, got: {query}")
 
@@ -957,7 +957,7 @@ class TestSQLGenerator(SimpleTestCase):
             'JOIN "orders" "orders" ON "users"."id"="orders"."user_id" '
             'WHERE "users"."country"=\'Ireland\' '
             'GROUP BY "users"."country" '
-            'HAVING SUM("orders"."price")>5'
+            'HAVING CAST(SUM("orders"."price") AS INT)>5'
         )
         self.assertEqual(str(query), expected_query, f"Expected: {expected_query}, got: {query}")
 

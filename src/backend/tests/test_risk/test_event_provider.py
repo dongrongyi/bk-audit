@@ -33,9 +33,9 @@ class TestEventProviderSqlBuilder(TestCase):
 
     # 基础 WHERE 条件（复用）
     BASE_WHERE = (
-        f"WHERE `t`.`strategy_id`={STRATEGY_ID} "
+        f"WHERE CAST(`t`.`strategy_id` AS BIGINT)={STRATEGY_ID} "
         f"AND `t`.`raw_event_id`='{RAW_EVENT_ID}' "
-        f"AND `t`.`dtEventTimeStamp` BETWEEN {START_TIME} AND {END_TIME}"
+        f"AND CAST(`t`.`dtEventTimeStamp` AS BIGINT) BETWEEN {START_TIME} AND {END_TIME}"
     )
 
     def setUp(self):
@@ -697,9 +697,9 @@ class TestRiskEventAggregateSqlBuilder(TestCase):
 
         expected = (
             f"SELECT COUNT(*) `count` FROM {builder.table_name} `t` "
-            f"WHERE `t`.`strategy_id`={builder.strategy_id} "
+            f"WHERE CAST(`t`.`strategy_id` AS BIGINT)={builder.strategy_id} "
             f"AND `t`.`raw_event_id`='{builder.raw_event_id}' "
-            f"AND `t`.`dtEventTimeStamp` BETWEEN {builder.start_time} AND {builder.end_time} "
+            f"AND CAST(`t`.`dtEventTimeStamp` AS BIGINT) BETWEEN {builder.start_time} AND {builder.end_time} "
             f"LIMIT 1"
         )
         self.assertEqual(sql, expected)
