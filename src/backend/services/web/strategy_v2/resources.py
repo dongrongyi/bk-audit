@@ -1401,17 +1401,16 @@ class ToggleStrategy(StrategyV2Base):
         # 更新处理人
         strategy.updated_by = get_request_username()
         strategy.save(update_fields=["updated_by"])
-        if validated_request_data["toggle"]:
-            call_controller(BaseControl.enable.__name__, strategy.strategy_id, controller_cls)
-            # 启停经 celery 异步落库，须显式传入方向同步 BKSEC 自动规则（评审定论：停用策略须禁用自动规则）
-            from services.web.risk.bksec.rules import sync_bksec_rule
-
-            sync_bksec_rule(strategy, strategy_alive=True)
-            return
-        call_controller(BaseControl.disabled.__name__, strategy.strategy_id, controller_cls)
+        # 启停经 celery 异步落库，此刻 strategy.status 仍是旧值，须显式向 sync_bksec_rule 传入方向
+        # （评审定论：停用策略须禁用自动规则）。对称写法确保后续追加逻辑不会漏调同步。
         from services.web.risk.bksec.rules import sync_bksec_rule
 
-        sync_bksec_rule(strategy, strategy_alive=False)
+        if validated_request_data["toggle"]:
+            call_controller(BaseControl.enable.__name__, strategy.strategy_id, controller_cls)
+            sync_bksec_rule(strategy, strategy_alive=True)
+        else:
+            call_controller(BaseControl.disabled.__name__, strategy.strategy_id, controller_cls)
+            sync_bksec_rule(strategy, strategy_alive=False)
 
 
 class RetryStrategy(StrategyV2Base):

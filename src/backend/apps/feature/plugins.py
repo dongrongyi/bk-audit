@@ -95,11 +95,13 @@ class BksecPlugin(BaseFeaturePlugin):
         if self._feature.status == FeatureStatusChoices.DENY.value:
             return FeatureStatusChoices.DENY.value
         # 延迟导入，避免与 services.web.risk.models 形成循环依赖
+        from services.web.risk.bksec.constants import BKSEC_PRESET_PA_NAME
         from services.web.risk.models import ProcessApplication
 
         # 探测必配环境变量与内置套餐（均为运行时真查，避免"开了开关但环境未配齐"的中间态）
+        # BKSEC 内置套餐按名称精确匹配（与 ensure_preset_pa 口径一致），避免与其他 is_builtin 套餐相互影响
         missing_env = [name for name in self.REQUIRED_ENV if not getattr(settings, name, None)]
-        has_preset_pa = ProcessApplication.objects.filter(is_builtin=True).exists()
+        has_preset_pa = ProcessApplication.objects.filter(is_builtin=True, name=str(BKSEC_PRESET_PA_NAME)).exists()
         self._feature.config = {
             "missing_env": missing_env,
             "has_preset_pa": has_preset_pa,

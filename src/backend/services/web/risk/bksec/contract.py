@@ -133,9 +133,16 @@ def _collect_field_mappings(config: BkSecConfig):
     返回 (target_mapping, event_mappings)：
     - target_mapping：key == BKSEC_FIELD_RISK_ASSET 的映射（工单级资产字段，独立走 ${target} 常量）
     - event_mappings：其余 key 非空的映射（风险类型扩展字段桶，写入 ${event_data}）
+
+    注意：operator（BKSEC_FIELD_INITIAL_OWNER）也从 event_mappings 中剔除——
+    它由独立的 ${operator} 常量承担（BKSEC_OPERATOR_TEMPLATE 统一兜底），
+    避免用户在 field_mappings 中配了 operator 却实际未被 ${operator} 消费的双通道歧义。
+    此处仅作用于"写入 event_data 桶"的口径；validate_for_submit 仍对 operator 的模板值做必填校验。
     """
     target_mapping = next((m for m in config.field_mappings if m.key == BKSEC_FIELD_RISK_ASSET), None)
-    event_mappings = [m for m in config.field_mappings if m.key and m.key != BKSEC_FIELD_RISK_ASSET]
+    event_mappings = [
+        m for m in config.field_mappings if m.key and m.key not in (BKSEC_FIELD_RISK_ASSET, BKSEC_FIELD_INITIAL_OWNER)
+    ]
     return target_mapping, event_mappings
 
 
@@ -221,19 +228,11 @@ def build_plugin_constants(config: BkSecConfig, risk: Optional[Risk] = None, tes
 
 def render_event_constant(template_json: str, risk: Optional[Risk] = None) -> str:
     """
-    渲染事件契约常量（AutoProcess 正式发送时调用），返回最终事件 JSON 字符串
+    渲染事件契约常量（AutoProcess 正式发送时调用），返回最终事件 JSON 字符串。
+
+    只做模板渲染，不再对渲染结果做任何 dict 结构改写：
+    - ${event_data} 渲染结果结构为 `{key: value}`（无 fields 外壳），历史上对 fields 的兜底属死代码；
+    - operator 兜底由 ${operator} 常量的 BKSEC_OPERATOR_TEMPLATE 独立承担
+      （空则回落 risk.security_person），此处不再重复处理。
     """
-    rendered = render_value(template_json, build_render_context(risk=risk))
-    # 初始责任人兜底（渲染后仍为空时补安全接口人）——仅事件体(dict)适用；
-    # operator 等其它契约常量渲染结果为 JSON 数组(list)，不在此处理
-    try:
-        payload = json.loads(rendered)
-        if isinstance(payload, dict):
-            fields = payload.get(BKSEC_EVENT_FIELD_FIELDS) or {}
-            if not fields.get(BKSEC_FIELD_INITIAL_OWNER):
-                fields[BKSEC_FIELD_INITIAL_OWNER] = ";".join(load_security_person())
-                payload[BKSEC_EVENT_FIELD_FIELDS] = fields
-                rendered = json.dumps(payload, ensure_ascii=False)
-    except (ValueError, TypeError):
-        logger.exception("[BkSecContract] Rendered payload is not valid json, keep origin")
-    return rendered
+    return render_value(template_json, build_render_context(risk=risk))

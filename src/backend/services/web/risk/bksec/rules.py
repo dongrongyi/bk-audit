@@ -71,15 +71,24 @@ def ensure_preset_pa() -> Optional[ProcessApplication]:
     """
     from django.conf import settings
 
-    pa = ProcessApplication.objects.filter(is_builtin=True).order_by("-id").first()
     template_id = settings.BKSEC_SOPS_TEMPLATE_ID
+    # 已有 BKSEC 内置套餐仅按名称精确匹配，避免混入未来其他 is_builtin 套餐（P4）
+    builtin_lookup = ProcessApplication.objects.filter(is_builtin=True, name=str(BKSEC_PRESET_PA_NAME))
     if not template_id:
-        return pa
+        # 未配置模板 ID：只返回已有 BKSEC 内置套餐（若已存在），不做兜底创建
+        return builtin_lookup.order_by("-id").first()
     try:
         template_id = int(template_id)
     except (TypeError, ValueError):
         logger.exception("[BkSecRule] Invalid BKSEC_SOPS_TEMPLATE_ID: %s", settings.BKSEC_SOPS_TEMPLATE_ID)
-        return pa
+        return builtin_lookup.order_by("-id").first()
+    # 精确匹配：sops_template_id + is_builtin，避免未来其他 is_builtin 套餐引入的干扰（P4）
+    pa = ProcessApplication.objects.filter(is_builtin=True, sops_template_id=template_id).order_by("-id").first()
+    if pa is None:
+        # 环境变量换过模板 ID 时，按预置套餐名称回落自愈已有的 BKSEC 内置套餐（旧模板 ID 记录），
+        # 保持记录连续性（不重复建套餐、既有规则的 pa_id 引用不变）；
+        # 通过 name 精确匹配，避免误命中未来其他 is_builtin 套餐
+        pa = builtin_lookup.order_by("-id").first()
     if pa is None:
         pa = ProcessApplication.objects.create(
             name=str(BKSEC_PRESET_PA_NAME),
@@ -300,8 +309,23 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> tuple:
         ).report()
         return (False, message)
 
+    import json as _json
+    import os as _os
+
     import requests as _requests
 
+    # APIGW 应用鉴权 header（与项目内 BkApiResource / 插件端 _fetch_risk_type_token 一致）：
+    # 走 APIGW 网关时须携带 x-bkapi-authorization，网关据此鉴权；
+    # 避免裸 requests 绕过统一鉴权导致 401/403（P2）
+    headers = {
+        "Content-Type": "application/json",
+        "x-bkapi-authorization": _json.dumps(
+            {
+                "bk_app_code": _os.getenv("BKPAAS_APP_ID", getattr(settings, "APP_CODE", "")),
+                "bk_app_secret": _os.getenv("BKPAAS_APP_SECRET", getattr(settings, "SECRET_KEY", "")),
+            }
+        ),
+    }
     try:
         resp = _requests.post(
             api_url,
@@ -311,7 +335,7 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> tuple:
                 "target_type": config.target_type,
                 "source_type": config.source_type,
             },
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             timeout=10,
         )
         result = resp.json()

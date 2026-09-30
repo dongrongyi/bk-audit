@@ -64,11 +64,7 @@ class BkSecChannel(TicketChannel):
 
     def render_preview(self, channel_config: dict, risk: Optional[Risk]) -> dict:
         config = self.parse_config(channel_config)
-        risk_id = getattr(risk, "risk_id", None)
-        if risk_id:
-            risk = Risk.objects.filter(risk_id=risk_id).first()
-            if risk is None:
-                raise serializers.ValidationError(gettext_lazy("样例风险单不存在：%s") % risk_id)
+        # 样例风险单存在性由 resources 层（PreviewTicket.perform_request）统一校验，此处不再重复查询（P6）
         try:
             payload = build_event_payload(config, risk=risk)
         except Exception as err:  # NOCC:broad-except(预览即时报错，区别于正式发送的失败重试链路)
@@ -102,11 +98,11 @@ class BkSecChannel(TicketChannel):
         risk_id = getattr(risk, "risk_id", "") or ""
         return {
             "ticket_id": "MOCK-{}".format(risk_id),  # 占位：BKSEC 创建工单后生成真实ID
-            "title": "{}（安全工单）".format(risk_data.get("title", "")),  # 占位：BKSEC 按类型+risk_id 生成
+            "title": gettext_lazy("{}（安全工单）").format(risk_data.get("title", "")),  # 占位：BKSEC 按类型+risk_id 生成
             "submit_time": risk_data.get("event_time", ""),  # 近似：以风险首次发现时间占位
-            "deadline": "由 BKSEC 按 SLA 生成（预览占位）",  # 占位：BKSEC 侧 SLA 计算
-            "status": "待 BKSEC 受理",  # 占位：BKSEC 工单状态机初始态
-            "current_operator_org": "由 BKSEC 按责任人解析（预览占位）",  # 占位：BKSEC 按责任人解析组织
+            "deadline": gettext_lazy("由 BKSEC 按 SLA 生成（预览占位）"),  # 占位：BKSEC 侧 SLA 计算
+            "status": gettext_lazy("待 BKSEC 受理"),  # 占位：BKSEC 工单状态机初始态
+            "current_operator_org": gettext_lazy("由 BKSEC 按责任人解析（预览占位）"),  # 占位：BKSEC 按责任人解析组织
         }
 
     def sync_test_config(self, channel_config: dict, risk: Risk) -> None:
@@ -165,9 +161,18 @@ class BkSecChannel(TicketChannel):
     def resolve_failure_hints(self) -> List[Tuple[str, str]]:
         # 已知插件错误特征 → 处置指引（联调实证 2026-09-23）
         return [
-            ("Config matching query does not exist", "插件侧未配置该策略的发单配置（Config 表），请在插件 Admin 为对应 strategy_id 添加后重试"),
-            ("业务或执行人校验失败", "插件白名单未放行：请检查插件环境变量 BKAPP_EXECUTOR / BKAPP_BK_BIZ_ID"),
-            ("Expecting value", "插件参数格式错误：operator 须为 JSON 数组串、event_type/event_data/event_evidence 须为合法 JSON"),
+            (
+                "Config matching query does not exist",
+                gettext_lazy("插件侧未配置该策略的发单配置（Config 表），请在插件 Admin 为对应 strategy_id 添加后重试"),
+            ),
+            (
+                "业务或执行人校验失败",
+                gettext_lazy("插件白名单未放行：请检查插件环境变量 BKAPP_EXECUTOR / BKAPP_BK_BIZ_ID"),
+            ),
+            (
+                "Expecting value",
+                gettext_lazy("插件参数格式错误：operator 须为 JSON 数组串、event_type/event_data/event_evidence 须为合法 JSON"),
+            ),
         ]
 
 
