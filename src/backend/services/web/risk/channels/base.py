@@ -75,6 +75,17 @@ class TicketChannel(abc.ABC):
         """
         raise NotImplementedError
 
+    def sync_test_config(self, channel_config: dict, risk: Risk) -> None:
+        """
+        测试发送前置：兜底同步下游侧配置（如 BKSEC 同步插件侧 Config）。
+
+        默认空实现——仅 BKSEC 这类"下游异步执行阶段才读取自身配置"的通道需要。
+        需要此能力的通道应覆盖本方法：在测试发送前主动把本次 channel_config 同步到下游，
+        确保下游侧配置与本次入参一致（后续改配置再测，直接更新同一主键的配置即可）。
+        同步失败抛 serializers.ValidationError 直接阻断测试发送。
+        """
+        return None
+
     @abc.abstractmethod
     def get_preset_pa_template_id(self) -> Optional[str]:
         """

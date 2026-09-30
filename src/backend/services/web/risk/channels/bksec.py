@@ -87,6 +87,33 @@ class BkSecChannel(TicketChannel):
             "warnings": warnings,
         }
 
+    def sync_test_config(self, channel_config: dict, risk: Risk) -> None:
+        """
+        测试发送前置：兜底同步插件侧 Config。
+
+        测试发送直接走 SOPS 真实通道，插件执行阶段才读取其侧 Config（按 strategy_id 复用）。
+        若用户未保存策略（或上次保存后改过配置）就直接测试，插件侧可能尚无对应 Config，
+        导致任务异步执行时静默失败。故在发送前主动同步一次，确保插件侧 Config 与本次入参一致；
+        后续若再次修改配置重新测试，直接更新同一 strategy_id 的 Config 即可。
+
+        同步失败（接口不可达 / 插件拒绝）直接阻断测试发送并给出可操作提示，
+        而非等到异步执行阶段才暴露。
+        """
+        config = self.parse_config(channel_config)
+        try:
+            config.validate_for_submit()
+        except ValueError as err:
+            raise serializers.ValidationError(gettext_lazy("BKSEC 配置不合法：%s") % err)
+        if not risk.strategy_id:
+            raise serializers.ValidationError(gettext_lazy("样例风险单未关联策略（strategy_id 为空），无法同步插件配置，请选择已绑定策略的风险单进行测试"))
+        from services.web.risk.bksec.rules import sync_plugin_config
+        from services.web.strategy_v2.models import Strategy
+
+        strategy = Strategy(strategy_id=risk.strategy_id)
+        success, message = sync_plugin_config(strategy, config)
+        if not success:
+            raise serializers.ValidationError(gettext_lazy("测试前插件配置同步失败，无法发送测试工单：%s") % message)
+
     def render_test_constants(self, channel_config: dict, risk: Risk, test_receivers: List[str]) -> dict:
         config = self.parse_config(channel_config)
         try:

@@ -107,6 +107,30 @@ def _wrap_json_escape(template_value: str) -> str:
     return re.sub(r"\{\{(.+?)\}\}", r"{{\1 | json_escape}}", template_value)
 
 
+def _collect_field_mappings(config: BkSecConfig):
+    """
+    从字段映射中拆出 target 与其它扩展字段（测试/正式共用同一拆分口径，避免两处重复遍历）。
+
+    返回 (target_mapping, event_mappings)：
+    - target_mapping：key == BKSEC_FIELD_RISK_ASSET 的映射（工单级资产字段，独立走 ${target} 常量）
+    - event_mappings：其余 key 非空的映射（风险类型扩展字段桶，写入 ${event_data}）
+    """
+    target_mapping = next((m for m in config.field_mappings if m.key == BKSEC_FIELD_RISK_ASSET), None)
+    event_mappings = [m for m in config.field_mappings if m.key and m.key != BKSEC_FIELD_RISK_ASSET]
+    return target_mapping, event_mappings
+
+
+def _resolve_initial_owner(fields: dict, test_operator: str = "") -> str:
+    """
+    初始责任人兜底（测试/正式共用同一规则，避免两处语义漂移）：
+    - 测试发送且指定 test_operator → 以测试接收人覆盖（E3 客户端侧隔离，测试单只发给测试接收人）
+    - 否则字段为空 → 兜底安全接口人（决策 D4）
+    """
+    if test_operator:
+        return test_operator
+    return fields.get(BKSEC_FIELD_INITIAL_OWNER) or ";".join(load_security_person())
+
+
 def build_pa_params(config: BkSecConfig) -> dict:
     """
     生成自动创建处理规则的 pa_params（字段级契约，对接 SOPS 插件「审计中心WeSec发单」入参）
@@ -122,8 +146,8 @@ def build_pa_params(config: BkSecConfig) -> dict:
     params = {param: {"field": field, "value": ""} for param, field in BKSEC_PLUGIN_STANDARD_FIELDS.items()}
     params[BKSEC_PARAM_EVENT_TYPE] = {"field": "", "value": config.risk_type_id}
     # target（风险资产信息）为工单级字段，从 field_mappings 拆出单独走 ${target} 标准常量，
-    # 不再混入 event_data（风险类型扩展字段桶）
-    target_mapping = next((m for m in config.field_mappings if m.key == BKSEC_FIELD_RISK_ASSET), None)
+    # 不再混入 event_data（风险类型扩展字段桶）——拆分口径由 _collect_field_mappings 统一
+    target_mapping, event_mappings = _collect_field_mappings(config)
     params[BKSEC_PARAM_TARGET] = {
         "field": "",
         "value": _wrap_json_escape(target_mapping.value) if target_mapping else "",
@@ -131,11 +155,7 @@ def build_pa_params(config: BkSecConfig) -> dict:
     params[BKSEC_PARAM_EVENT_DATA] = {
         "field": "",
         "value": json.dumps(
-            {
-                m.key: _wrap_json_escape(m.value)
-                for m in config.field_mappings
-                if m.key and m.key != BKSEC_FIELD_RISK_ASSET
-            },
+            {m.key: _wrap_json_escape(m.value) for m in event_mappings},
             ensure_ascii=False,
         ),
     }
@@ -149,7 +169,8 @@ def build_plugin_constants(config: BkSecConfig, risk: Optional[Risk] = None, tes
     """
     构造插件的最终入参常量（测试发送/预览用；正式发送走 pa_params → AutoProcess 同构渲染）
 
-    返回与 SOPS create_task(constants) 直接对接的字段级常量。
+    字段集合、target 拆分、初始责任人兜底与 build_pa_params 共用同一内核
+    （_collect_field_mappings / _resolve_initial_owner），保证两端契约同构、新增字段只改一处。
     """
     context = build_render_context(risk=risk)
     constants: dict = {}
@@ -163,22 +184,11 @@ def build_plugin_constants(config: BkSecConfig, risk: Optional[Risk] = None, tes
         constants[param] = value
     # BKSEC 风险类型（P1）
     constants[BKSEC_PARAM_EVENT_TYPE] = config.risk_type_id
-    # 动态字段：渲染 field_mappings（测试发送覆盖初始责任人，空值兜底安全接口人）
-    fields = {}
-    target_value = ""
-    for mapping in config.field_mappings:
-        if not mapping.key:
-            continue
-        if mapping.key == BKSEC_FIELD_RISK_ASSET:
-            # target（风险资产信息）走独立 ${target} 标准常量，不混入 event_data 桶
-            target_value = render_value(mapping.value, context)
-            continue
-        fields[mapping.key] = render_value(mapping.value, context)
-    if test_operator:
-        fields[BKSEC_FIELD_INITIAL_OWNER] = test_operator
-    elif not fields.get(BKSEC_FIELD_INITIAL_OWNER):
-        fields[BKSEC_FIELD_INITIAL_OWNER] = ";".join(load_security_person())
-    constants[BKSEC_PARAM_TARGET] = target_value
+    # 动态字段：复用同一拆分内核（与正式 pa_params 口径一致）
+    target_mapping, event_mappings = _collect_field_mappings(config)
+    fields = {m.key: render_value(m.value, context) for m in event_mappings}
+    fields[BKSEC_FIELD_INITIAL_OWNER] = _resolve_initial_owner(fields, test_operator)
+    constants[BKSEC_PARAM_TARGET] = render_value(target_mapping.value, context) if target_mapping else ""
     constants[BKSEC_PARAM_EVENT_DATA] = json.dumps(fields, ensure_ascii=False)
     # 责任人（D4 兜底）：模板经 tojson 自足产出数组串，满足插件 json.loads 契约
     constants[BKSEC_PARAM_OPERATOR] = render_value(BKSEC_OPERATOR_TEMPLATE, context)

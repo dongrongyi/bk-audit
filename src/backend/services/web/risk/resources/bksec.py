@@ -93,8 +93,9 @@ class RetrieveBkSecRiskType(BkSecResourceMeta):
 
         from apps.feature.handlers import FeatureHandler
 
+        # 与列表接口一致：feature 未启用时优雅降级，返回空详情（避免前端已持有 risk_type_id 时误报 400）
         if not FeatureHandler("bksec").check():
-            raise serializers.ValidationError(gettext_lazy("BKSEC 功能未启用或环境未就绪，无法查询风险类型详情"))
+            return {}
         cache_key = BKSEC_RISK_TYPE_CACHE_KEY.format(risk_type_id=validated_request_data["risk_type_id"])
         detail = cache.get(cache_key)
         if detail is None:
@@ -155,15 +156,19 @@ class SendTestTicket(BkSecResourceMeta):
         risk = get_object_or_404(Risk, risk_id=validated_request_data["risk_id"])
         # 通道前置守卫（如 BKSEC 的回调隔离）
         ch.validate_test_target(risk)
+        # 测试发送前置：兜底同步插件侧 Config（未保存即测试 / 配置已变更时，确保插件侧与本次入参一致）
+        ch.sync_test_config(validated_request_data["channel_config"], risk)
         # 渲染插件入参常量
         constants = ch.render_test_constants(
             validated_request_data["channel_config"], risk, validated_request_data["test_receivers"]
         )
-        # 确保预置套餐就绪（依赖通道提供的模板 ID 环境变量）
+        # 确保预置套餐就绪（依赖通道提供的模板 ID 环境变量；复用正式路径的套餐自愈逻辑）
         template_id = ch.get_preset_pa_template_id()
         if not template_id:
             raise serializers.ValidationError(gettext_lazy("预置发单套餐未就绪（未配置套餐模板 ID），无法发送测试工单"))
-        pa = self._ensure_preset_pa(template_id)
+        from services.web.risk.bksec.rules import ensure_preset_pa
+
+        pa = ensure_preset_pa()
         if pa is None:
             raise serializers.ValidationError(gettext_lazy("预置发单套餐未就绪，无法发送测试工单"))
         # 经预置套餐模板创建并启动测试任务（与正式发送同一通道、同一入参结构）。
@@ -187,42 +192,6 @@ class SendTestTicket(BkSecResourceMeta):
             risk.risk_id,
         )
         return {"task": result, "constants": constants}
-
-    @staticmethod
-    def _ensure_preset_pa(template_id):
-        """
-        获取/自愈预置发单套餐（通用层，仅按模板 ID 维护内置套餐；
-        通道专属的模板 ID 由 channel.get_preset_pa_template_id 提供）
-        """
-        from services.web.risk.bksec.constants import (
-            BKSEC_PRESET_PA_DESCRIPTION,
-            BKSEC_PRESET_PA_NAME,
-        )
-        from services.web.risk.models import ProcessApplication
-
-        pa = ProcessApplication.objects.filter(is_builtin=True).order_by("-id").first()
-        try:
-            template_id = int(template_id)
-        except (TypeError, ValueError):
-            logger.exception("[SendTestTicket] Invalid preset pa template_id: %s", template_id)
-            return pa
-        if pa is None:
-            pa = ProcessApplication.objects.create(
-                name=str(BKSEC_PRESET_PA_NAME),
-                sops_template_id=template_id,
-                need_approve=False,
-                description=str(BKSEC_PRESET_PA_DESCRIPTION),
-                is_enabled=True,
-                is_builtin=True,
-            )
-            logger.info("[SendTestTicket] Preset process application created, id=%s template=%s", pa.id, template_id)
-            return pa
-        if pa.sops_template_id != template_id or not pa.is_enabled:
-            pa.sops_template_id = template_id
-            pa.need_approve = False
-            pa.is_enabled = True
-            pa.save(update_fields=["sops_template_id", "need_approve", "is_enabled"])
-        return pa
 
 
 class GetTaskStatus(BkSecResourceMeta):
