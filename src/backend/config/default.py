@@ -356,6 +356,9 @@ FEATURE_TOGGLE = {
     "storage_edit": os.getenv("BKAPP_FEATURE_STORAGE_EDIT", "deny"),
     "enable_doris": os.getenv("BKAPP_FEATURE_ENABLE_DORIS", "on"),
     "check_bkvision_share_permission": os.getenv("BKAPP_FEATURE_CHECK_BKVISION_SHARE_PERMISSION", "on"),
+    # BKSEC 安全工单：默认关闭（社区版/未对接 BKSEC 的环境自动隐藏）。
+    # 设为非 deny（如 available）时，仍须通过 BksecPlugin 的能力校验（必配环境变量 + 内置发单套餐）才视为可用。
+    "bksec": os.getenv("BKAPP_FEATURE_BKSEC", "deny"),
 }
 
 # BkLog

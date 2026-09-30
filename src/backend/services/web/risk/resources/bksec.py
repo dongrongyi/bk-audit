@@ -59,6 +59,10 @@ class ListBkSecRiskTypes(BkSecResourceMeta):
         is_formal = serializers.CharField(label=gettext_lazy("是否正式"), required=False, allow_blank=True)
 
     def perform_request(self, validated_request_data):
+        from apps.feature.handlers import FeatureHandler
+
+        if not FeatureHandler("bksec").check():
+            return []
         if not settings.BKSEC_PROJECT_ID:
             raise serializers.ValidationError(gettext_lazy("未配置 BKSEC 项目（BKAPP_BKSEC_PROJECT_ID），无法查询风险类型"))
         params = {
@@ -87,6 +91,10 @@ class RetrieveBkSecRiskType(BkSecResourceMeta):
     def perform_request(self, validated_request_data):
         from django.core.cache import cache
 
+        from apps.feature.handlers import FeatureHandler
+
+        if not FeatureHandler("bksec").check():
+            raise serializers.ValidationError(gettext_lazy("BKSEC 功能未启用或环境未就绪，无法查询风险类型详情"))
         cache_key = BKSEC_RISK_TYPE_CACHE_KEY.format(risk_type_id=validated_request_data["risk_type_id"])
         detail = cache.get(cache_key)
         if detail is None:

@@ -19,6 +19,7 @@ to the current version of the project delivered to anyone in the future.
 import abc
 
 from bk_resource import api
+from django.conf import settings
 from django.utils.translation import gettext
 
 from apps.feature.constants import FeatureStatusChoices
@@ -69,3 +70,40 @@ class BklogOtlpPlugin(BaseFeaturePlugin):
         self._feature.config = config
         # 响应状态
         return self._feature.status
+
+
+class BksecPlugin(BaseFeaturePlugin):
+    """
+    BKSEC 安全工单特性插件
+
+    特性开启需同时满足：
+      1. 部署层总开关已开（feature.status != deny，由环境变量 BKAPP_FEATURE_BKSEC 控制，默认 deny）；
+      2. 必配环境变量齐全：BK_SEC_API_URL（BKSEC API 可达）、BKSEC_PROJECT_ID（风险类型下拉维度）、
+         BKSEC_SOPS_TEMPLATE_ID（预置发单套餐模板）；
+      3. 已存在内置处理套餐（ProcessApplication.is_builtin=True），即发单能力就绪。
+
+    仅当三者全部满足时状态置 available，否则置 deny，并把缺失项写回 config 供前端/运维排查。
+    注意：内置套餐由 ensure_preset_pa 在保存策略时按 BKSEC_SOPS_TEMPLATE_ID 自动创建，
+    故条件 2 满足后，首次保存策略即会补齐条件 3，开关随之自动可用。
+    """
+
+    # 必配环境变量（与 config.default 中 BKSEC 段一致；BKSEC_PLUGIN_CONFIG_API_URL 可降级，不列为必配）
+    REQUIRED_ENV = ("BK_SEC_API_URL", "BKSEC_PROJECT_ID", "BKSEC_SOPS_TEMPLATE_ID")
+
+    def _update_status(self):
+        # 部署层总开关关闭 → 直接 deny（社区版无需再做环境/套餐探测）
+        if self._feature.status == FeatureStatusChoices.DENY.value:
+            return FeatureStatusChoices.DENY.value
+        # 延迟导入，避免与 services.web.risk.models 形成循环依赖
+        from services.web.risk.models import ProcessApplication
+
+        # 探测必配环境变量与内置套餐（均为运行时真查，避免"开了开关但环境未配齐"的中间态）
+        missing_env = [name for name in self.REQUIRED_ENV if not getattr(settings, name, None)]
+        has_preset_pa = ProcessApplication.objects.filter(is_builtin=True).exists()
+        self._feature.config = {
+            "missing_env": missing_env,
+            "has_preset_pa": has_preset_pa,
+        }
+        if missing_env or not has_preset_pa:
+            return FeatureStatusChoices.DENY.value
+        return FeatureStatusChoices.AVAILABLE.value

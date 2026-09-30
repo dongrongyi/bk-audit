@@ -23,6 +23,7 @@ from django.conf import settings
 from django.utils.translation import gettext_lazy
 from rest_framework import serializers
 
+from apps.feature.handlers import FeatureHandler
 from services.web.risk.bksec.config import BkSecConfig
 from services.web.risk.bksec.constants import BKSEC_FIELD_INITIAL_OWNER
 from services.web.risk.bksec.contract import build_event_payload, build_plugin_constants
@@ -43,7 +44,19 @@ class BkSecChannel(TicketChannel):
 
     channel_type = "bk_sec"
 
+    @staticmethod
+    def _ensure_enabled() -> None:
+        """
+        后端 feature 硬拦截：BKSEC 未启用（开关关 / 必配环境变量缺失 / 内置套餐未就绪）时，
+        阻断一切配置解析、预览、测试发送，防止前端隐藏后仍被 API 直接调用。
+        """
+        if not FeatureHandler("bksec").check():
+            raise serializers.ValidationError(
+                gettext_lazy("BKSEC 功能未启用或环境未就绪（请确认 BKAPP_FEATURE_BKSEC 开关、必配环境变量与内置发单套餐）")
+            )
+
     def parse_config(self, channel_config: dict) -> BkSecConfig:
+        self._ensure_enabled()
         try:
             return BkSecConfig.model_validate(channel_config)
         except ValueError as err:
