@@ -52,6 +52,7 @@ class BkSecConfig(BaseModel):
     risk_type_id: str = Field("", description="BKSEC 风险类型 ID")
     risk_type_name: str = Field("", description="BKSEC 风险类型名称")
     target_type: str = Field("", description="BKSEC 目标资产类型（上报方自定义，如 tencentcloud_sub_user）")
+    source_type: str = Field("bk-audit", description="BKSEC 数据源类型（由审计侧赋值，暂固定 bk-audit）")
     field_mappings: List[BkSecFieldMapping] = Field(default_factory=list, description="字段映射列表")
 
     @field_validator("field_mappings")

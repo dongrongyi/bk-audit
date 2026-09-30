@@ -35,6 +35,7 @@ from django.utils.translation import gettext_lazy
 BKSEC_PARAM_EVENT_TYPE = "${event_type}"
 BKSEC_PARAM_EVENT_DATA = "${event_data}"
 BKSEC_PARAM_OPERATOR = "${operator}"
+BKSEC_PARAM_TARGET = "${target}"
 BKSEC_PARAM_ACTION = "${action}"
 BKSEC_PARAM_ONCE_TASK = "${once_task}"
 # - action：插件提交事件后获取 BKSEC 工单结果的方式
@@ -60,6 +61,7 @@ BKSEC_PLUGIN_STANDARD_FIELDS = {
     "${event_source}": "event_source",
     "${strategy_id}": "strategy_id",
     "${raw_event_id}": "raw_event_id",
+    "${target}": "target",
 }
 # operator 兜底模板（D4：无责任人时取安全接口人）。
 # 契约依据（插件源码实证 2026-09-23）：插件对 ${operator} 执行 ",".join(json.loads(x))——

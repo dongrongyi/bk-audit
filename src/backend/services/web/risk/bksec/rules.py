@@ -309,6 +309,7 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> tuple:
                 "strategy_id": str(strategy.strategy_id),
                 "risk_type_id": config.risk_type_id,
                 "target_type": config.target_type,
+                "source_type": config.source_type,
             },
             headers={"Content-Type": "application/json"},
             timeout=10,
