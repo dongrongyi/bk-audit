@@ -85,7 +85,7 @@ class TestListPAExecutionRecords:
         pa_a, pa_b, risk_a, risk_b = self._prepare()
         _create_node(risk_a.risk_id, SOPSTaskStatus.FINISHED.value, task_id=11)
         _create_node(risk_b.risk_id, SOPSTaskStatus.RUNNING.value, task_id=22)
-        resp = resource.risk.list_pa_execution_records.perform_request({"id": pa_a.id})
+        resp = resource.risk.list_pa_execution_records.perform_request({"pa_id": pa_a.id})
         records = resp["results"]
         assert resp["count"] == 1
         assert len(records) == 1

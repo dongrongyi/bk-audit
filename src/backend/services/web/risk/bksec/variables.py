@@ -240,32 +240,16 @@ def build_render_context(risk: Optional[Risk] = None, events: Optional[List[dict
     return context
 
 
-def _normalize_risk_type(item: dict) -> dict:
+def _extract_risk_access_fields(item: dict) -> list:
     """
-    归一化 BKSEC 风险类型列表项（策略页下拉用）
+    从风险类型对象中抽取工单字段 schema（risk_access_fields）
 
-    risk_access_list 的 results 条目字段较杂，这里只抽取下拉所需的最小字段，
-    缺字段时给默认值，避免前端渲染抖动。
+    列表项的 results 与详情接口的返回结构一致，均内嵌 risk_access_fields，
+    因此列表接口直接复用此抽取逻辑即可返回 schema，无需再调一次详情接口。
     """
     if not isinstance(item, dict):
-        return {}
-    return {
-        "risk_type_id": str(item.get("id", "")),
-        "risk_type_name": item.get("name", "") or item.get("risk_type_name", ""),
-        "is_formal": bool(item.get("is_formal", False)),
-    }
-
-
-def _normalize_risk_type_detail(detail: dict) -> dict:
-    """
-    归一化 BKSEC 风险类型详情（字段 schema 表单用）
-
-    详情含 risk_access_fields——工单字段 schema（key/name/...），
-    抽取为前端动态表单渲染所需的扁平结构；其余字段容错降级。
-    """
-    if not isinstance(detail, dict):
-        return {"risk_type_id": "", "risk_type_name": "", "fields": []}
-    raw_fields = detail.get("risk_access_fields") or detail.get("fields") or []
+        return []
+    raw_fields = item.get("risk_access_fields") or item.get("fields") or []
     fields = []
     if isinstance(raw_fields, list):
         for f in raw_fields:
@@ -279,8 +263,22 @@ def _normalize_risk_type_detail(detail: dict) -> dict:
                     "type": f.get("type", ""),
                 }
             )
+    return fields
+
+
+def _normalize_risk_type(item: dict) -> dict:
+    """
+    归一化 BKSEC 风险类型列表项（策略页下拉 + 字段 schema 表单用）
+
+    risk_access_list 的 results 条目本身即内嵌 risk_access_fields（字段 schema），
+    这里一并抽取，前端选完类型后直接读本地的 fields 渲染映射表单，
+    不再需要二次调用详情接口。缺字段时给默认值，避免前端渲染抖动。
+    """
+    if not isinstance(item, dict):
+        return {}
     return {
-        "risk_type_id": str(detail.get("id", "")),
-        "risk_type_name": detail.get("name", "") or detail.get("risk_type_name", ""),
-        "fields": fields,
+        "risk_type_id": str(item.get("id", "")),
+        "risk_type_name": item.get("name", "") or item.get("risk_type_name", ""),
+        "is_formal": bool(item.get("is_formal", False)),
+        "fields": _extract_risk_access_fields(item),
     }

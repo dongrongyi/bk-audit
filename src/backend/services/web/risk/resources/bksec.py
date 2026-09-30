@@ -27,14 +27,7 @@ from django.utils.translation import gettext_lazy
 from rest_framework import serializers
 
 from apps.sops.constants import SOPSTaskStatus
-from services.web.risk.bksec.constants import (
-    BKSEC_CACHE_TIMEOUT,
-    BKSEC_RISK_TYPE_CACHE_KEY,
-)
-from services.web.risk.bksec.variables import (
-    _normalize_risk_type,
-    _normalize_risk_type_detail,
-)
+from services.web.risk.bksec.variables import _normalize_risk_type
 from services.web.risk.channels.base import ChannelRegistry
 from services.web.risk.models import Risk
 
@@ -76,33 +69,6 @@ class ListBkSecRiskTypes(BkSecResourceMeta):
         result = api.bk_sec.risk_access_list(**params)
         items = result.get("results", []) or []
         return [_normalize_risk_type(item) for item in items if isinstance(item, dict)]
-
-
-class RetrieveBkSecRiskType(BkSecResourceMeta):
-    """
-    查询 BKSEC 风险类型详情（含工单字段 schema）
-    """
-
-    name = gettext_lazy("查询BKSEC风险类型详情")
-
-    class RequestSerializer(serializers.Serializer):
-        risk_type_id = serializers.CharField(label=gettext_lazy("风险类型ID"), required=True)
-
-    def perform_request(self, validated_request_data):
-        from django.core.cache import cache
-
-        from apps.feature.handlers import FeatureHandler
-
-        # 与列表接口一致：feature 未启用时优雅降级，返回空详情（避免前端已持有 risk_type_id 时误报 400）
-        if not FeatureHandler("bksec").check():
-            return {}
-        cache_key = BKSEC_RISK_TYPE_CACHE_KEY.format(risk_type_id=validated_request_data["risk_type_id"])
-        detail = cache.get(cache_key)
-        if detail is None:
-            detail = api.bk_sec.risk_access_retrieve(id=validated_request_data["risk_type_id"])
-            detail = _normalize_risk_type_detail(detail or {})
-            cache.set(cache_key, detail, timeout=BKSEC_CACHE_TIMEOUT)
-        return detail
 
 
 class PreviewTicket(BkSecResourceMeta):

@@ -234,7 +234,7 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
         return None
 
     class RequestSerializer(serializers.Serializer):
-        id = serializers.IntegerField(label=gettext_lazy("套餐ID"), required=False, allow_null=True)
+        pa_id = serializers.IntegerField(label=gettext_lazy("套餐ID"), required=False, allow_null=True)
         risk_id = serializers.CharField(label=gettext_lazy("风险ID"), required=False, allow_blank=True, allow_null=True)
         scene_id = serializers.IntegerField(label=gettext_lazy("场景ID"), required=False, allow_null=True)
         page = serializers.IntegerField(label=gettext_lazy("页码"), required=False, min_value=1, default=1)
@@ -243,7 +243,7 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
         )
 
     def perform_request(self, validated_request_data):
-        pa_id = validated_request_data.get("id")
+        pa_id = validated_request_data.get("pa_id")
         risk_id = validated_request_data.get("risk_id")
         scene_id = validated_request_data.get("scene_id")
         page = validated_request_data.get("page", 1)

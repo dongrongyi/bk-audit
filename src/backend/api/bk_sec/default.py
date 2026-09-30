@@ -43,17 +43,8 @@ class BKSec(BkApiResource, abc.ABC):
 
 
 class RiskAccessList(BKSec):
-    """查询风险类型列表"""
+    """查询风险类型列表（内嵌 risk_access_fields 字段 schema，无需再调详情接口）"""
 
     name = "查询风险类型列表"
     method = "GET"
     action = "/api/v1/risk/risk_access/"
-
-
-class RiskAccessRetrieve(BKSec):
-    """查询风险类型详情（含事件字段 schema：risk_access_fields）"""
-
-    name = "查询风险类型详情"
-    method = "GET"
-    action = "/api/v1/risk/risk_access/{id}/"
-    url_keys = ["id"]

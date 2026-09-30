@@ -491,7 +491,6 @@ class BkSecViewSet(ResourceViewSet):
 
     resource_routes = [
         ResourceRoute("GET", resource.risk.list_bk_sec_risk_types, endpoint="risk_types"),
-        ResourceRoute("POST", resource.risk.retrieve_bk_sec_risk_type, endpoint="risk_type_detail"),
         ResourceRoute("POST", resource.risk.preview_ticket, endpoint="preview"),
         ResourceRoute("POST", resource.risk.send_test_ticket, endpoint="test_send"),
         ResourceRoute("GET", resource.risk.get_task_status, endpoint="test_task_status"),

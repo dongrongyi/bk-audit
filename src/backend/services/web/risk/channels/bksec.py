@@ -77,14 +77,36 @@ class BkSecChannel(TicketChannel):
         warnings = []
         if risk is not None and not (payload.get("fields", {}).get(BKSEC_FIELD_INITIAL_OWNER) or "").strip():
             warnings.append(gettext_lazy("初始责任人为空（该风险单无责任人且未配置安全接口人兜底），工单可能被 BKSEC 拒收，" "请到系统配置设置安全接口人或调整映射"))
+        # 工单头（BKSEC 侧生成，发单前不存在）：后端 mock 占位，仅用于前端预览工单外观，
+        # 非审计中心上报内容、不进入真实报文。发单后由 BKSEC 生成真实值。
+        ticket_header = self._build_mock_ticket_header(risk, risk_data)
         return {
             "risk_type_id": config.risk_type_id,
             "risk_type_name": config.risk_type_name,
             "has_sample_risk": risk is not None,
             "ticket": payload,
+            "ticket_header": ticket_header,
             "risk": risk_data,
             "risk_context_keys": list(risk_data.keys()),
             "warnings": warnings,
+        }
+
+    @staticmethod
+    def _build_mock_ticket_header(risk: Optional[Risk], risk_data: dict) -> dict:
+        """
+        后端 mock 的 BKSEC 工单头占位（发单前这些字段尚不存在，由 BKSEC 侧生成）。
+
+        仅取审计中心已有的 risk 真实数据做尽量贴近的占位；纯 BKSEC 产物（工单ID/状态/截止时间/
+        责任人组织）用明确标注的占位文案，避免前端误以为这是真实上报值。
+        """
+        risk_id = getattr(risk, "risk_id", "") or ""
+        return {
+            "ticket_id": "MOCK-{}".format(risk_id),  # 占位：BKSEC 创建工单后生成真实ID
+            "title": "{}（安全工单）".format(risk_data.get("title", "")),  # 占位：BKSEC 按类型+risk_id 生成
+            "submit_time": risk_data.get("event_time", ""),  # 近似：以风险首次发现时间占位
+            "deadline": "由 BKSEC 按 SLA 生成（预览占位）",  # 占位：BKSEC 侧 SLA 计算
+            "status": "待 BKSEC 受理",  # 占位：BKSEC 工单状态机初始态
+            "current_operator_org": "由 BKSEC 按责任人解析（预览占位）",  # 占位：BKSEC 按责任人解析组织
         }
 
     def sync_test_config(self, channel_config: dict, risk: Risk) -> None:

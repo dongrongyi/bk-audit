@@ -51,6 +51,7 @@ from services.web.risk.bksec.renderer import render_value
 from services.web.risk.bksec.variables import (
     TIME_DISPLAY_FORMAT,
     build_render_context,
+    build_risk_data,
     load_security_person,
 )
 from services.web.risk.models import Risk
@@ -90,6 +91,24 @@ def build_event_payload(
     }
     if risk is not None:
         payload[BKSEC_EVENT_FIELD_RISK_ID] = risk.risk_id
+        # B 类风险属性：与正式发单链路（BKSEC_PLUGIN_STANDARD_FIELDS）对齐，
+        # 直接复用 build_risk_data 已暴露的真实风险变量，保证预览报文与真实上报结构一致。
+        # 仅作预览展示用，不进入 BKSEC 事件体的 fields 桶（fields 只放风险类型字段）。
+        risk_data = build_risk_data(risk)
+        payload["risk_attribute"] = {
+            "title": risk_data.get("title", ""),
+            "risk_level": risk_data.get("risk_level", ""),
+            "event_content": risk_data.get("event_content", ""),
+            "risk_guidance": risk_data.get("risk_guidance", ""),
+            "event_time": risk_data.get("event_time", ""),
+            "event_source": risk_data.get("event_source", ""),
+            "strategy_id": risk_data.get("strategy_id", ""),
+            "strategy_name": risk_data.get("strategy_name", ""),
+            "raw_event_id": risk_data.get("raw_event_id", ""),
+            "operator": risk_data.get("operator", ""),
+            "current_operator": risk_data.get("current_operator", ""),
+            "notice_users": risk_data.get("notice_users", ""),
+        }
     if test_operator:
         payload[BKSEC_EVENT_FIELD_IS_TEST] = True
         payload[BKSEC_EVENT_FIELD_TEST_OPERATOR] = test_operator
