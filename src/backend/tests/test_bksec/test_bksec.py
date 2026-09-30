@@ -288,8 +288,8 @@ class TestBkSecResources:
     def test_preview_ticket(self):
         config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
         with RiskContext() as risk:
-            result = resource.risk.preview_bk_sec_ticket.perform_request(
-                {"bksec_config": config.model_dump(), "risk_id": risk.risk_id}
+            result = resource.risk.preview_ticket.perform_request(
+                {"channel": "bk_sec", "channel_config": config.model_dump(), "risk_id": risk.risk_id}
             )
         assert result["has_sample_risk"] is True
         assert result["ticket"]["fields"]["operator"] == "admin"
@@ -308,8 +308,13 @@ class TestBkSecResources:
             ) as create_task, mock.patch(
                 "services.web.risk.resources.bksec.api.bk_sops.start_task", mock.Mock(return_value=None)
             ) as start_task:
-                result = resource.risk.send_bk_sec_test_ticket.perform_request(
-                    {"bksec_config": config.model_dump(), "test_operator": "tester", "risk_id": risk.risk_id}
+                result = resource.risk.send_test_ticket.perform_request(
+                    {
+                        "channel": "bk_sec",
+                        "channel_config": config.model_dump(),
+                        "test_receivers": ["tester"],
+                        "risk_id": risk.risk_id,
+                    }
                 )
         assert result["task"]["task_id"] == SOPS_FLOW_INFO["task_id"]
         start_task.assert_called_once()
@@ -345,8 +350,13 @@ class TestBkSecResources:
             )
             with mock.patch("services.web.risk.resources.bksec.api.bk_sops.create_task") as create_task:
                 with pytest.raises(Exception) as err:
-                    resource.risk.send_bk_sec_test_ticket.perform_request(
-                        {"bksec_config": config.model_dump(), "test_operator": "tester", "risk_id": risk.risk_id}
+                    resource.risk.send_test_ticket.perform_request(
+                        {
+                            "channel": "bk_sec",
+                            "channel_config": config.model_dump(),
+                            "test_receivers": ["tester"],
+                            "risk_id": risk.risk_id,
+                        }
                     )
             create_task.assert_not_called()
             assert "正式派单" in str(err.value.args)
@@ -371,14 +381,14 @@ class TestBkSecResources:
             "services.web.risk.resources.bksec.api.bk_sops.get_node_data",
             mock.Mock(side_effect=Exception("boom")),
         ):
-            result = resource.risk.get_bk_sec_test_task_status.perform_request({"task_id": "1"})
-        assert result["failure_hint"] == resource.risk.get_bk_sec_test_task_status.GENERIC_HINT
+            result = resource.risk.get_task_status.perform_request({"task_id": "1", "channel": "bk_sec"})
+        assert result["failure_hint"] == resource.risk.get_task_status.GENERIC_HINT
         # 成功状态不附带提示
         with mock.patch(
             "services.web.risk.resources.bksec.api.bk_sops.get_task_status",
             mock.Mock(return_value={"state": "FINISHED"}),
         ):
-            result = resource.risk.get_bk_sec_test_task_status.perform_request({"task_id": "1"})
+            result = resource.risk.get_task_status.perform_request({"task_id": "1", "channel": "bk_sec"})
         assert "failure_hint" not in result
 
     def test_operator_template_empty_value_renders_valid_json_array(self):

@@ -238,3 +238,49 @@ def build_render_context(risk: Optional[Risk] = None, events: Optional[List[dict
     }
     context.update(AGGREGATION_FUNCTIONS)
     return context
+
+
+def _normalize_risk_type(item: dict) -> dict:
+    """
+    归一化 BKSEC 风险类型列表项（策略页下拉用）
+
+    risk_access_list 的 results 条目字段较杂，这里只抽取下拉所需的最小字段，
+    缺字段时给默认值，避免前端渲染抖动。
+    """
+    if not isinstance(item, dict):
+        return {}
+    return {
+        "risk_type_id": str(item.get("id", "")),
+        "risk_type_name": item.get("name", "") or item.get("risk_type_name", ""),
+        "is_formal": bool(item.get("is_formal", False)),
+    }
+
+
+def _normalize_risk_type_detail(detail: dict) -> dict:
+    """
+    归一化 BKSEC 风险类型详情（字段 schema 表单用）
+
+    详情含 risk_access_fields——工单字段 schema（key/name/...），
+    抽取为前端动态表单渲染所需的扁平结构；其余字段容错降级。
+    """
+    if not isinstance(detail, dict):
+        return {"risk_type_id": "", "risk_type_name": "", "fields": []}
+    raw_fields = detail.get("risk_access_fields") or detail.get("fields") or []
+    fields = []
+    if isinstance(raw_fields, list):
+        for f in raw_fields:
+            if not isinstance(f, dict):
+                continue
+            fields.append(
+                {
+                    "key": f.get("key", ""),
+                    "name": f.get("name", "") or f.get("label", ""),
+                    "required": bool(f.get("required", False)),
+                    "type": f.get("type", ""),
+                }
+            )
+    return {
+        "risk_type_id": str(detail.get("id", "")),
+        "risk_type_name": detail.get("name", "") or detail.get("risk_type_name", ""),
+        "fields": fields,
+    }

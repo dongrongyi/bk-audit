@@ -16,6 +16,8 @@ We undertake not to change the open source license (MIT license) applicable
 to the current version of the project delivered to anyone in the future.
 """
 
+# 加载通道适配实现，触发 ChannelRegistry.register（通用下发接口依赖）
+from services.web.risk.channels import bksec as _bksec_channel  # noqa
 from services.web.risk.resources.analyse_report import *  # noqa
 from services.web.risk.resources.bksec import *  # noqa
 from services.web.risk.resources.event import *  # noqa
