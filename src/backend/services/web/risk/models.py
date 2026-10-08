@@ -389,7 +389,7 @@ class Risk(StrategyTagMixin, SoftDeleteModel):
     def last_history(self) -> Union["TicketNode", None]:
         from services.web.risk.handlers.ticket import MisReport, ReOpenMisReport
 
-        nodes = TicketNode.objects.filter(risk_id=self.risk_id).order_by("-timestamp")
+        nodes = TicketNode.objects.filter(risk_id=self.risk_id, is_test=False).order_by("-timestamp")
         for node in nodes:
             if node.action not in [MisReport.__name__, ReOpenMisReport.__name__]:
                 return node
@@ -675,6 +675,7 @@ class TicketNode(models.Model):
         default=TicketNodeStatus.RUNNING,
         db_index=True,
     )
+    is_test = models.BooleanField(gettext_lazy("Is Test"), default=False, db_index=True)
 
     class Meta:
         verbose_name = gettext_lazy("Ticket History")

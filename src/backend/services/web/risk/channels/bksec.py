@@ -51,9 +51,7 @@ class BkSecChannel(TicketChannel):
         阻断一切配置解析、预览、测试发送，防止前端隐藏后仍被 API 直接调用。
         """
         if not FeatureHandler("bksec").check():
-            raise serializers.ValidationError(
-                gettext_lazy("BKSEC 功能未启用或环境未就绪（请确认 BKAPP_FEATURE_BKSEC 开关、必配环境变量与内置发单套餐）")
-            )
+            raise serializers.ValidationError(gettext_lazy("BKSEC 功能未启用或环境未就绪（请确认必配环境变量与内置发单套餐）"))
 
     def parse_config(self, channel_config: dict) -> BkSecConfig:
         self._ensure_enabled()
@@ -144,7 +142,7 @@ class BkSecChannel(TicketChannel):
         # ① 风险存在进行中的正式派单 → 测试会复用其回调，测试工单办结会误触发正式节点完成；
         # ② 风险存在已完成的正式派单（Callback.is_finished）→ 测试被插件静默拦截（任务成功但未发单）。
         # 故该风险存在任何 AutoProcess 正式派单历史时拒绝测试发送，引导换一张风险单
-        if TicketNode.objects.filter(risk_id=risk.risk_id, action="AutoProcess").exists():
+        if TicketNode.objects.filter(risk_id=risk.risk_id, action="AutoProcess", is_test=False).exists():
             raise serializers.ValidationError(
                 gettext_lazy("该风险单已有正式派单记录：插件的回调按风险单复用，在其上发送测试工单" "会干扰正式回调或被静默拦截，请选择一张未发送过正式工单的风险单进行测试")
             )

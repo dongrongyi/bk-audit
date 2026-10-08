@@ -27,6 +27,7 @@ from services.web.risk.bksec import sync_bksec_rule
 from services.web.risk.bksec.config import BkSecConfig
 from services.web.risk.bksec.constants import (
     BKSEC_OPERATOR_TEMPLATE,
+    BKSEC_PRESET_PA_NAME,
     BKSEC_RULE_PRIORITY_BASE,
 )
 from services.web.risk.bksec.contract import (
@@ -182,8 +183,18 @@ class TestBkSecRules:
         from services.web.risk.bksec.rules import ensure_preset_pa
 
         settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
-        pa = ensure_preset_pa()
-        assert pa is not None and pa.sops_template_id == 10001 and pa.is_builtin and not pa.need_approve
+        # 套餐不存在时返回 None
+        assert ensure_preset_pa() is None
+        # 手动创建套餐后可获取
+        pa = ProcessApplication.objects.create(
+            name=str(BKSEC_PRESET_PA_NAME),
+            sops_template_id=10001,
+            need_approve=False,
+            is_enabled=True,
+            is_builtin=True,
+        )
+        result = ensure_preset_pa()
+        assert result is not None and result.id == pa.id
         # 幂等
         assert ensure_preset_pa().id == pa.id
 

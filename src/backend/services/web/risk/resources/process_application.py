@@ -248,6 +248,7 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
         scene_id = validated_request_data.get("scene_id")
         page = validated_request_data.get("page", 1)
         page_size = validated_request_data.get("page_size", 20)
+        # 处理套餐执行记录包含测试单（is_test 不过滤）
         nodes = TicketNode.objects.filter(action="AutoProcess")
         # 套餐筛选 / 场景范围：套餐 → 规则 → 风险 → 执行节点
         if pa_id or scene_id:
@@ -318,6 +319,7 @@ class ListPAExecutionRecords(ProcessApplicationMeta):
                     "task_name": process_result.get("task_name") or "",
                     "trigger": process_result.get("trigger") or "",
                     "duration": self._calc_duration(process_result.get("status") or {}),
+                    "is_test": node.is_test,
                 }
             )
         return {

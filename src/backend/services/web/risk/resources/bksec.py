@@ -25,11 +25,13 @@ from django.conf import settings
 from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext_lazy
 from rest_framework import serializers
+from rest_framework.settings import api_settings
 
 from apps.sops.constants import SOPSTaskStatus
 from services.web.risk.bksec.variables import _normalize_risk_type
 from services.web.risk.channels.base import ChannelRegistry
-from services.web.risk.models import Risk
+from services.web.risk.constants import TicketNodeStatus
+from services.web.risk.models import Risk, TicketNode
 
 logger = logging.getLogger("celery")
 
@@ -151,6 +153,26 @@ class SendTestTicket(BkSecResourceMeta):
         except Exception as err:  # NOCC:broad-except(SOPS 调用失败转友好提示)
             logger.exception("[SendTestTicket] SOPS task create/start failed, risk_id=%s", risk.risk_id)
             raise serializers.ValidationError(gettext_lazy("SOPS 测试任务创建/启动失败：%s") % err)
+        # 生成执行记录（is_test=True，与正式单结构一致；风险详情页过滤、处理套餐执行记录可见）
+        task_name = "【测试】{}_{}".format(pa.name, int(datetime.datetime.now().timestamp() * 1000))
+        TicketNode.objects.create(
+            risk_id=risk.risk_id,
+            operator="test",
+            current_operator=[],
+            action="AutoProcess",
+            timestamp=datetime.datetime.now().timestamp(),
+            time=datetime.datetime.now().strftime(api_settings.DATETIME_FORMAT),
+            process_result={
+                "task": result,
+                "status": api.bk_sops.get_task_status(task_id=result["task_id"], bk_biz_id=settings.DEFAULT_BK_BIZ_ID),
+                "pa_id": pa.id,
+                "pa_name": pa.name,
+                "task_name": task_name,
+                "trigger": "test",
+            },
+            status=TicketNodeStatus.RUNNING,
+            is_test=True,
+        )
         logger.info(
             "[SendTestTicket] SOPS task started, task_id=%s channel=%s risk_id=%s",
             result.get("task_id"),
@@ -182,6 +204,21 @@ class GetTaskStatus(BkSecResourceMeta):
             task_id=validated_request_data["task_id"], bk_biz_id=settings.DEFAULT_BK_BIZ_ID
         )
         result = dict(status)
+        # 测试单执行记录状态同步（一次性发送，无轮询任务，由前端查询时更新）
+        if result.get("state") in SOPSTaskStatus.get_finished_status():
+            node = (
+                TicketNode.objects.filter(
+                    is_test=True,
+                    status=TicketNodeStatus.RUNNING,
+                    process_result__task__task_id=str(validated_request_data["task_id"]),
+                )
+                .order_by("-timestamp")
+                .first()
+            )
+            if node:
+                node.process_result["status"] = result
+                node.status = TicketNodeStatus.FINISHED
+                node.save(update_fields=["process_result", "status"])
         if result.get("state") in SOPSTaskStatus.get_failed_status():
             hints = []
             channel_type = validated_request_data.get("channel")

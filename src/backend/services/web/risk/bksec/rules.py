@@ -25,7 +25,6 @@ from django.utils.translation import gettext
 from services.web.risk.bksec.config import BkSecConfig
 from services.web.risk.bksec.constants import (
     BKSEC_AUTO_RULE_NAME,
-    BKSEC_PRESET_PA_DESCRIPTION,
     BKSEC_PRESET_PA_NAME,
     BKSEC_RULE_PRIORITY_BASE,
 )
@@ -63,11 +62,11 @@ def is_bksec_enabled(strategy: Optional[Strategy]) -> bool:
 
 def ensure_preset_pa() -> Optional[ProcessApplication]:
     """
-    获取/修复 预置 BKSEC 发单处理套餐
+    获取/自愈 预置 BKSEC 发单处理套餐
 
-    1. 套餐不存在 + 配置了 BKSEC_SOPS_TEMPLATE_ID	自动创建一个预置处理套餐（名称“【内置】BKSEC安全工单发单”、指向该模板、need_approve=False、启用、打内置标记）
-    2. 套餐存在，但sops模板 ID 与环境变量不一致 / 被停用	自愈：按环境变量校正模板 ID、强制启用（换模板只需改环境变量，下次保存策略自动生效）
-    3. 未配置环境变量	返回内置处理套餐，无内置处理套餐时返回友好报错提示
+    1. 套餐不存在 → 返回 None（管理员需手动创建）
+    2. 套餐存在，但 sops 模板 ID 与环境变量不一致 / 被停用 → 自愈：按环境变量校正模板 ID、强制启用
+    3. 未配置环境变量 → 返回已有的内置套餐，无内置套餐时返回 None
     """
     from django.conf import settings
 
@@ -75,7 +74,7 @@ def ensure_preset_pa() -> Optional[ProcessApplication]:
     # 已有 BKSEC 内置套餐仅按名称精确匹配，避免混入未来其他 is_builtin 套餐（P4）
     builtin_lookup = ProcessApplication.objects.filter(is_builtin=True, name=str(BKSEC_PRESET_PA_NAME))
     if not template_id:
-        # 未配置模板 ID：只返回已有 BKSEC 内置套餐（若已存在），不做兜底创建
+        # 未配置模板 ID：只返回已有 BKSEC 内置套餐（若已存在）
         return builtin_lookup.order_by("-id").first()
     try:
         template_id = int(template_id)
@@ -90,16 +89,14 @@ def ensure_preset_pa() -> Optional[ProcessApplication]:
         # 通过 name 精确匹配，避免误命中未来其他 is_builtin 套餐
         pa = builtin_lookup.order_by("-id").first()
     if pa is None:
-        pa = ProcessApplication.objects.create(
-            name=str(BKSEC_PRESET_PA_NAME),
-            sops_template_id=template_id,
-            need_approve=False,
-            description=str(BKSEC_PRESET_PA_DESCRIPTION),
-            is_enabled=True,
-            is_builtin=True,
-        )
-        logger.info("[BkSecRule] Preset process application created, id=%s template=%s", pa.id, template_id)
-        return pa
+        # 套餐不存在，返回 None（管理员需手动创建）
+        return None
+    if pa.sops_template_id != template_id or not pa.is_enabled:
+        pa.sops_template_id = template_id
+        pa.need_approve = False
+        pa.is_enabled = True
+        pa.save(update_fields=["sops_template_id", "need_approve", "is_enabled"])
+    return pa
     if pa.sops_template_id != template_id or not pa.is_enabled:
         pa.sops_template_id = template_id
         pa.need_approve = False
