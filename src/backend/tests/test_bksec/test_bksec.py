@@ -153,7 +153,8 @@ class TestContract:
         assert constants["${operator}"] == '["tester"]'  # 数组串，满足插件 json.loads 契约
         fields = json.loads(constants["${event_data}"])
         assert fields["operator"] == "tester"
-        assert risk.risk_id in fields["target"]
+        # target 已拆分为独立 ${target} 常量（不混入 event_data 桶）
+        assert risk.risk_id in constants["${target}"]
 
     def test_test_operator_marker(self):
         config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
@@ -164,6 +165,12 @@ class TestContract:
 
 @pytest.mark.django_db
 class TestBkSecRules:
+    @pytest.fixture(autouse=True)
+    def _mock_plugin_config_sync(self):
+        """启用路径的插件 Config 同步强校验在单测环境（无 URL）会阻断，mock 掉。"""
+        with mock.patch("services.web.risk.bksec.rules.sync_plugin_config", mock.Mock(return_value=(True, "ok"))):
+            yield
+
     def _strategy(self, bksec_config=None):
         from services.web.strategy_v2.models import Strategy
 
@@ -204,6 +211,9 @@ class TestBkSecRules:
         settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
         RiskRule.objects.all().delete()
         ProcessApplication.objects.all().delete()
+        ProcessApplication.objects.create(
+            name=str(BKSEC_PRESET_PA_NAME), sops_template_id=10001, need_approve=False, is_enabled=True, is_builtin=True
+        )
         strategy = self._strategy(BKSEC_CONFIG_DATA)
         rule = sync_bksec_rule(strategy)
         assert rule is not None and rule.is_enabled and rule.auto_strategy_id == strategy.strategy_id
@@ -223,6 +233,9 @@ class TestBkSecRules:
         settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
         RiskRule.objects.all().delete()
         ProcessApplication.objects.all().delete()
+        ProcessApplication.objects.create(
+            name=str(BKSEC_PRESET_PA_NAME), sops_template_id=10001, need_approve=False, is_enabled=True, is_builtin=True
+        )
         strategy = self._strategy(BKSEC_CONFIG_DATA)
         rule = sync_bksec_rule(strategy)
         # 关闭开关 → 原地停用（不产生新版本，对齐 ToggleRiskRule）
@@ -272,6 +285,9 @@ class TestBkSecRules:
         settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
         RiskRule.objects.all().delete()
         ProcessApplication.objects.all().delete()
+        ProcessApplication.objects.create(
+            name=str(BKSEC_PRESET_PA_NAME), sops_template_id=10001, need_approve=False, is_enabled=True, is_builtin=True
+        )
         strategy = self._strategy(BKSEC_CONFIG_DATA)
         rule = sync_bksec_rule(strategy)
         with pytest.raises(Exception) as err:
@@ -296,11 +312,20 @@ class TestBkSecRules:
 
 @pytest.mark.django_db
 class TestBkSecResources:
+    @pytest.fixture(autouse=True)
+    def _enable_bksec(self):
+        """接口测试依赖 feature 开关放行（BKSEC 环境变量/内置套餐在单测环境通常缺失）。"""
+        with mock.patch(
+            "services.web.risk.bksec.service.FeatureHandler",
+            return_value=mock.Mock(check=mock.Mock(return_value=True)),
+        ):
+            yield
+
     def test_preview_ticket(self):
         config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
         with RiskContext() as risk:
             result = resource.risk.preview_ticket.perform_request(
-                {"channel": "bk_sec", "channel_config": config.model_dump(), "risk_id": risk.risk_id}
+                {"bksec_config": config.model_dump(), "risk_id": risk.risk_id}
             )
         assert result["has_sample_risk"] is True
         assert result["ticket"]["fields"]["operator"] == "admin"
@@ -308,21 +333,31 @@ class TestBkSecResources:
 
     def test_send_test_ticket(self, settings):
         """测试发送经 SOPS 真实通道（create_task + start_task），事件常量含测试标记与处理人覆盖"""
+        from services.web.strategy_v2.models import Strategy
         from tests.test_risk.test_tickets.constants import SOPS_FLOW_INFO
 
         config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
         settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
         ProcessApplication.objects.filter(is_builtin=True).delete()
+        ProcessApplication.objects.create(
+            name=str(BKSEC_PRESET_PA_NAME), sops_template_id=10001, need_approve=False, is_builtin=True
+        )
         with RiskContext() as risk:
+            strategy = Strategy.objects.get(strategy_id=risk.strategy_id)
+            strategy.bksec_config = config.model_dump()
+            strategy.save(update_fields=["bksec_config"])
             with mock.patch(
+                "services.web.risk.bksec.rules.sync_plugin_config", mock.Mock(return_value=(True, "ok"))
+            ), mock.patch(
                 "services.web.risk.resources.bksec.api.bk_sops.create_task", mock.Mock(return_value=SOPS_FLOW_INFO)
             ) as create_task, mock.patch(
                 "services.web.risk.resources.bksec.api.bk_sops.start_task", mock.Mock(return_value=None)
-            ) as start_task:
+            ) as start_task, mock.patch(
+                "services.web.risk.resources.bksec.api.bk_sops.get_task_status",
+                mock.Mock(return_value={"state": "RUNNING"}),
+            ):
                 result = resource.risk.send_test_ticket.perform_request(
                     {
-                        "channel": "bk_sec",
-                        "channel_config": config.model_dump(),
                         "test_receivers": ["tester"],
                         "risk_id": risk.risk_id,
                     }
@@ -336,8 +371,9 @@ class TestBkSecResources:
         # Bug1 修复锁定：测试发送必须以指定处理人覆盖初始责任人，保证隔离
         assert fields["operator"] == "tester"
         assert constants["${operator}"] == '["tester"]'  # 数组串，满足插件 json.loads 契约
-        # 决策 A 修复锁定：测试发送必须携带样例风险单，risk 变量按真实数据渲染
-        assert risk.risk_id in fields["target"]
+        # 决策 A 修复锁定：测试发送必须携带样例风险单，risk 变量按真实数据渲染；
+        # target 已拆分为独立 ${target} 常量（不混入 event_data 桶）
+        assert risk.risk_id in constants["${target}"]
         # 测试任务名带【测试】前缀，便于 SOPS 侧区分
         assert create_task.call_args.kwargs["name"].startswith("【测试】")
 
@@ -346,10 +382,14 @@ class TestBkSecResources:
         import time as _time
 
         from services.web.risk.models import TicketNode
+        from services.web.strategy_v2.models import Strategy
 
         config = BkSecConfig.model_validate(BKSEC_CONFIG_DATA)
         settings.BKSEC_SOPS_TEMPLATE_ID = "10001"
         with RiskContext() as risk:
+            strategy = Strategy.objects.get(strategy_id=risk.strategy_id)
+            strategy.bksec_config = config.model_dump()
+            strategy.save(update_fields=["bksec_config"])
             TicketNode.objects.create(
                 risk_id=risk.risk_id,
                 operator="bk-audit",
@@ -363,8 +403,6 @@ class TestBkSecResources:
                 with pytest.raises(Exception) as err:
                     resource.risk.send_test_ticket.perform_request(
                         {
-                            "channel": "bk_sec",
-                            "channel_config": config.model_dump(),
                             "test_receivers": ["tester"],
                             "risk_id": risk.risk_id,
                         }
@@ -381,7 +419,7 @@ class TestBkSecResources:
             "services.web.risk.resources.bksec.api.bk_sops.get_node_data",
             mock.Mock(return_value={"detail": "plugin execute failed: Config matching query does not exist."}),
         ):
-            result = resource.risk.get_bk_sec_test_task_status.perform_request({"task_id": "1"})
+            result = resource.risk.get_task_status.perform_request({"task_id": "1"})
         assert result["state"] == "FAILED"
         assert "Config" in result["failure_hint"] and "插件 Admin" in result["failure_hint"]
         # 特征未命中 → 通用指引
@@ -392,14 +430,14 @@ class TestBkSecResources:
             "services.web.risk.resources.bksec.api.bk_sops.get_node_data",
             mock.Mock(side_effect=Exception("boom")),
         ):
-            result = resource.risk.get_task_status.perform_request({"task_id": "1", "channel": "bk_sec"})
+            result = resource.risk.get_task_status.perform_request({"task_id": "1"})
         assert result["failure_hint"] == resource.risk.get_task_status.GENERIC_HINT
         # 成功状态不附带提示
         with mock.patch(
             "services.web.risk.resources.bksec.api.bk_sops.get_task_status",
             mock.Mock(return_value={"state": "FINISHED"}),
         ):
-            result = resource.risk.get_task_status.perform_request({"task_id": "1", "channel": "bk_sec"})
+            result = resource.risk.get_task_status.perform_request({"task_id": "1"})
         assert "failure_hint" not in result
 
     def test_operator_template_empty_value_renders_valid_json_array(self):

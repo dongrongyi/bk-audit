@@ -97,12 +97,6 @@ def ensure_preset_pa() -> Optional[ProcessApplication]:
         pa.is_enabled = True
         pa.save(update_fields=["sops_template_id", "need_approve", "is_enabled"])
     return pa
-    if pa.sops_template_id != template_id or not pa.is_enabled:
-        pa.sops_template_id = template_id
-        pa.need_approve = False
-        pa.is_enabled = True
-        pa.save(update_fields=["sops_template_id", "need_approve", "is_enabled"])
-    return pa
 
 
 def _load_strategy_scene_id(strategy: Strategy) -> Optional[int]:
@@ -286,7 +280,8 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> tuple:
     """
     同步插件 Config（方案 1）：传业务参数给插件，插件内部构造完整 Config 并存储。
 
-    审计中心只传 strategy_id + risk_type_id + target_type，格式细节（凭证/桥接配方/默认值）归插件管理。
+    审计中心只传 strategy_id + risk_type_id，格式细节（凭证/桥接配方/默认值）归插件管理。
+    target_type 改为 SOPS 常量传递（支持模板表达式），不再同步到 Config 表。
     返回 (success: bool, message: str)：
         - success=True  → 插件已成功建立/更新 Config
         - success=False → 失败原因（含插件返回的 message 或网络异常信息）
@@ -329,7 +324,6 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> tuple:
             json={
                 "strategy_id": str(strategy.strategy_id),
                 "risk_type_id": config.risk_type_id,
-                "target_type": config.target_type,
                 "source_type": config.source_type,
             },
             headers=headers,

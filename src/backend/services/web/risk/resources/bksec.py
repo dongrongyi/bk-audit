@@ -28,10 +28,20 @@ from rest_framework import serializers
 from rest_framework.settings import api_settings
 
 from apps.sops.constants import SOPSTaskStatus
+from services.web.risk.bksec.rules import load_bksec_config
+from services.web.risk.bksec.service import (
+    bksec_failure_hints,
+    ensure_bksec_enabled,
+    parse_bksec_config,
+    render_bksec_preview,
+    render_bksec_test_constants,
+    sync_bksec_test_config,
+    validate_bksec_test_target,
+)
 from services.web.risk.bksec.variables import _normalize_risk_type
-from services.web.risk.channels.base import ChannelRegistry
 from services.web.risk.constants import TicketNodeStatus
 from services.web.risk.models import Risk, TicketNode
+from services.web.strategy_v2.models import Strategy
 
 logger = logging.getLogger("celery")
 
@@ -75,29 +85,41 @@ class ListBkSecRiskTypes(BkSecResourceMeta):
 
 class PreviewTicket(BkSecResourceMeta):
     """
-    预览工单（按当前通道配置 + 指定样例风险单渲染，不实际发送）
+    预览工单（按 BKSEC 配置 + 指定样例风险单渲染，不实际发送）
 
-    通道无关：具体渲染逻辑由 channel 参数指定的通道适配实现（如 bk_sec）。
+    配置来源二选一（用于支持保存前预览）：
+    - 传 bksec_config：用前端当前表单配置（未保存也可预览）；
+    - 传 strategy_id：反查该策略已保存的 bksec_config。
     """
 
     name = gettext_lazy("预览工单")
 
     class RequestSerializer(serializers.Serializer):
-        channel = serializers.CharField(label=gettext_lazy("下发通道类型"), required=True)
-        channel_config = serializers.DictField(label=gettext_lazy("通道专属配置"), required=True)
+        strategy_id = serializers.IntegerField(label=gettext_lazy("策略ID"), required=False, allow_null=True)
+        bksec_config = serializers.DictField(label=gettext_lazy("BKSEC工单配置"), required=False)
         risk_id = serializers.CharField(
             label=gettext_lazy("样例风险单ID"), required=False, allow_blank=True, allow_null=True
         )
 
     def perform_request(self, validated_request_data):
-        ch = ChannelRegistry.get(validated_request_data["channel"])
+        config_dict = validated_request_data.get("bksec_config")
+        if config_dict:
+            config = parse_bksec_config(config_dict)
+        else:
+            strategy_id = validated_request_data.get("strategy_id")
+            if not strategy_id:
+                raise serializers.ValidationError(gettext_lazy("预览需提供策略ID（strategy_id）或 BKSEC 工单配置（bksec_config）"))
+            strategy = get_object_or_404(Strategy, strategy_id=strategy_id)
+            config = load_bksec_config(strategy)
+            if config is None:
+                raise serializers.ValidationError(gettext_lazy("该策略未配置 BKSEC 安全工单"))
         risk = None
         risk_id = validated_request_data.get("risk_id")
         if risk_id:
             risk = Risk.objects.filter(risk_id=risk_id).first()
             if risk is None:
                 raise serializers.ValidationError(gettext_lazy("样例风险单不存在：%s") % risk_id)
-        return ch.render_preview(validated_request_data["channel_config"], risk)
+        return render_bksec_preview(config, risk)
 
 
 class SendTestTicket(BkSecResourceMeta):
@@ -105,14 +127,12 @@ class SendTestTicket(BkSecResourceMeta):
     发送测试工单（经 SOPS 真实通道推送，仅发给指定接收人，不影响正式派单）
 
     测试结果即生产路径的验证；任务状态由前端轮询 get_task_status 接口获取。
-    通道无关：具体常量构造、前置守卫、套餐模板均由 channel 适配实现。
+    配置从风险单反查已保存的策略 BKSEC 配置（测的就是已保存那份）。
     """
 
     name = gettext_lazy("发送测试工单")
 
     class RequestSerializer(serializers.Serializer):
-        channel = serializers.CharField(label=gettext_lazy("下发通道类型"), required=True)
-        channel_config = serializers.DictField(label=gettext_lazy("通道专属配置"), required=True)
         test_receivers = serializers.ListField(
             label=gettext_lazy("测试接收人"), child=serializers.CharField(), required=True
         )
@@ -120,19 +140,24 @@ class SendTestTicket(BkSecResourceMeta):
         risk_id = serializers.CharField(label=gettext_lazy("样例风险单ID"), required=True)
 
     def perform_request(self, validated_request_data):
-        ch = ChannelRegistry.get(validated_request_data["channel"])
+        # 后端 feature 硬拦截（前端隐藏后仍可能被 API 直接调用）
+        ensure_bksec_enabled()
         risk = get_object_or_404(Risk, risk_id=validated_request_data["risk_id"])
-        # 通道前置守卫（如 BKSEC 的回调隔离）
-        ch.validate_test_target(risk)
-        # 测试发送前置：兜底同步插件侧 Config（未保存即测试 / 配置已变更时，确保插件侧与本次入参一致）
-        ch.sync_test_config(validated_request_data["channel_config"], risk)
+        # 测试发送发生在保存之后：从风险单反查已保存的策略 BKSEC 配置（测的就是已保存那份）
+        strategy = Strategy.objects.filter(strategy_id=risk.strategy_id).first()
+        if strategy is None:
+            raise serializers.ValidationError(gettext_lazy("该风险单未关联策略，无法发送测试工单"))
+        config = load_bksec_config(strategy)
+        if config is None or not config.enabled:
+            raise serializers.ValidationError(gettext_lazy("该风险单关联的策略未启用 BKSEC 安全工单"))
+        # 回调隔离守卫（插件 Callback 表按风险单复用）
+        validate_bksec_test_target(risk)
+        # 测试发送前置：兜底同步插件侧 Config（确保插件侧与已保存配置一致）
+        sync_bksec_test_config(strategy, config)
         # 渲染插件入参常量
-        constants = ch.render_test_constants(
-            validated_request_data["channel_config"], risk, validated_request_data["test_receivers"]
-        )
-        # 确保预置套餐就绪（依赖通道提供的模板 ID 环境变量；复用正式路径的套餐自愈逻辑）
-        template_id = ch.get_preset_pa_template_id()
-        if not template_id:
+        constants = render_bksec_test_constants(config, risk, validated_request_data["test_receivers"])
+        # 确保预置套餐就绪（复用正式路径的套餐自愈逻辑）
+        if not settings.BKSEC_SOPS_TEMPLATE_ID:
             raise serializers.ValidationError(gettext_lazy("预置发单套餐未就绪（未配置套餐模板 ID），无法发送测试工单"))
         from services.web.risk.bksec.rules import ensure_preset_pa
 
@@ -174,9 +199,8 @@ class SendTestTicket(BkSecResourceMeta):
             is_test=True,
         )
         logger.info(
-            "[SendTestTicket] SOPS task started, task_id=%s channel=%s risk_id=%s",
+            "[SendTestTicket] SOPS task started, task_id=%s risk_id=%s",
             result.get("task_id"),
-            validated_request_data["channel"],
             risk.risk_id,
         )
         return {"task": result, "constants": constants}
@@ -186,7 +210,7 @@ class GetTaskStatus(BkSecResourceMeta):
     """
     查询测试任务状态（透传 SOPS 任务状态，供前端轮询至终态）
 
-    通道无关：失败时附带的可操作失败提示（failure_hint）由对应通道提供已知错误特征映射。
+    失败时附带可操作的失败提示（failure_hint），由已知插件错误特征映射翻译。
     注意：插件侧错误（如 Config 缺失）发生在 SOPS 异步执行阶段，create_task 时刻无法感知，
     只能在本接口（轮询）侧转换。
     """
@@ -197,7 +221,6 @@ class GetTaskStatus(BkSecResourceMeta):
 
     class RequestSerializer(serializers.Serializer):
         task_id = serializers.CharField(label=gettext_lazy("SOPS任务ID"), required=True)
-        channel = serializers.CharField(label=gettext_lazy("下发通道类型"), required=False, allow_blank=True)
 
     def perform_request(self, validated_request_data):
         status = api.bk_sops.get_task_status(
@@ -220,11 +243,7 @@ class GetTaskStatus(BkSecResourceMeta):
                 node.status = TicketNodeStatus.FINISHED
                 node.save(update_fields=["process_result", "status"])
         if result.get("state") in SOPSTaskStatus.get_failed_status():
-            hints = []
-            channel_type = validated_request_data.get("channel")
-            if channel_type:
-                hints = ChannelRegistry.get(channel_type).resolve_failure_hints()
-            result["failure_hint"] = self._build_failure_hint(validated_request_data["task_id"], hints)
+            result["failure_hint"] = self._build_failure_hint(validated_request_data["task_id"], bksec_failure_hints())
         return result
 
     def _build_failure_hint(self, task_id: str, hints: list) -> str:

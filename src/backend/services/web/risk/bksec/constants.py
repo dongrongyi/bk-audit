@@ -35,6 +35,7 @@ from django.utils.translation import gettext_lazy
 BKSEC_PARAM_EVENT_TYPE = "${event_type}"
 BKSEC_PARAM_EVENT_DATA = "${event_data}"
 BKSEC_PARAM_OPERATOR = "${operator}"
+BKSEC_PARAM_TARGET_TYPE = "${target_type}"
 BKSEC_PARAM_TARGET = "${target}"
 BKSEC_PARAM_ACTION = "${action}"
 BKSEC_PARAM_ONCE_TASK = "${once_task}"

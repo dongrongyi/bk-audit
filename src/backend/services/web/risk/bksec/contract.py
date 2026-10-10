@@ -45,6 +45,7 @@ from services.web.risk.bksec.constants import (
     BKSEC_PARAM_ONCE_TASK,
     BKSEC_PARAM_OPERATOR,
     BKSEC_PARAM_TARGET,
+    BKSEC_PARAM_TARGET_TYPE,
     BKSEC_PLUGIN_STANDARD_FIELDS,
 )
 from services.web.risk.bksec.renderer import render_value
@@ -166,11 +167,17 @@ def build_pa_params(config: BkSecConfig) -> dict:
       AutoProcess 走 getattr(risk, None) 崩溃）
     - ${event_type} → BKSEC 风险类型（P1 确认）
     - ${event_data} → 策略页字段映射序列化的模板串（发送时渲染，P2）
+    - ${target_type} → 目标资产类型（支持模板表达式）
     - ${operator} → 兜底模板（决策 D4）
     - ${action}/${once_task} → 插件控制参数默认值（P4 待确认）
     """
     params = {param: {"field": field, "value": ""} for param, field in BKSEC_PLUGIN_STANDARD_FIELDS.items()}
     params[BKSEC_PARAM_EVENT_TYPE] = {"field": "", "value": config.risk_type_id}
+    # target_type（目标资产类型）为工单级字段，支持模板表达式
+    params[BKSEC_PARAM_TARGET_TYPE] = {
+        "field": "",
+        "value": _wrap_json_escape(config.target_type) if config.target_type else "",
+    }
     # target（风险资产信息）为工单级字段，从 field_mappings 拆出单独走 ${target} 标准常量，
     # 不再混入 event_data（风险类型扩展字段桶）——拆分口径由 _collect_field_mappings 统一
     target_mapping, event_mappings = _collect_field_mappings(config)
@@ -195,7 +202,7 @@ def build_plugin_constants(config: BkSecConfig, risk: Optional[Risk] = None, tes
     """
     构造插件的最终入参常量（测试发送/预览用；正式发送走 pa_params → AutoProcess 同构渲染）
 
-    字段集合、target 拆分、初始责任人兜底与 build_pa_params 共用同一内核
+    字段集合、target_type/target 拆分、初始责任人兜底与 build_pa_params 共用同一内核
     （_collect_field_mappings / _resolve_initial_owner），保证两端契约同构、新增字段只改一处。
     """
     context = build_render_context(risk=risk)
@@ -210,6 +217,8 @@ def build_plugin_constants(config: BkSecConfig, risk: Optional[Risk] = None, tes
         constants[param] = value
     # BKSEC 风险类型（P1）
     constants[BKSEC_PARAM_EVENT_TYPE] = config.risk_type_id
+    # target_type（目标资产类型）：支持模板表达式
+    constants[BKSEC_PARAM_TARGET_TYPE] = render_value(config.target_type, context) if config.target_type else ""
     # 动态字段：复用同一拆分内核（与正式 pa_params 口径一致）
     target_mapping, event_mappings = _collect_field_mappings(config)
     fields = {m.key: render_value(m.value, context) for m in event_mappings}
