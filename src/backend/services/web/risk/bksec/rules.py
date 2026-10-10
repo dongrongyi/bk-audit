@@ -278,9 +278,9 @@ def disable_bksec_rule(strategy_id: int) -> None:
 
 def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> tuple:
     """
-    同步插件 Config（方案 1）：传业务参数给插件，插件内部构造完整 Config 并存储。
+    同步插件 Config：传业务参数给插件，插件内部构造完整 Config 并存储。
 
-    审计中心只传 strategy_id + risk_type_id，格式细节（凭证/桥接配方/默认值）归插件管理。
+    审计中心传 strategy_id + risk_type_id + source_type + token，格式细节（凭证/桥接配方/默认值）归插件管理。
     target_type 改为 SOPS 常量传递（支持模板表达式），不再同步到 Config 表。
     返回 (success: bool, message: str)：
         - success=True  → 插件已成功建立/更新 Config
@@ -298,6 +298,34 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> tuple:
         logger.warning("[BkSecPluginConfig] %s, strategy_id=%s", message, strategy.strategy_id)
         BkSecConfigSyncFailedEvent(
             context={"strategy_id": str(strategy.strategy_id), "stage": "api_url_missing", "error": message},
+        ).report()
+        return (False, message)
+
+    # 获取 token（调用 risk_access API）
+    try:
+        from bk_resource import api
+
+        result = api.bk_sec.risk_access_retrieve(id=config.risk_type_id)
+        token = result.get("data", {}).get("token", "")
+        if not token:
+            message = "risk_access API 未返回 token"
+            logger.warning(
+                "[BkSecPluginConfig] %s, strategy_id=%s risk_type_id=%s",
+                message,
+                strategy.strategy_id,
+                config.risk_type_id,
+            )
+            BkSecConfigSyncFailedEvent(
+                context={"strategy_id": str(strategy.strategy_id), "stage": "token_missing", "error": message},
+            ).report()
+            return (False, message)
+    except Exception as err:
+        message = "获取 token 失败：%s" % err
+        logger.warning(
+            "[BkSecPluginConfig] %s, strategy_id=%s risk_type_id=%s", message, strategy.strategy_id, config.risk_type_id
+        )
+        BkSecConfigSyncFailedEvent(
+            context={"strategy_id": str(strategy.strategy_id), "stage": "token_fetch_failed", "error": message},
         ).report()
         return (False, message)
 
@@ -325,6 +353,7 @@ def sync_plugin_config(strategy: Strategy, config: BkSecConfig) -> tuple:
                 "strategy_id": str(strategy.strategy_id),
                 "risk_type_id": config.risk_type_id,
                 "source_type": config.source_type,
+                "token": token,
             },
             headers=headers,
             timeout=10,
