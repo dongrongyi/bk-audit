@@ -1424,19 +1424,29 @@ class ToggleStrategy(StrategyV2Base):
         # 更新处理人
         strategy.updated_by = get_request_username()
         strategy.save(update_fields=["updated_by"])
-        from services.web.risk.bksec.rules import BkSecPluginSyncError, sync_bksec_rule
+        from services.web.risk.bksec.rules import (
+            BkSecPluginSyncError,
+            prepare_bksec_rule_for_enable,
+            sync_bksec_rule,
+        )
 
         if validated_request_data["toggle"]:
-            # 先同步规则：插件同步失败时规则事务回滚，这里直接拒绝，策略保持关闭。
+            # 先做发单配置预检（插件同步失败时直接拒绝，策略保持关闭），但不落规则。
+            # 规则由状态检查在策略确认 RUNNING 后激活，避免控制器尚未启动成功时规则已对风险可见。
             try:
-                sync_bksec_rule(strategy, strategy_alive=True)
+                prepare_bksec_rule_for_enable(strategy)
             except BkSecPluginSyncError as err:
+                logger.error(
+                    "[ToggleStrategy] Plugin config sync failed, strategy_id=%s diagnosis=%s",
+                    strategy.strategy_id,
+                    err.diagnosis,
+                )
                 raise serializers.ValidationError(gettext("策略未启用，BKSEC 工单配置同步失败：%s") % err)
             try:
                 call_controller(BaseControl.enable.__name__, strategy.strategy_id, controller_cls)
             except Exception:
-                # 控制器启用失败（如 get_flow_deploy_data 超时）：回退刚启用的发单规则，
-                # 保证策略与发单规则双关。补偿失败只记日志，不遮蔽原异常。
+                # 控制器启用失败（如 get_flow_deploy_data 超时）：规则尚未激活，仍补偿关闭，
+                # 兜住策略原本已有启用规则的场景。补偿失败只记日志，不遮蔽原异常。
                 try:
                     sync_bksec_rule(strategy, strategy_alive=False)
                 except Exception:

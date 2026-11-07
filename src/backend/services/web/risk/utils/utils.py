@@ -109,22 +109,35 @@ def format_sops_time(value) -> str:
 def calc_task_duration(status_info: dict) -> Optional[int]:
     """耗时（秒）：SOPS 任务实际 start_time/finish_time 之差；未结束/缺失返回 None
 
-    部分场景（SOPS 版本差异/任务未回填任务级时间）下任务级 start_time/finish_time 为空，
-    此时退化为取所有子节点的最早开始时间与最晚结束时间，避免耗时恒为 None。
+    只有任务到达终态才计算耗时：执行中的任务即使已有子节点结束，也不能提前算出耗时，
+    否则会带着非空 duration 参与已完成记录排序。
+    终态下任务级时间缺失时，退化为取子节点时间：
+    - 失败终态优先取失败节点的 finish_time（流程在失败节点处停止）；
+    - 其他终态取所有已结束子节点的最晚 finish_time。
     """
     status_info = status_info or {}
+    state = status_info.get("state")
+    if state not in SOPSTaskStatus.get_finished_status():
+        return None
     start = parse_sops_time(status_info.get("start_time"))
     finish = parse_sops_time(status_info.get("finish_time"))
     if not (start and finish):
-        children = status_info.get("children") or {}
-        child_times = [
-            (parse_sops_time(child.get("start_time")), parse_sops_time(child.get("finish_time")))
-            for child in children.values()
-            if isinstance(child, dict)
-        ]
-        starts = [item[0] for item in child_times if item[0]]
-        finishes = [item[1] for item in child_times if item[1]]
+        nodes = list(iter_status_nodes(status_info))
+        starts = [parse_sops_time(node.get("start_time")) for node in nodes]
+        starts = [item for item in starts if item]
         start = start or (min(starts) if starts else None)
+
+        finishes = []
+        if state in SOPSTaskStatus.get_failed_status():
+            finishes = [
+                parse_sops_time(node.get("finish_time"))
+                for node in nodes
+                if node.get("state") in SOPSTaskStatus.get_failed_status() and node.get("finish_time")
+            ]
+            finishes = [item for item in finishes if item]
+        if not finishes:
+            finishes = [parse_sops_time(node.get("finish_time")) for node in nodes if node.get("finish_time")]
+            finishes = [item for item in finishes if item]
         finish = finish or (max(finishes) if finishes else None)
     if start and finish:
         return int((finish - start).total_seconds())
