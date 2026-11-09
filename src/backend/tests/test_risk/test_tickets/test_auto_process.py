@@ -20,6 +20,7 @@ import uuid
 from unittest import mock
 
 from bk_resource import resource
+from bk_resource.exceptions import APIRequestError
 from bk_resource.settings import bk_resource_settings
 from django.test.utils import override_settings
 
@@ -27,8 +28,9 @@ from apps.itsm.constants import TicketStatus
 from apps.sops.constants import SOPSTaskStatus
 from services.web.risk.constants import RiskDisplayStatus, RiskStatus
 from services.web.risk.exceptions import AutoProcessParamsError
-from services.web.risk.handlers.ticket import AutoProcess, ForApprove
+from services.web.risk.handlers.ticket import AutoProcess, ForApprove, _is_recoverable_api_error
 from services.web.risk.models import Risk
+from tests.base import TestCase
 from tests.test_risk.test_tickets.base import RiskContext, RuleContext, TicketTest
 from tests.test_risk.test_tickets.constants import (
     APPROVE_SERVICE_INFO,
@@ -498,3 +500,43 @@ class AutoProcessTest(TicketTest):
                 risk = Risk.objects.get(risk_id=risk.risk_id)
                 self.assertEquals(risk.last_history.action, AutoProcess.__name__)
                 self.assertEquals(risk.last_history.extra["pa_config"], pa_config)
+
+
+class TestAutoProcessApiErrorClassification(TestCase):
+    """AutoProcess 对 get_task_status 异常的可重试分类。"""
+
+    @staticmethod
+    def _gateway_error(status_code: int) -> APIRequestError:
+        return APIRequestError(
+            module_name="bk_sops",
+            url="/get_task_status/",
+            status_code=status_code,
+            result="[50000] gateway",
+        )
+
+    def test_gateway_5xx_is_recoverable(self):
+        self.assertTrue(_is_recoverable_api_error(self._gateway_error(502)))
+        self.assertTrue(_is_recoverable_api_error(self._gateway_error(503)))
+        self.assertTrue(_is_recoverable_api_error(self._gateway_error(429)))
+        self.assertTrue(_is_recoverable_api_error(self._gateway_error(408)))
+
+    def test_client_4xx_is_not_recoverable(self):
+        self.assertFalse(_is_recoverable_api_error(self._gateway_error(400)))
+        self.assertFalse(_is_recoverable_api_error(self._gateway_error(403)))
+        self.assertFalse(_is_recoverable_api_error(self._gateway_error(404)))
+
+    def test_standard_business_error_is_not_recoverable(self):
+        err = APIRequestError(
+            module_name="bk_sops",
+            url="/get_task_status/",
+            result={"result": False, "code": 50000, "message": "business failed"},
+        )
+        # CoreException 默认 status_code=500，但业务错误并没有真实 HTTP 状态
+        self.assertNotIn("status_code", vars(err))
+        self.assertEqual(err.status_code, 500)
+        self.assertFalse(_is_recoverable_api_error(err))
+
+    def test_network_error_is_recoverable(self):
+        err = APIRequestError(module_name="bk_sops", url="/get_task_status/", result="connection timeout")
+        self.assertNotIn("status_code", vars(err))
+        self.assertTrue(_is_recoverable_api_error(err))

@@ -788,6 +788,27 @@ def get_itsm_ticket_status(ticket_id: str) -> dict:
     }
 
 
+def _is_recoverable_api_error(exc: APIRequestError) -> bool:
+    """判断外部 API 异常是否可重试。
+
+    依据真实 HTTP 状态码与标准响应格式，而不是响应体里是否带 code：
+    - 非 2xx：5xx/408/425/429 可重试，其余 4xx 视为永久错误；
+    - HTTP 200 + result=false：业务失败，不可重试；
+    - 网络/超时/解析失败：按可重试处理。
+
+    注意：CoreException 默认 status_code=500，只有实例 __dict__ 里存在的才是真实状态码。
+    """
+
+    if "status_code" in vars(exc):
+        status = vars(exc)["status_code"]
+        return status in (408, 425, 429) or status >= 500
+
+    data = getattr(exc, "data", {}) or {}
+    if data.get("result") is False:
+        return False
+    return True
+
+
 class AutoProcess(RiskFlowBaseHandler):
     """
     自动套餐处理
@@ -810,15 +831,14 @@ class AutoProcess(RiskFlowBaseHandler):
             try:
                 return {"status": api.bk_sops.get_task_status(task_id=task_id, bk_biz_id=settings.DEFAULT_BK_BIZ_ID)}
             except APIRequestError as err:
-                # 业务错误：不可恢复，降级为 FAILED 让下游走"转人工 + AWAIT_PROCESS"分支，
-                err_data = getattr(err, "data", {}) or {}
-                if "code" in err_data:
+                # 业务错误/客户端错误：不可恢复，降级为 FAILED 让下游走"转人工 + AWAIT_PROCESS"分支；
+                # 网关 5xx / 网络异常 / 超时：可恢复，抛出让外层重试。
+                if not _is_recoverable_api_error(err):
                     logger.exception(
                         f"[AutoProcess] get_task_status business error, "
                         f"risk_id={self.risk.risk_id}, task_id={task_id}, err={err}"
                     )
                     return {"status": {"state": SOPSTaskStatus.FAILED}}
-                # HTTP 5xx / 网络异常 / 超时：可恢复，抛出让外层重试
                 raise
         # 优先使用参数
         pa_config = pa_config
