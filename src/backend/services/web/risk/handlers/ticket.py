@@ -1190,6 +1190,10 @@ class ConfirmRisk(RiskFlowBaseHandler):
 
         self.risk.refresh_from_db()
         NewRisk(risk_id=self.risk.risk_id, operator=self.operator).run(skip_record=True)
+        # 链式推进（建单/建任务）放 worker，避免完整套餐跑在请求线程
+        from services.web.risk.tasks import process_one_risk
+
+        process_one_risk.delay(risk_id=self.risk.risk_id)
         try:
             RiskHandler().trigger_render_task(self.risk)
         except Exception as e:
