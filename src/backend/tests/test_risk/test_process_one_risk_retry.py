@@ -75,6 +75,7 @@ class TestProcessOneRiskRetryCount(TestCase):
 
         with (
             mock.patch("services.web.risk.tasks.AutoProcess", AutoProcess),
+            mock.patch.dict("services.web.risk.tasks._CHAIN_HANDLERS", {RiskStatus.AUTO_PROCESS: AutoProcess}),
             mock.patch("services.web.risk.tasks.TransOperator") as trans_cls,
         ):
             trans_cls.load_security_person.return_value = ["security"]

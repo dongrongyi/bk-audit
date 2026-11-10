@@ -603,13 +603,21 @@ def process_risk_ticket(*, risk_id: str = None, manual: bool = False):
 
     # 逐个处理
     for risk in risks:
-        if settings.ENABLE_MULTI_PROCESS_RISK and not manual:
+        # manual=True 来自请求线程（手动建单），必须 delay，链式不允许跑在请求线程
+        if manual or settings.ENABLE_MULTI_PROCESS_RISK:
             process_one_risk.delay(risk_id=risk.risk_id)
             logger_celery.info("[ProcessRiskTicket] Scheduled %s", risk.risk_id)
         else:
             logger_celery.info("[ProcessRiskTicket] Sync-Running %s", risk.risk_id)
             process_one_risk(risk_id=risk.risk_id)
 
+
+# 链式推进的状态机入口：每个 handler 一次任务内至多执行一次，止步于需外部等待的状态
+_CHAIN_HANDLERS = {
+    RiskStatus.NEW: NewRisk,
+    RiskStatus.FOR_APPROVE: ForApprove,
+    RiskStatus.AUTO_PROCESS: AutoProcess,
+}
 
 # 风险仍处于自动流转的状态；只有离开这些状态才清除失败计数
 _AUTO_FLOW_STATUSES = (RiskStatus.NEW, RiskStatus.FOR_APPROVE, RiskStatus.AUTO_PROCESS)
@@ -623,6 +631,9 @@ _AUTO_FLOW_STATUSES = (RiskStatus.NEW, RiskStatus.FOR_APPROVE, RiskStatus.AUTO_P
 def process_one_risk(*, risk_id: str):
     """
     处理单个风险
+
+    链式推进：NewRisk 成功后按最新状态继续建单（ForApprove）或建任务（AutoProcess），
+    ForApprove 审批通过后同任务继续 AutoProcess，不等下一轮扫表。
     """
 
     # 获取风险
@@ -630,38 +641,23 @@ def process_one_risk(*, risk_id: str):
 
     # 重试
     cache_key = f"process_one_risk:fail:{risk.risk_id}"
-    # 判断操作
-    match risk.status:
-        case RiskStatus.NEW:
-            process_class = NewRisk
-        case RiskStatus.FOR_APPROVE:
-            process_class = ForApprove
-        case RiskStatus.AUTO_PROCESS:
-            process_class = AutoProcess
-        case _:
-            return
-    # 处理
+    # 链式处理：每个 handler 至多一次，状态不再推进即终止（建单/等审批/等执行即止步）
+    process_name = ""
     try:
-        logger_celery.info("[ProcessRiskTicket] %s Start %s", process_class.__name__, risk.risk_id)
-        # 处理
-        process_class(risk_id=risk.risk_id, operator=bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME).run()
-        # 成功：仍在自动流转则保留失败计数并续期，避免中间一次成功轮询把累计失败清零；
-        # 只有风险真正离开自动流转后才清除。
-        status = Risk.objects.filter(risk_id=risk.risk_id).values_list("status", flat=True).first()
-        if status in _AUTO_FLOW_STATUSES:
-            current = cache.get(key=cache_key)
-            if current:
-                cache.set(
-                    key=cache_key,
-                    value=current,
-                    timeout=(settings.PROCESS_RISK_MAX_RETRY + 1) * settings.DEFAULT_CACHE_LOCK_TIMEOUT,
-                )
-        else:
-            cache.delete(key=cache_key)
+        executed = []
+        for _ in range(len(_CHAIN_HANDLERS)):
+            process_class = _CHAIN_HANDLERS.get(risk.status)
+            if not process_class or process_class in executed:
+                break
+            executed.append(process_class)
+            process_name = process_class.__name__
+            logger_celery.info("[ProcessRiskTicket] %s Start %s", process_name, risk.risk_id)
+            process_class(risk_id=risk.risk_id, operator=bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME).run()
+            risk.refresh_from_db(fields=["status"])
     except Exception as err:  # NOCC:broad-except(需要处理所有错误)
         # 获取失败次数
         retry_times = cache.get(key=cache_key, default=1)
-        logger_celery.exception("[ProcessRiskTicket] %s Error %s %s", process_class.__name__, risk.risk_id, err)
+        logger_celery.exception("[ProcessRiskTicket] %s Error %s %s", process_name, risk.risk_id, err)
         # 先落失败计数，再做通知等可能失败的副作用，避免通知异常导致计数不增长、无限重试
         if retry_times < settings.PROCESS_RISK_MAX_RETRY:
             cache.set(
@@ -671,7 +667,7 @@ def process_one_risk(*, risk_id: str):
             )
         title = gettext("Process Risk Ticket Failed")
         content = gettext("ProcessClass: %s\nRiskID: %s(%d/%d)\nError: %s") % (
-            process_class.__name__,
+            process_name,
             risk.risk_id,
             retry_times,
             settings.PROCESS_RISK_MAX_RETRY,
@@ -690,10 +686,23 @@ def process_one_risk(*, risk_id: str):
             # 转人工成功后再删计数；失败时保留，下一轮仍封顶直接再转
             cache.delete(key=cache_key)
     except BaseException as err:
-        logger_celery.exception("[ProcessRiskTicket] %s Error %s %s", process_class.__name__, risk.risk_id, err)
+        logger_celery.exception("[ProcessRiskTicket] %s Error %s %s", process_name, risk.risk_id, err)
         raise err
+    else:
+        # 成功：仍在自动流转则保留失败计数并续期，避免中间一次成功轮询把累计失败清零；
+        # 只有风险真正离开自动流转后才清除。
+        if risk.status in _AUTO_FLOW_STATUSES:
+            current = cache.get(key=cache_key)
+            if current:
+                cache.set(
+                    key=cache_key,
+                    value=current,
+                    timeout=(settings.PROCESS_RISK_MAX_RETRY + 1) * settings.DEFAULT_CACHE_LOCK_TIMEOUT,
+                )
+        else:
+            cache.delete(key=cache_key)
     finally:
-        logger_celery.info("[ProcessRiskTicket] %s End %s", process_class.__name__, risk.risk_id)
+        logger_celery.info("[ProcessRiskTicket] End %s", risk_id)
 
 
 def _sync_approve_node_status(node: TicketNode, ticket: dict) -> None:
@@ -720,84 +729,113 @@ def _sync_approve_node_status(node: TicketNode, ticket: dict) -> None:
     )
 
 
+# 每轮补偿派发上限：候选长期 running（审批中/执行中）不会离开候选集，
+# 超出部分留下轮；随机抽样保证长期都被轮到（固定顺序取前 N 会饿死尾部）。
+SYNC_AUTO_RESULT_BATCH_LIMIT = 500
+
+
+@celery_app.task(queue="risk", time_limit=settings.DEFAULT_CACHE_LOCK_TIMEOUT)
+def sync_one_auto_result(node_id: str):
+    """单节点状态同步：拉外部状态回写 TicketNode，节点已结束则推进风险流转。
+
+    fan-out 补偿子任务与带 node_id 的直调路径（强制撤销等，task 直接调用即
+    同步执行、返回时节点已回写）共用本函数；不加锁，select_for_update 已
+    串行化回写，重复派发最多多拉一次状态。
+    只回写节点、不做关单；关单由链式 process_one_risk 的 AutoProcess.post_process 承担。
+    """
+
+    try:
+        with transaction.atomic():
+            node = TicketNode.objects.select_for_update().get(id=node_id)
+            # 审批节点
+            if node.action == ForApprove.__name__:
+                ticket = node.process_result.get("ticket") or {}
+                _sync_approve_node_status(node, ticket)
+            # 自动处理套餐节点
+            elif node.action == AutoProcess.__name__:
+                task_id = node.process_result.get("task", {}).get("task_id", "")
+                if task_id:
+                    status = api.bk_sops.get_task_status(task_id=task_id, bk_biz_id=settings.DEFAULT_BK_BIZ_ID)
+                    # 失败时补全错误信息 error_message 和 failure_hint
+                    if status.get("state") in SOPSTaskStatus.get_failed_status():
+                        node.process_result["failure_hint"] = fill_failure_info(status, task_id=task_id)
+                    node.process_result["status"] = status
+                    # 耗时（秒）：冗余到独立整数字段，保证列表按数值排序（JSON 数值排序会按字符串比较出错）
+                    node.process_result["duration"] = calc_task_duration(status)
+                    node.duration = node.process_result["duration"]
+                    # 实际开始时间物化到独立字段，供执行记录筛选/排序；缺失时回退记录创建时间
+                    start_ts = calc_task_start_timestamp(status)
+                    node.sops_start_time = (
+                        start_ts if start_ts is not None else (node.sops_start_time or node.timestamp)
+                    )
+                    node.status = (
+                        TicketNodeStatus.FINISHED
+                        if node.process_result["status"]["state"]
+                        in [
+                            SOPSTaskStatus.EXPIRED,
+                            SOPSTaskStatus.FINISHED,
+                            SOPSTaskStatus.FAILED,
+                            SOPSTaskStatus.REVOKED,
+                        ]
+                        else TicketNodeStatus.RUNNING
+                    )
+                else:
+                    node.status = TicketNodeStatus.FINISHED
+            # 其他节点只需要判断不为最后一个，则关闭
+            # 或 该风险单已关闭，则关闭
+            else:
+                last_node = (
+                    TicketNode.objects.filter(risk_id=node.risk_id, is_test=False).order_by("-timestamp").first()
+                )
+                risk = Risk.objects.filter(risk_id=node.risk_id).first()
+                if (last_node and last_node.timestamp > node.timestamp) or (risk and risk.status == RiskStatus.CLOSED):
+                    node.status = TicketNodeStatus.FINISHED
+            node.save(update_fields=["process_result", "status", "duration", "sops_start_time"])
+    except Exception as err:  # NOCC:broad-except(需要处理所有错误)
+        logger_celery.exception("[SyncAutoResult] Error %s %s", node_id, err)
+        return
+    # 回写后 delay 链式 process_one_risk：审批通过→同链建任务、套餐结束→同链关单或转人工
+    if node.action in (ForApprove.__name__, AutoProcess.__name__) and node.status == TicketNodeStatus.FINISHED:
+        process_one_risk.delay(risk_id=node.risk_id)
+
+
 @periodic_task(
     run_every=crontab(minute=settings.SYNC_AUTO_RESULT_PERIODIC_TASK_MINUTE),
     queue="risk",
     time_limit=settings.DEFAULT_CACHE_LOCK_TIMEOUT,
 )
-@lock(lock_name="celery:sync_auto_result")
+@lock(
+    lock_name="celery:sync_auto_result",
+    load_lock_name=lambda **kwargs: f"celery:sync_auto_result:{kwargs['node_id']}"
+    if kwargs.get("node_id")
+    else "celery:sync_auto_result",
+)
 def sync_auto_result(node_id: str = None):
-    """同步处理节点状态"""
+    """同步处理节点状态
 
-    # 筛选所有需要更新的节点
+    带 node_id：同步直调（强制撤销等请求线程路径），task 直接调用即同步执行，
+    返回时节点已回写；
+    不带 node_id：只做候选分发（fan-out），逐节点 delay 子任务，父任务不调外部 HTTP。
+    """
+
+    if node_id:
+        sync_one_auto_result(node_id=node_id)
+        return
+
     # 无 node_id 时收窄候选集：只有审批/套餐节点需要跟外部系统（ITSM/SOPS）同步状态，
     # 其余节点（NewRisk/转单/记经验等）按设计长期保持 running，进补偿只会拖垮本任务。
-    # 只取主键且不做分页：既不实例化模型、不加载 JSONField，也避免 LIMIT/OFFSET 漏/重节点。
-    if node_id:
-        node_ids = [node_id]
-    else:
-        node_ids = list(
-            TicketNode.objects.filter(
-                status=TicketNodeStatus.RUNNING,
-                action__in=[ForApprove.__name__, AutoProcess.__name__],
-            )
-            .order_by()
-            .values_list("id", flat=True)
+    # 随机序 + 每轮上限：候选长期 running 不会离开候选集，固定顺序取前 N 会饿死尾部。
+    node_ids = list(
+        TicketNode.objects.filter(
+            status=TicketNodeStatus.RUNNING,
+            action__in=[ForApprove.__name__, AutoProcess.__name__],
         )
-
-    # 逐个更新
+        .order_by("?")
+        .values_list("id", flat=True)[:SYNC_AUTO_RESULT_BATCH_LIMIT]
+    )
     for current_node_id in node_ids:
-        try:
-            with transaction.atomic():
-                node = TicketNode.objects.select_for_update().get(id=current_node_id)
-                # 审批节点
-                if node.action == ForApprove.__name__:
-                    ticket = node.process_result.get("ticket") or {}
-                    _sync_approve_node_status(node, ticket)
-                # 自动处理套餐节点
-                elif node.action == AutoProcess.__name__:
-                    task_id = node.process_result.get("task", {}).get("task_id", "")
-                    if task_id:
-                        status = api.bk_sops.get_task_status(task_id=task_id, bk_biz_id=settings.DEFAULT_BK_BIZ_ID)
-                        # 失败时补全错误信息error_message和failure_hint
-                        if status.get("state") in SOPSTaskStatus.get_failed_status():
-                            node.process_result["failure_hint"] = fill_failure_info(status, task_id=task_id)
-                        node.process_result["status"] = status
-                        # 耗时（秒）：冗余到独立整数字段，保证列表按数值排序（JSON 数值排序会按字符串比较出错）
-                        node.process_result["duration"] = calc_task_duration(status)
-                        node.duration = node.process_result["duration"]
-                        # 实际开始时间物化到独立字段，供执行记录筛选/排序；缺失时回退记录创建时间
-                        start_ts = calc_task_start_timestamp(status)
-                        node.sops_start_time = (
-                            start_ts if start_ts is not None else (node.sops_start_time or node.timestamp)
-                        )
-                        node.status = (
-                            TicketNodeStatus.FINISHED
-                            if node.process_result["status"]["state"]
-                            in [
-                                SOPSTaskStatus.EXPIRED,
-                                SOPSTaskStatus.FINISHED,
-                                SOPSTaskStatus.FAILED,
-                                SOPSTaskStatus.REVOKED,
-                            ]
-                            else TicketNodeStatus.RUNNING
-                        )
-                    else:
-                        node.status = TicketNodeStatus.FINISHED
-                # 其他节点只需要判断不为最后一个，则关闭
-                # 或 该风险单已关闭，则关闭
-                else:
-                    last_node = (
-                        TicketNode.objects.filter(risk_id=node.risk_id, is_test=False).order_by("-timestamp").first()
-                    )
-                    risk = Risk.objects.filter(risk_id=node.risk_id).first()
-                    if (last_node and last_node.timestamp > node.timestamp) or (
-                        risk and risk.status == RiskStatus.CLOSED
-                    ):
-                        node.status = TicketNodeStatus.FINISHED
-                node.save(update_fields=["process_result", "status", "duration", "sops_start_time"])
-        except Exception as err:  # NOCC:broad-except(需要处理所有错误)
-            logger_celery.exception("[SyncAutoResult] Error %s %s", current_node_id, err)
+        sync_one_auto_result.delay(node_id=current_node_id)
+
 
 
 def _build_risk_query_from_prompt_params(prompt_params: dict) -> Q:
