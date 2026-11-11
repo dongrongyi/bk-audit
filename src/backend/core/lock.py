@@ -27,6 +27,15 @@ class CacheLock:
 
         return self._locked
 
+    def __enter__(self) -> bool:
+        """返回是否成功获得锁；失败时不要调用 release，避免误删他人锁。"""
+
+        return not self._locked
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if not self._locked:
+            self.release()
+
     def _init(self) -> bool:
         """
         初始化锁

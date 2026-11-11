@@ -46,7 +46,7 @@ from apps.meta.constants import ConfigLevelChoices
 from apps.meta.models import GlobalMetaConfig
 from apps.notice.handlers import ErrorMsgHandler
 from apps.sops.constants import SOPSTaskStatus
-from core.lock import lock
+from core.lock import CacheLock, lock
 from core.observability import (
     OBSERVATION_METRIC_STATUS_ERROR,
     OBSERVATION_METRIC_STATUS_SUCCESS,
@@ -623,86 +623,107 @@ _CHAIN_HANDLERS = {
 _AUTO_FLOW_STATUSES = (RiskStatus.NEW, RiskStatus.FOR_APPROVE, RiskStatus.AUTO_PROCESS)
 
 
-@celery_app.task(queue="risk", time_limit=settings.DEFAULT_CACHE_LOCK_TIMEOUT)
-@lock(
-    lock_name="celery:process_one_risk",
-    load_lock_name=lambda **kwargs: f"celery:process_one_risk:{kwargs['risk_id']}",
+@celery_app.task(
+    queue="risk",
+    time_limit=settings.DEFAULT_CACHE_LOCK_TIMEOUT,
+    acks_late=True,
+    reject_on_worker_lost=True,
 )
-def process_one_risk(*, risk_id: str):
+def process_one_risk(*, risk_id: str, chain_depth: int = 0):
     """
-    处理单个风险
+    处理单个风险的单个流转步骤。
 
-    链式推进：NewRisk 成功后按最新状态继续建单（ForApprove）或建任务（AutoProcess），
-    ForApprove 审批通过后同任务继续 AutoProcess，不等下一轮扫表。
+    每次只执行当前状态对应的一个 handler。handler 事务提交后，若状态推进到
+    下一个 handler，则释放锁后重新投递本任务；否则结束，等待周期扫描或外部回调。
     """
 
-    # 获取风险
-    risk = Risk.objects.get(risk_id=risk_id)
+    lock_name = f"celery:process_one_risk:{risk_id}"
+    next_task_kwargs = None
+    with CacheLock(lock_name=lock_name, timeout=settings.DEFAULT_CACHE_LOCK_TIMEOUT) as acquired:
+        if not acquired:
+            logger_celery.warning("[CacheLockCheckFailed] MultiProcessRunning %s", lock_name)
+            return
 
-    # 重试
-    cache_key = f"process_one_risk:fail:{risk.risk_id}"
-    # 链式处理：每个 handler 至多一次，状态不再推进即终止（建单/等审批/等执行即止步）
-    process_name = ""
-    try:
-        executed = []
-        for _ in range(len(_CHAIN_HANDLERS)):
+        risk = None
+        cache_key = ""
+        process_class = None
+        process_name = ""
+        try:
+            # 获取风险
+            risk = Risk.objects.get(risk_id=risk_id)
+            cache_key = f"process_one_risk:fail:{risk.risk_id}"
             process_class = _CHAIN_HANDLERS.get(risk.status)
-            if not process_class or process_class in executed:
-                break
-            executed.append(process_class)
+            if not process_class:
+                return
+
             process_name = process_class.__name__
             logger_celery.info("[ProcessRiskTicket] %s Start %s", process_name, risk.risk_id)
+            # 每个任务只推进一个 handler，避免长事务和 handler 内嵌套调用。
             process_class(risk_id=risk.risk_id, operator=bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME).run()
-            risk.refresh_from_db(fields=["status"])
-    except Exception as err:  # NOCC:broad-except(需要处理所有错误)
-        # 获取失败次数
-        retry_times = cache.get(key=cache_key, default=1)
-        logger_celery.exception("[ProcessRiskTicket] %s Error %s %s", process_name, risk.risk_id, err)
-        # 先落失败计数，再做通知等可能失败的副作用，避免通知异常导致计数不增长、无限重试
-        if retry_times < settings.PROCESS_RISK_MAX_RETRY:
-            cache.set(
-                key=cache_key,
-                value=retry_times + 1,
-                timeout=(settings.PROCESS_RISK_MAX_RETRY + 1) * settings.DEFAULT_CACHE_LOCK_TIMEOUT,
-            )
-        title = gettext("Process Risk Ticket Failed")
-        content = gettext("ProcessClass: %s\nRiskID: %s(%d/%d)\nError: %s") % (
-            process_name,
-            risk.risk_id,
-            retry_times,
-            settings.PROCESS_RISK_MAX_RETRY,
-            err,
-        )
-        try:
-            ErrorMsgHandler(title, content).send()
-        except Exception:  # NOCC:broad-except(通知失败不能挡住计数和转人工)
-            logger_celery.exception("[ProcessRiskTicket] Notify failed %s", risk.risk_id)
-        # 失败达到最大次数转人工
-        if retry_times >= settings.PROCESS_RISK_MAX_RETRY:
-            TransOperator(risk_id=risk.risk_id, operator=bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME).run(
-                new_operators=TransOperator.load_security_person(),
-                description=gettext("风险自动流转失败，转为安全接口人处理"),
-            )
-            # 转人工成功后再删计数；失败时保留，下一轮仍封顶直接再转
-            cache.delete(key=cache_key)
-    except BaseException as err:
-        logger_celery.exception("[ProcessRiskTicket] %s Error %s %s", process_name, risk.risk_id, err)
-        raise err
-    else:
-        # 成功：仍在自动流转则保留失败计数并续期，避免中间一次成功轮询把累计失败清零；
-        # 只有风险真正离开自动流转后才清除。
-        if risk.status in _AUTO_FLOW_STATUSES:
-            current = cache.get(key=cache_key)
-            if current:
+        except Exception as err:  # NOCC:broad-except(需要处理所有错误)
+            # 没有匹配到 handler 时，异常来自查询/代码本身，交给上层处理
+            if process_class is None:
+                raise
+
+            # 获取失败次数
+            retry_times = cache.get(key=cache_key, default=1)
+            logger_celery.exception("[ProcessRiskTicket] %s Error %s %s", process_name, risk.risk_id, err)
+            # 先落失败计数，再做通知等可能失败的副作用，避免通知异常导致计数不增长、无限重试
+            if retry_times < settings.PROCESS_RISK_MAX_RETRY:
                 cache.set(
                     key=cache_key,
-                    value=current,
+                    value=retry_times + 1,
                     timeout=(settings.PROCESS_RISK_MAX_RETRY + 1) * settings.DEFAULT_CACHE_LOCK_TIMEOUT,
                 )
+            title = gettext("Process Risk Ticket Failed")
+            content = gettext("ProcessClass: %s\nRiskID: %s(%d/%d)\nError: %s") % (
+                process_name,
+                risk.risk_id,
+                retry_times,
+                settings.PROCESS_RISK_MAX_RETRY,
+                err,
+            )
+            try:
+                ErrorMsgHandler(title, content).send()
+            except Exception:  # NOCC:broad-except(通知失败不能挡住计数和转人工)
+                logger_celery.exception("[ProcessRiskTicket] Notify failed %s", risk.risk_id)
+            # 失败达到最大次数转人工
+            if retry_times >= settings.PROCESS_RISK_MAX_RETRY:
+                TransOperator(risk_id=risk.risk_id, operator=bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME).run(
+                    new_operators=TransOperator.load_security_person(),
+                    description=gettext("风险自动流转失败，转为安全接口人处理"),
+                )
+                # 转人工成功后再删计数；失败时保留，下一轮仍封顶直接再转
+                cache.delete(key=cache_key)
         else:
-            cache.delete(key=cache_key)
-    finally:
-        logger_celery.info("[ProcessRiskTicket] End %s", risk_id)
+            # handler.run() 内的事务已经提交；按最新状态决定失败计数和下一步。
+            risk.refresh_from_db(fields=["status"])
+            if risk.status in _AUTO_FLOW_STATUSES:
+                current = cache.get(key=cache_key)
+                if current:
+                    cache.set(
+                        key=cache_key,
+                        value=current,
+                        timeout=(settings.PROCESS_RISK_MAX_RETRY + 1) * settings.DEFAULT_CACHE_LOCK_TIMEOUT,
+                    )
+            else:
+                cache.delete(key=cache_key)
+
+            next_process_class = _CHAIN_HANDLERS.get(risk.status)
+            if (
+                next_process_class
+                and next_process_class is not process_class
+                and chain_depth + 1 < len(_CHAIN_HANDLERS)
+            ):
+                next_task_kwargs = {"risk_id": risk.risk_id, "chain_depth": chain_depth + 1}
+                logger_celery.info(
+                    "[ProcessRiskTicket] Schedule next %s for %s", next_process_class.__name__, risk.risk_id
+                )
+        finally:
+            logger_celery.info("[ProcessRiskTicket] End %s", risk_id)
+
+    if next_task_kwargs:
+        process_one_risk.delay(**next_task_kwargs)
 
 
 def _sync_approve_node_status(node: TicketNode, ticket: dict) -> None:
