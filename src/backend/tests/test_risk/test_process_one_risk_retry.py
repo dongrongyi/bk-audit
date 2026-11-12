@@ -64,8 +64,12 @@ class TestProcessOneRiskRetryCount(TestCase):
         effect = run_side_effect
 
         class AutoProcess:
+            @classmethod
+            def match(cls, risk):
+                return risk.status == RiskStatus.AUTO_PROCESS
+
             def __init__(self, *args, **kwargs):
-                pass
+                self.next_step_required = False
 
             def run(self, *args, **kwargs):
                 if isinstance(effect, BaseException):
@@ -75,7 +79,7 @@ class TestProcessOneRiskRetryCount(TestCase):
 
         with (
             mock.patch("services.web.risk.tasks.AutoProcess", AutoProcess),
-            mock.patch.dict("services.web.risk.tasks._CHAIN_HANDLERS", {RiskStatus.AUTO_PROCESS: AutoProcess}),
+            mock.patch("services.web.risk.tasks.AUTO_FLOW_HANDLERS", (AutoProcess,)),
             mock.patch("services.web.risk.tasks.TransOperator") as trans_cls,
         ):
             trans_cls.load_security_person.return_value = ["security"]

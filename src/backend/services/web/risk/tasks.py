@@ -84,9 +84,9 @@ from services.web.risk.handlers import (
 from services.web.risk.handlers.risk import RiskHandler
 from services.web.risk.handlers.risk_export_service import RiskExportService
 from services.web.risk.handlers.ticket import (
+    AUTO_FLOW_HANDLERS,
     AutoProcess,
     ForApprove,
-    NewRisk,
     TransOperator,
     get_itsm_ticket_status,
 )
@@ -612,13 +612,6 @@ def process_risk_ticket(*, risk_id: str = None, manual: bool = False):
             process_one_risk(risk_id=risk.risk_id)
 
 
-# 链式推进的状态机入口：每个 handler 一次任务内至多执行一次，止步于需外部等待的状态
-_CHAIN_HANDLERS = {
-    RiskStatus.NEW: NewRisk,
-    RiskStatus.FOR_APPROVE: ForApprove,
-    RiskStatus.AUTO_PROCESS: AutoProcess,
-}
-
 # 风险仍处于自动流转的状态；只有离开这些状态才清除失败计数
 _AUTO_FLOW_STATUSES = (RiskStatus.NEW, RiskStatus.FOR_APPROVE, RiskStatus.AUTO_PROCESS)
 
@@ -652,14 +645,15 @@ def process_one_risk(*, risk_id: str, chain_depth: int = 0):
             # 获取风险
             risk = Risk.objects.get(risk_id=risk_id)
             cache_key = f"process_one_risk:fail:{risk.risk_id}"
-            process_class = _CHAIN_HANDLERS.get(risk.status)
+            process_class = next((handler for handler in AUTO_FLOW_HANDLERS if handler.match(risk)), None)
             if not process_class:
                 return
 
             process_name = process_class.__name__
             logger_celery.info("[ProcessRiskTicket] %s Start %s", process_name, risk.risk_id)
             # 每个任务只推进一个 handler，避免长事务和 handler 内嵌套调用。
-            process_class(risk_id=risk.risk_id, operator=bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME).run()
+            handler = process_class(risk_id=risk.risk_id, operator=bk_resource_settings.PLATFORM_AUTH_ACCESS_USERNAME)
+            handler.run()
         except Exception as err:  # NOCC:broad-except(需要处理所有错误)
             # 没有匹配到 handler 时，异常来自查询/代码本身，交给上层处理
             if process_class is None:
@@ -709,16 +703,9 @@ def process_one_risk(*, risk_id: str, chain_depth: int = 0):
             else:
                 cache.delete(key=cache_key)
 
-            next_process_class = _CHAIN_HANDLERS.get(risk.status)
-            if (
-                next_process_class
-                and next_process_class is not process_class
-                and chain_depth + 1 < len(_CHAIN_HANDLERS)
-            ):
+            if handler.next_step_required and chain_depth + 1 < len(AUTO_FLOW_HANDLERS):
                 next_task_kwargs = {"risk_id": risk.risk_id, "chain_depth": chain_depth + 1}
-                logger_celery.info(
-                    "[ProcessRiskTicket] Schedule next %s for %s", next_process_class.__name__, risk.risk_id
-                )
+                logger_celery.info("[ProcessRiskTicket] Schedule next step for %s", risk.risk_id)
         finally:
             logger_celery.info("[ProcessRiskTicket] End %s", risk_id)
 
@@ -856,7 +843,6 @@ def sync_auto_result(node_id: str = None):
     )
     for current_node_id in node_ids:
         sync_one_auto_result.delay(node_id=current_node_id)
-
 
 
 def _build_risk_query_from_prompt_params(prompt_params: dict) -> Q:

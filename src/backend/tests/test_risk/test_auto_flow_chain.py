@@ -249,6 +249,22 @@ class AutoFlowChainTest(TicketTest):
         """异步单步任务开启延迟确认，重复投递依赖状态与业务幂等。"""
         self.assertTrue(process_one_risk.acks_late)
 
+    def test_handler_match_restricts_auto_flow_statuses(self):
+        """自动流转 match 只匹配各自的状态，避免手动操作状态被自动调度。"""
+        from services.web.risk.handlers.ticket import AutoProcess, ForApprove, NewRisk
+
+        for status, matcher, other in (
+            (RiskStatus.NEW, NewRisk, AutoProcess),
+            (RiskStatus.FOR_APPROVE, ForApprove, NewRisk),
+            (RiskStatus.AUTO_PROCESS, AutoProcess, ForApprove),
+        ):
+            risk = mock.Mock(status=status)
+            self.assertTrue(matcher.match(risk))
+            self.assertFalse(other.match(risk))
+
+        awaiting = mock.Mock(status=RiskStatus.AWAIT_PROCESS)
+        self.assertFalse(AutoProcess.match(awaiting))
+
 
 class SyncAutoResultFanoutTest(TicketTest):
     """补偿 fan-out：父任务只派发，子任务单节点同步"""
